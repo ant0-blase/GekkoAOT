@@ -1,0 +1,1506 @@
+{
+  "entries": [
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 0,
+        "branches": 14,
+        "calls": 4,
+        "fp_ps": 0,
+        "instructions": 76,
+        "loads": 15,
+        "returns": 1,
+        "stores": 12
+      },
+      "fingerprint": "0140ee695b1e98a349347aa9fab0cbc591e561571a79bac7a3723f6a2d070aa0",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 5.8878,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "bb4a9bc04bc67d8f",
+      "span_instructions": 76
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 2,
+        "branches": 26,
+        "calls": 5,
+        "fp_ps": 0,
+        "instructions": 166,
+        "loads": 22,
+        "returns": 1,
+        "stores": 16
+      },
+      "fingerprint": "0155fcf2b84bdaa9985c86250d73a8c4320baf3d47598b80306f5a175178f5b9",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 7.7834,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "8b301c4ccede9b4c",
+      "span_instructions": 166
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 2,
+        "branches": 4,
+        "calls": 2,
+        "fp_ps": 0,
+        "instructions": 31,
+        "loads": 5,
+        "returns": 1,
+        "stores": 5
+      },
+      "fingerprint": "121765d4d9d64570488eb04dd5cd9faf933f6bff21fb691b08bb6d836028b7fb",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 8.1927,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "8d785a48d9e2aa24",
+      "span_instructions": 31
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 7,
+        "branches": 29,
+        "calls": 12,
+        "fp_ps": 0,
+        "instructions": 121,
+        "loads": 22,
+        "returns": 1,
+        "stores": 4
+      },
+      "fingerprint": "13bee56c45cd5ccdbe8e98a9a03e7da91aa796db501f07d0517e05576f0a6bd6",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 5.6101,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "abc0584c2acc9e61",
+      "span_instructions": 121
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 3,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 35,
+        "loads": 2,
+        "returns": 1,
+        "stores": 8
+      },
+      "fingerprint": "140833c3ccc7f541d822a33a30b903ae29b3963db438cc114f3bd2e962a92f7c",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 12.3559,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "8e6004451eebc8b2",
+      "span_instructions": 35
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 4,
+        "branches": 8,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 89,
+        "loads": 29,
+        "returns": 1,
+        "stores": 29
+      },
+      "fingerprint": "14757421114c3d0e3560e244293ca057be177fac9f76cf2ce4c1de93bde8996a",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.6996,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "03c0308f704abe39",
+      "span_instructions": 89
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 3,
+        "branches": 4,
+        "calls": 0,
+        "fp_ps": 29,
+        "instructions": 94,
+        "loads": 7,
+        "returns": 1,
+        "stores": 0
+      },
+      "fingerprint": "1d9d8ec1af89c5c2d7912b8f8f623f73d98055329e072326a7665a3819d5f125",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 34.915,
+      "policy": "balanced",
+      "samples": 7,
+      "simhash": "a3ea0a5bea9e1b8b",
+      "span_instructions": 94
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 0,
+        "branches": 8,
+        "calls": 3,
+        "fp_ps": 0,
+        "instructions": 48,
+        "loads": 7,
+        "returns": 1,
+        "stores": 7
+      },
+      "fingerprint": "1ed50f2066cfb81250ecab292a85251fd46dba8d0a741428994b9c15e70d6a0a",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 6.7654,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "faca1fa04bc63b8f",
+      "span_instructions": 48
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 1,
+        "branches": 6,
+        "calls": 2,
+        "fp_ps": 0,
+        "instructions": 28,
+        "loads": 6,
+        "returns": 1,
+        "stores": 6
+      },
+      "fingerprint": "254bc51b878809ce8de855ea963de4704e3308a9f7dc4c1ef4ad38d2534b3659",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 53.9756,
+      "policy": "aggressive",
+      "samples": 5,
+      "simhash": "1f581e4fe9f6de05",
+      "span_instructions": 28
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 1,
+        "branches": 63,
+        "calls": 16,
+        "fp_ps": 0,
+        "instructions": 133,
+        "loads": 7,
+        "returns": 1,
+        "stores": 6
+      },
+      "fingerprint": "27215adb764dc8b80ccc26a56aad5fb29f66c9060a6b4b8505789d0470f56bd5",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 13.4852,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "71c29e496c0b9f8b",
+      "span_instructions": 133
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 33,
+        "branches": 59,
+        "calls": 33,
+        "fp_ps": 0,
+        "instructions": 251,
+        "loads": 54,
+        "returns": 1,
+        "stores": 7
+      },
+      "fingerprint": "28d7b13da682abe0b34cd5ce88b4f864e669416cfa38bca6cdac690007ded87f",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 6.8265,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "22f0dc4d2decbf5d",
+      "span_instructions": 251
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 4,
+        "branches": 7,
+        "calls": 4,
+        "fp_ps": 0,
+        "instructions": 45,
+        "loads": 8,
+        "returns": 1,
+        "stores": 6
+      },
+      "fingerprint": "2b76c73d4503f8fc2ba2864e4e65db3d75ba81ba3f95229bb6bf21a843a7e9c3",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.5364,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "867ad2421fe51a26",
+      "span_instructions": 45
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 1,
+        "branches": 13,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 78,
+        "loads": 2,
+        "returns": 1,
+        "stores": 3
+      },
+      "fingerprint": "2ea4c0845a13e038d50aeef12cd6cd7775ebe2e0dab19f285c62a3a88291bc40",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.6422,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "bfe2d9c9bccc938d",
+      "span_instructions": 78
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 1,
+        "branches": 2,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 9,
+        "loads": 1,
+        "returns": 1,
+        "stores": 1
+      },
+      "fingerprint": "31e7f888a3cd1e10735763c4b5cf3806a340d302c931eb2f2a90f98619908530",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 14.7279,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "06422acba28dc299",
+      "span_instructions": 9
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 1,
+        "branches": 2,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 13,
+        "loads": 0,
+        "returns": 1,
+        "stores": 0
+      },
+      "fingerprint": "3361c25f85049f8a38a81837cd22bac441e23ecd0da288f55f90cef7a444813a",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.6059,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "8765485dec4cb592",
+      "span_instructions": 13
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 0,
+        "branches": 8,
+        "calls": 3,
+        "fp_ps": 0,
+        "instructions": 48,
+        "loads": 7,
+        "returns": 1,
+        "stores": 7
+      },
+      "fingerprint": "34c5ca5a827243d549199a8f542c2bc89984d056a5a67bd75e3bcf1f1bdf3049",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 5.8886,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "fb4a1fa20b871b87",
+      "span_instructions": 48
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 7,
+        "branches": 35,
+        "calls": 17,
+        "fp_ps": 0,
+        "instructions": 131,
+        "loads": 8,
+        "returns": 1,
+        "stores": 7
+      },
+      "fingerprint": "3adea1e3311928581d493ff1001fbf13a18c276caf6fa551c243e2f914e480bc",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 8.1866,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "d3e3984daec99ec9",
+      "span_instructions": 131
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 2,
+        "branches": 24,
+        "calls": 5,
+        "fp_ps": 0,
+        "instructions": 95,
+        "loads": 12,
+        "returns": 1,
+        "stores": 8
+      },
+      "fingerprint": "3d7e940524534494d51e9bf30874af645dc047c3cd085bcf1c60ba021521cca2",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.2494,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "b2cad3804bc81bcb",
+      "span_instructions": 95
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 2,
+        "branches": 78,
+        "calls": 48,
+        "fp_ps": 0,
+        "instructions": 512,
+        "loads": 111,
+        "returns": 0,
+        "stores": 24
+      },
+      "fingerprint": "3f559aeedf0d17ae8b7beb0410c3afa6a88e9a214896a7bec91b88fde0188352",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 39.0039,
+      "policy": "aggressive",
+      "samples": 5,
+      "simhash": "1351425d2cc99201",
+      "span_instructions": 512
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 2,
+        "branches": 22,
+        "calls": 10,
+        "fp_ps": 0,
+        "instructions": 92,
+        "loads": 23,
+        "returns": 1,
+        "stores": 7
+      },
+      "fingerprint": "463845aa971381502b71e635546d79a9ae44019b7ae57783f4cc2b44f42ef5c7",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 15.7328,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "616a9a4a6eab8b01",
+      "span_instructions": 92
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 55,
+        "branches": 91,
+        "calls": 56,
+        "fp_ps": 9,
+        "instructions": 464,
+        "loads": 90,
+        "returns": 1,
+        "stores": 38
+      },
+      "fingerprint": "49c05ab4d6bd25ca985d2ec2b3eb6f27f94b2561fc59b1db56a5aa138ae2cfc4",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 18.9576,
+      "policy": "balanced",
+      "samples": 4,
+      "simhash": "2ad0dc4dade4bc59",
+      "span_instructions": 464
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 1,
+        "branches": 2,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 12,
+        "loads": 0,
+        "returns": 1,
+        "stores": 0
+      },
+      "fingerprint": "4c34e56117c77fe3805a42f826e248998ee6423c62604fdacb192b9c4684f592",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 5.6918,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "97e7405f2e4cb7db",
+      "span_instructions": 12
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 3,
+        "calls": 0,
+        "fp_ps": 2,
+        "instructions": 22,
+        "loads": 0,
+        "returns": 1,
+        "stores": 2
+      },
+      "fingerprint": "546c20d01f58ce2db68d19ac5910eceb7a85d42ac953af56618213d43a10e372",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 52.11,
+      "policy": "balanced",
+      "samples": 8,
+      "simhash": "25ce6491b4dd2469",
+      "span_instructions": 22
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 3,
+        "branches": 5,
+        "calls": 3,
+        "fp_ps": 0,
+        "instructions": 49,
+        "loads": 7,
+        "returns": 1,
+        "stores": 9
+      },
+      "fingerprint": "54797ad0f30c547e9b1df8187cfdc7cf445257b1eb310ffb2340486c787be7e3",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 7.7769,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "17c0488d2ec49265",
+      "span_instructions": 49
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 1,
+        "branches": 3,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 39,
+        "loads": 3,
+        "returns": 1,
+        "stores": 10
+      },
+      "fingerprint": "55ccc9faa4a8af564509da2579be5f7341edaecd92b65e992fa3a2dba7aa4de6",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 10.6191,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "f3644844ccf08a61",
+      "span_instructions": 39
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 2,
+        "branches": 7,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 48,
+        "loads": 3,
+        "returns": 1,
+        "stores": 2
+      },
+      "fingerprint": "5e74024481d105e5de386f3c0037390ab28df0d655f7679c1c1c0286cbf4090f",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 34.6032,
+      "policy": "balanced",
+      "samples": 7,
+      "simhash": "a128fd93ab1e7570",
+      "span_instructions": 48
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 5,
+        "branches": 10,
+        "calls": 4,
+        "fp_ps": 0,
+        "instructions": 117,
+        "loads": 29,
+        "returns": 1,
+        "stores": 14
+      },
+      "fingerprint": "5f6bdb9a7ef907a872b2a37eed6169810d7dbf041961f3357d1a01bc62d9dbb4",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 47.5755,
+      "policy": "balanced",
+      "samples": 8,
+      "simhash": "ab505ccbbfda8ae0",
+      "span_instructions": 117
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 0,
+        "calls": 0,
+        "fp_ps": 15,
+        "instructions": 26,
+        "loads": 0,
+        "returns": 1,
+        "stores": 6
+      },
+      "fingerprint": "689fc946a499fac39a6ec63fd887f4bcf534ddb78f0419b994c4712adce9fac9",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 32.038,
+      "policy": "balanced",
+      "samples": 6,
+      "simhash": "00e98a5da42a0bdb",
+      "span_instructions": 26
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 2,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 15,
+        "loads": 4,
+        "returns": 1,
+        "stores": 0
+      },
+      "fingerprint": "700e4cc8c7c29980ebb17a2a5f5ca0452bb4e406e171de4ec69b8be0cdba15a4",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 65.9309,
+      "policy": "aggressive",
+      "samples": 8,
+      "simhash": "b772d7cc3e48f8d1",
+      "span_instructions": 15
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 0,
+        "branches": 7,
+        "calls": 3,
+        "fp_ps": 0,
+        "instructions": 40,
+        "loads": 6,
+        "returns": 1,
+        "stores": 6
+      },
+      "fingerprint": "73cd62de3c75086709e31847ed0fe9b2a493eebd82cbb415e8862db359b7e773",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 6.819,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "fa4a1b804bc6198f",
+      "span_instructions": 40
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 10,
+        "branches": 28,
+        "calls": 8,
+        "fp_ps": 0,
+        "instructions": 128,
+        "loads": 23,
+        "returns": 1,
+        "stores": 22
+      },
+      "fingerprint": "7455330451794bd8f71a3ef79922accc4d1d469f0ca05156cd6f5af183642c00",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 84.3852,
+      "policy": "aggressive",
+      "samples": 8,
+      "simhash": "2b40dc47c86a9ab8",
+      "span_instructions": 128
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 0,
+        "calls": 0,
+        "fp_ps": 18,
+        "instructions": 32,
+        "loads": 6,
+        "returns": 1,
+        "stores": 6
+      },
+      "fingerprint": "79a86956d87685ce12c4a212f515076a55f5ecde5f24f587d1078317e5b947fd",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 32.003,
+      "policy": "balanced",
+      "samples": 6,
+      "simhash": "16fb98cd842e09c7",
+      "span_instructions": 32
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 2,
+        "branches": 4,
+        "calls": 2,
+        "fp_ps": 0,
+        "instructions": 19,
+        "loads": 3,
+        "returns": 1,
+        "stores": 3
+      },
+      "fingerprint": "7a70b7f6d368a7d9c198b31c7af6e7633114583554909289b3c42658e319f360",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 7.1903,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "81605a4e492a3e4d",
+      "span_instructions": 19
+    },
+    {
+      "confidence": 0.77,
+      "features": {
+        "back_edges": 0,
+        "branches": 8,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 121,
+        "loads": 5,
+        "returns": 1,
+        "stores": 15
+      },
+      "fingerprint": "7fc41e3d4e994583ec7c8825a5ea00c4b3585e7270f26a15c9173661408686ee",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 4.5444,
+      "policy": "balanced",
+      "samples": 2,
+      "simhash": "d1b2c01fefc7f62b",
+      "span_instructions": 121
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 8,
+        "branches": 17,
+        "calls": 8,
+        "fp_ps": 0,
+        "instructions": 113,
+        "loads": 9,
+        "returns": 1,
+        "stores": 10
+      },
+      "fingerprint": "83584b24fddb0f382374559f979eec91327e770172bc576f3709caad3fba5b9d",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 8.194,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "82e1744f80ce9685",
+      "span_instructions": 113
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 2,
+        "branches": 30,
+        "calls": 14,
+        "fp_ps": 0,
+        "instructions": 199,
+        "loads": 45,
+        "returns": 1,
+        "stores": 57
+      },
+      "fingerprint": "8bcde2447ddcec8ded2d95aa4b4bfdb23aed00da397c0f0f29c77efec721eea1",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 5.0622,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "c920888d8f4e9f0c",
+      "span_instructions": 199
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 3,
+        "branches": 3,
+        "calls": 3,
+        "fp_ps": 0,
+        "instructions": 25,
+        "loads": 6,
+        "returns": 1,
+        "stores": 5
+      },
+      "fingerprint": "8e1c3807a381a184df2383ad6e34095b287041ceced083799a69ac37e35402d4",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 9.3624,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "8870ce6a8b64db65",
+      "span_instructions": 25
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 9,
+        "branches": 75,
+        "calls": 36,
+        "fp_ps": 0,
+        "instructions": 249,
+        "loads": 26,
+        "returns": 1,
+        "stores": 15
+      },
+      "fingerprint": "8f40fc90a6cdd7cc0edc8f72513c360265f17993a0e020b65277b8299b31bc42",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 7.2171,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "824b1a65ecea9ac9",
+      "span_instructions": 249
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 14,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 215,
+        "loads": 41,
+        "returns": 1,
+        "stores": 38
+      },
+      "fingerprint": "9768167a7a7dea779b795a67152a59ec5d218af09f9916da7d1cbef0b3d67fc5",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 12.3745,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "9251e846a0cf8eef",
+      "span_instructions": 215
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 2,
+        "branches": 120,
+        "calls": 72,
+        "fp_ps": 0,
+        "instructions": 512,
+        "loads": 130,
+        "returns": 0,
+        "stores": 66
+      },
+      "fingerprint": "98647618e76b2d58500a018f8caa74c2a38321453e5524e515cd662db31de73e",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 54.8248,
+      "policy": "aggressive",
+      "samples": 5,
+      "simhash": "3350ce67e8dd9ad9",
+      "span_instructions": 512
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 4,
+        "branches": 9,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 46,
+        "loads": 0,
+        "returns": 1,
+        "stores": 11
+      },
+      "fingerprint": "9ca24515dc4777564ddd67742f96562456c405b9c9c1f2ef6291fa0e35e4de26",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 3.2055,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "5be645cd98dddd87",
+      "span_instructions": 46
+    },
+    {
+      "confidence": 0.98,
+      "features": {
+        "back_edges": 4,
+        "branches": 13,
+        "calls": 4,
+        "fp_ps": 0,
+        "instructions": 43,
+        "loads": 7,
+        "returns": 1,
+        "stores": 4
+      },
+      "fingerprint": "9fa367ac684ac111ff6c5730873a35588cde8f8774ec72c99f032327e1a09546",
+      "games": [
+        "GM2E8P",
+        "GMFE69"
+      ],
+      "hot_weight": 79.3423,
+      "policy": "aggressive",
+      "samples": 9,
+      "simhash": "3a685a4208eb9b4d",
+      "span_instructions": 43
+    },
+    {
+      "confidence": 0.84,
+      "features": {
+        "back_edges": 1,
+        "branches": 4,
+        "calls": 1,
+        "fp_ps": 10,
+        "instructions": 25,
+        "loads": 4,
+        "returns": 1,
+        "stores": 3
+      },
+      "fingerprint": "a35cc0bac3433040f20cb5802c428361c838bd11e4177690f431b14b6041fc86",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 12.6307,
+      "policy": "balanced",
+      "samples": 3,
+      "simhash": "1e5b8ccd1fef67c3",
+      "span_instructions": 25
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 3,
+        "branches": 15,
+        "calls": 7,
+        "fp_ps": 0,
+        "instructions": 60,
+        "loads": 19,
+        "returns": 1,
+        "stores": 8
+      },
+      "fingerprint": "a5a26f88facd397fa14e3eab127e3e0e493757c153052baae1e3ab1d33649936",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 2.4621,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "ae58ca7ceed49eb8",
+      "span_instructions": 60
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 3,
+        "branches": 17,
+        "calls": 3,
+        "fp_ps": 0,
+        "instructions": 69,
+        "loads": 15,
+        "returns": 1,
+        "stores": 8
+      },
+      "fingerprint": "aecabadc0e0af26ce04ed6598aae426e682db82993e8b4b53e93b026200fe7d0",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 8.9378,
+      "policy": "balanced",
+      "samples": 4,
+      "simhash": "3b50d849ccaabe0c",
+      "span_instructions": 69
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 3,
+        "calls": 0,
+        "fp_ps": 11,
+        "instructions": 29,
+        "loads": 6,
+        "returns": 1,
+        "stores": 1
+      },
+      "fingerprint": "b61f68507cef7268515f307f6ed25b70969ace565a3435f7e1608cf0c54ec1e0",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 40.8501,
+      "policy": "balanced",
+      "samples": 7,
+      "simhash": "6f9b50f99fee218d",
+      "span_instructions": 29
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 0,
+        "branches": 10,
+        "calls": 1,
+        "fp_ps": 0,
+        "instructions": 70,
+        "loads": 12,
+        "returns": 1,
+        "stores": 14
+      },
+      "fingerprint": "b750324941858bb3f602236a0274f54298a885fce343550d748f8b0c7b7fa08d",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.35,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "1f41b841cfec9f0b",
+      "span_instructions": 70
+    },
+    {
+      "confidence": 0.77,
+      "features": {
+        "back_edges": 10,
+        "branches": 28,
+        "calls": 8,
+        "fp_ps": 0,
+        "instructions": 128,
+        "loads": 23,
+        "returns": 1,
+        "stores": 22
+      },
+      "fingerprint": "b8c3dd96387c8c4e15c6e543bbbfcdeb10817d4a699b998938935f91b87724ba",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 4.4049,
+      "policy": "balanced",
+      "samples": 2,
+      "simhash": "2b40dc47c86a9ab8",
+      "span_instructions": 128
+    },
+    {
+      "confidence": 0.85,
+      "features": {
+        "back_edges": 1,
+        "branches": 29,
+        "calls": 0,
+        "fp_ps": 42,
+        "instructions": 323,
+        "loads": 70,
+        "returns": 1,
+        "stores": 42
+      },
+      "fingerprint": "bd4949c83efc0815a49388d48d49953cc181368154a397ee89e3bfa274b2da1b",
+      "games": [
+        "DNDD01",
+        "GM2E8P"
+      ],
+      "hot_weight": 8.6754,
+      "policy": "balanced",
+      "samples": 2,
+      "simhash": "8fc240eb4f9bd9ad",
+      "span_instructions": 323
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 5,
+        "branches": 5,
+        "calls": 4,
+        "fp_ps": 0,
+        "instructions": 94,
+        "loads": 22,
+        "returns": 1,
+        "stores": 6
+      },
+      "fingerprint": "bdda1f53a02bd4292c286aef87433ef7b42de5d974b8d4ae4c06f268193ef251",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 25.4026,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "6dd560882ecfbb99",
+      "span_instructions": 94
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 2,
+        "calls": 0,
+        "fp_ps": 14,
+        "instructions": 36,
+        "loads": 4,
+        "returns": 1,
+        "stores": 3
+      },
+      "fingerprint": "c0b9025f307cf71f5a523820186820e06b877a1e7345be39002f9ff2396fc89d",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 30.4761,
+      "policy": "balanced",
+      "samples": 7,
+      "simhash": "bee25af620c9a1c0",
+      "span_instructions": 36
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 2,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 10,
+        "loads": 2,
+        "returns": 1,
+        "stores": 0
+      },
+      "fingerprint": "c3e6684a60759be2b8d44d741e4cc8898255fd980fc692590a59a69624dc7dce",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 11.9534,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "bf72f54d2cd0fdd1",
+      "span_instructions": 10
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 16,
+        "branches": 125,
+        "calls": 68,
+        "fp_ps": 16,
+        "instructions": 512,
+        "loads": 86,
+        "returns": 0,
+        "stores": 56
+      },
+      "fingerprint": "c43a6c6d2df7dd923075af5af00436b056fcc9807f3790895c1c0e0ab7ff8e30",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 15.3844,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "51c24c4fac099e41",
+      "span_instructions": 512
+    },
+    {
+      "confidence": 0.77,
+      "features": {
+        "back_edges": 1,
+        "branches": 1,
+        "calls": 1,
+        "fp_ps": 0,
+        "instructions": 21,
+        "loads": 5,
+        "returns": 1,
+        "stores": 4
+      },
+      "fingerprint": "c4d3e292ae21f9e30bf14755aa4535d2950a544f2b105b979c178f05ec9cb646",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 7.5033,
+      "policy": "balanced",
+      "samples": 2,
+      "simhash": "2c78ca0aefacbd1d",
+      "span_instructions": 21
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 7,
+        "branches": 54,
+        "calls": 16,
+        "fp_ps": 15,
+        "instructions": 244,
+        "loads": 41,
+        "returns": 1,
+        "stores": 16
+      },
+      "fingerprint": "ca9ff4e8fa08eab45895378ca2f2fc8537099397f77216245d3f69e2e5b8ce26",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 67.9511,
+      "policy": "aggressive",
+      "samples": 8,
+      "simhash": "c3c83ece0ecb8ca1",
+      "span_instructions": 244
+    },
+    {
+      "confidence": 0.77,
+      "features": {
+        "back_edges": 0,
+        "branches": 5,
+        "calls": 1,
+        "fp_ps": 0,
+        "instructions": 31,
+        "loads": 5,
+        "returns": 1,
+        "stores": 4
+      },
+      "fingerprint": "cc68487ad6881439c27f7cd443109135a6b5367080ddbfbc23568f8cd1373b97",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 7.5714,
+      "policy": "balanced",
+      "samples": 2,
+      "simhash": "a9c8984fce859205",
+      "span_instructions": 31
+    },
+    {
+      "confidence": 0.77,
+      "features": {
+        "back_edges": 2,
+        "branches": 8,
+        "calls": 0,
+        "fp_ps": 26,
+        "instructions": 123,
+        "loads": 28,
+        "returns": 1,
+        "stores": 15
+      },
+      "fingerprint": "cd56ecaa3ff3409c918c54da0c5df866f7dc9af57567de9414c3bd6821d888e6",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 4.0727,
+      "policy": "balanced",
+      "samples": 2,
+      "simhash": "cccacc4bcfd6c9a5",
+      "span_instructions": 123
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 3,
+        "branches": 12,
+        "calls": 6,
+        "fp_ps": 0,
+        "instructions": 40,
+        "loads": 14,
+        "returns": 1,
+        "stores": 3
+      },
+      "fingerprint": "d929955bd4620decb27cbc110ba36ce0102f587a8a94bbdb2c44a675b2988e4d",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.5282,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "acc85a5cead4b6fc",
+      "span_instructions": 40
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 1,
+        "branches": 2,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 12,
+        "loads": 0,
+        "returns": 1,
+        "stores": 0
+      },
+      "fingerprint": "e2f8d5d177e51fd623f2ad5d52434712aa58ceaa821c6f62ac27eb0e0e535382",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.5566,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "d7e5425dac4cb7db",
+      "span_instructions": 12
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 18,
+        "branches": 52,
+        "calls": 27,
+        "fp_ps": 0,
+        "instructions": 235,
+        "loads": 28,
+        "returns": 1,
+        "stores": 25
+      },
+      "fingerprint": "eb9ddd09452f0f1f373dc7dbb7d9c18c4165e44da3540b9b0496b15733e25008",
+      "games": [
+        "GMFE69"
+      ],
+      "hot_weight": 8.5161,
+      "policy": "aggressive",
+      "samples": 1,
+      "simhash": "2bf05c4dafe89ed9",
+      "span_instructions": 235
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 29,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 216,
+        "loads": 56,
+        "returns": 1,
+        "stores": 31
+      },
+      "fingerprint": "ed79f6949fd81f47633778f460a9dad24c342c83c1e6a042235cb98a81b3acd1",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 15.2315,
+      "policy": "balanced",
+      "samples": 5,
+      "simhash": "9b50d85420ceaf6e",
+      "span_instructions": 216
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 9,
+        "branches": 58,
+        "calls": 3,
+        "fp_ps": 0,
+        "instructions": 189,
+        "loads": 22,
+        "returns": 1,
+        "stores": 3
+      },
+      "fingerprint": "efcfcb1f3b24097aec4418582170456a06ca357fca64fe253783984047dcf1d6",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 2.5545,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "87f0d2450ceb8ec1",
+      "span_instructions": 189
+    },
+    {
+      "confidence": 0.84,
+      "features": {
+        "back_edges": 1,
+        "branches": 40,
+        "calls": 27,
+        "fp_ps": 0,
+        "instructions": 192,
+        "loads": 69,
+        "returns": 1,
+        "stores": 3
+      },
+      "fingerprint": "f0fe5d2a3a37b53c3b5d3ec21c55f66800a4bfadd5b4293804eae2ba37f205a7",
+      "games": [
+        "DNDD01"
+      ],
+      "hot_weight": 6.8211,
+      "policy": "balanced",
+      "samples": 3,
+      "simhash": "82718a236aac9a55",
+      "span_instructions": 192
+    },
+    {
+      "confidence": 0.77,
+      "features": {
+        "back_edges": 0,
+        "branches": 0,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 29,
+        "loads": 5,
+        "returns": 1,
+        "stores": 9
+      },
+      "fingerprint": "f96b2415f6edb91b215c7490502590c8979e18a619f371f3d190d4d942b50221",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 6.7814,
+      "policy": "balanced",
+      "samples": 2,
+      "simhash": "c77e606aa7d8ba80",
+      "span_instructions": 29
+    },
+    {
+      "confidence": 0.7,
+      "features": {
+        "back_edges": 0,
+        "branches": 3,
+        "calls": 1,
+        "fp_ps": 0,
+        "instructions": 30,
+        "loads": 7,
+        "returns": 1,
+        "stores": 7
+      },
+      "fingerprint": "fb779bc3fad7fd87af0b448c67b27ddc066f2344cc8afc3810f983dfdb357bfb",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 4.3125,
+      "policy": "balanced",
+      "samples": 1,
+      "simhash": "9e6a9ace4bc6f98d",
+      "span_instructions": 30
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 1,
+        "branches": 1,
+        "calls": 1,
+        "fp_ps": 15,
+        "instructions": 29,
+        "loads": 0,
+        "returns": 1,
+        "stores": 6
+      },
+      "fingerprint": "fc9558ac454009250008d17703a70292ba11788f520b99d2d17a9123d0605c79",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 42.0338,
+      "policy": "balanced",
+      "samples": 8,
+      "simhash": "02e9ca5da4224bdb",
+      "span_instructions": 29
+    },
+    {
+      "confidence": 0.98,
+      "features": {
+        "back_edges": 0,
+        "branches": 2,
+        "calls": 0,
+        "fp_ps": 0,
+        "instructions": 9,
+        "loads": 0,
+        "returns": 1,
+        "stores": 0
+      },
+      "fingerprint": "fefb0414145a6df1cad81fb7e42a10e3d1d5e7386cd62f8bea4b90092fea904a",
+      "games": [
+        "GM2E8P",
+        "GMFE69"
+      ],
+      "hot_weight": 79.9383,
+      "policy": "aggressive",
+      "samples": 9,
+      "simhash": "3b377887e6e5fb9e",
+      "span_instructions": 9
+    },
+    {
+      "confidence": 0.91,
+      "features": {
+        "back_edges": 0,
+        "branches": 6,
+        "calls": 5,
+        "fp_ps": 0,
+        "instructions": 38,
+        "loads": 5,
+        "returns": 1,
+        "stores": 7
+      },
+      "fingerprint": "ff3fe138436f6006adf22cee6b6706de815d245fcb0f691fb01c72607f320d74",
+      "games": [
+        "GM2E8P"
+      ],
+      "hot_weight": 42.983,
+      "policy": "balanced",
+      "samples": 8,
+      "simhash": "9e6a8d68efd4594d",
+      "span_instructions": 38
+    }
+  ],
+  "kind": "gekkoaot-crossgame-powerpc",
+  "schema": 1,
+  "signature_chunk_instructions": 512
+}

@@ -1,0 +1,31 @@
+diff --git a/src/backend/llvm/passes.cpp b/src/backend/llvm/passes.cpp
+index e96e559..5c679f1 100644
+--- a/src/backend/llvm/passes.cpp
++++ b/src/backend/llvm/passes.cpp
+@@ -4,5 +4,7 @@
+ #include <llvm/Analysis/LoopAnalysisManager.h>
+ #include <llvm/IR/Module.h>
+ #include <llvm/Passes/PassBuilder.h>
++#include <llvm/Support/CommandLine.h>
+ #include <llvm/Support/VirtualFileSystem.h>
++#include <mutex>
+ #include <llvm/Target/TargetMachine.h>
+@@ -10,1 +12,13 @@
++static void configureGekkoAOTLlvmOptions(const DolLLVMOptions &options) {
++  if (!options.profile_generate_path || !options.profile_generate_path[0])
++    return;
++
++  static std::once_flag once;
++  std::call_once(once, [] {
++    const char *argv[] = {"dolrecomp"};
++    llvm::cl::ParseCommandLineOptions(1, argv, "", nullptr,
++                                      "DOLRECOMP_LLVM_OPTIONS");
++  });
++}
++
+ namespace dolllvm {
+@@ -24,3 +38,4 @@
+ bool optimizeModule(Module &module, TargetMachine &machine,
+                     const DolLLVMOptions &options, raw_ostream &diagnostics) {
++  configureGekkoAOTLlvmOptions(options);
+   if (options.optimization_level <= 0)

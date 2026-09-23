@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "disc_id": "GHSE69",
+  "name": "Harry Potter and the Chamber of Secrets (USA)",
+  "pack_version": 4,
+  "source_project": "ant0-blase/HPCOS-GC-RECOMP",
+  "compatibility": {
+    "snapshot": "0.0.1",
+    "state": "menu",
+    "note": "Reaches the menu; loading screen stalls before gameplay."
+  },
+  "runtime_features": [],
+  "planned_runtime_features": [
+    "dynamic-aspect",
+    "guest-fov",
+    "high-rate-render-fixed-physics",
+    "xfb-overscan-correction",
+    "fast-directory-io",
+    "keyboard-mouse-overlay"
+  ],
+  "ui": {
+    "title": "Harry Potter and the Chamber of Secrets",
+    "options": []
+  }
+}

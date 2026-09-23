@@ -1,0 +1,143 @@
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index 92f358b..ff48ec1 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -763,7 +763,9 @@ auto attr_load_nbt_slice(const ShaderConfig& config, NbtSlice slice, std::string
+       dlExtra = sliceIdx * 2u;
+     }
+   }
+-  const u32 within = sliceIdx * 3u * compsize;
++  // NBT3 carries three independent indices, each selecting one XYZ vector.
++  // Only the single-index NBT layout stores B and T after N in one element.
++  const u32 within = mapping.nbt3 ? 0u : sliceIdx * 3u * compsize;
+   const auto [offs, buf, le] = attr_address(mapping, GX_VA_NRM, vidx, config.vtxStride, dlExtra, within);
+   auto sliceMapping = mapping;
+   sliceMapping.cnt = 3;
+@@ -1246,7 +1248,14 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+       UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
+     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];", i);
++        // GX_IDENTITY (60) bypasses the texture matrix. It would otherwise
++        // address postex_mtx[20], one element past the 10 PN + 10 tex matrices.
++        vtxXfrAttrs += fmt::format(
++            "\n    var tc{0}_tmp = tc{0}.xyz;"
++            "\n    if (in_texmtxidx{0} < {1}u) {{"
++            "\n        tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];"
++            "\n    }}",
++            i, static_cast<u32>(GX_IDENTITY));
+       } else if (tcg.mtx == GX_IDENTITY) {
+         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0}.xyz;", i);
+       } else {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 8323015..7388e8b 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -108,6 +108,22 @@ if (AURORA_ENABLE_GX)
+ 
+   gtest_discover_tests(gx_fifo_tests)
+ 
++  add_executable(gx_shader_tests
++    nbt3_shader_test.cpp
++  )
++  target_include_directories(gx_shader_tests PRIVATE
++    ../include
++    ../lib
++  )
++  target_compile_definitions(gx_shader_tests PRIVATE AURORA TARGET_PC)
++  target_link_libraries(gx_shader_tests PRIVATE
++    aurora::gx
++    aurora::vi
++    gtest
++    gtest_main
++  )
++  gtest_discover_tests(gx_shader_tests)
++
+   add_executable(gx_texture_cache_tests
+     gx_texture_cache_test.cpp
+     gx_texture_cache_test_stubs.cpp
+diff --git a/tests/nbt3_shader_test.cpp b/tests/nbt3_shader_test.cpp
+new file mode 100644
+index 0000000..fd93781
+--- /dev/null
++++ b/tests/nbt3_shader_test.cpp
+@@ -0,0 +1,79 @@
++#include <gtest/gtest.h>
++
++#include "gx/gx.hpp"
++
++#include <string>
++#include <string_view>
++
++namespace aurora::gx {
++namespace {
++
++std::string nbt_slice_line(GXTexGenSrc source) {
++  ShaderConfig config{};
++  config.vtxStride = 15;
++  config.attrs[GX_VA_POS] = {
++      .attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32, .offset = 0};
++  config.attrs[GX_VA_NRM] = {
++      .attrType = GX_INDEX8, .cnt = 9, .compType = GX_S16,
++      .offset = 12, .stride = 6, .le = false, .nbt3 = true};
++  config.tevStageCount = 1;
++  auto& stage = config.tevStages[0];
++  stage.colorPass.d = GX_CC_TEXC;
++  stage.texCoordId = GX_TEXCOORD0;
++  stage.texMapId = GX_TEXMAP0;
++  config.tcgs[0].src = source;
++
++  const std::string shader = build_shader_source(config);
++  const std::string_view declaration = source == GX_TG_BINRM ? "let in_binrm = " : "let in_tangent = ";
++  const auto start = shader.find(declaration);
++  if (start == std::string::npos) return {};
++  const auto end = shader.find(';', start);
++  if (end == std::string::npos) return {};
++  return shader.substr(start, end - start);
++}
++
++TEST(GxShaderTest, Nbt3BinormalIndexSelectsOneXyzElement) {
++  const auto line = nbt_slice_line(GX_TG_BINRM);
++  ASSERT_FALSE(line.empty());
++  // The second independent index is at vertex offset 13. It selects one
++  // six-byte XYZ vector; there is no additional B offset after that lookup.
++  EXPECT_NE(line.find("+ 13u) * 6u + 0u"), std::string::npos) << line;
++}
++
++TEST(GxShaderTest, Nbt3TangentIndexSelectsOneXyzElement) {
++  const auto line = nbt_slice_line(GX_TG_TANGENT);
++  ASSERT_FALSE(line.empty());
++  // The third independent index is at vertex offset 14.
++  EXPECT_NE(line.find("+ 14u) * 6u + 0u"), std::string::npos) << line;
++}
++
++TEST(GxShaderTest, DynamicTextureMatrixIdentityDoesNotIndexPastUniformArray) {
++  ShaderConfig config{};
++  config.vtxStride = 21;
++  config.attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32, .offset = 0};
++  config.attrs[GX_VA_TEX0MTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8, .offset = 12};
++  config.attrs[GX_VA_TEX0] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32, .offset = 13};
++  config.tevStageCount = 1;
++  auto& stage = config.tevStages[0];
++  stage.colorPass.d = GX_CC_TEXC;
++  stage.texCoordId = GX_TEXCOORD0;
++  stage.texMapId = GX_TEXMAP0;
++  config.tcgs[0].src = GX_TG_TEX0;
++  config.tcgs[0].mtx = GX_TEXMTX0;
++
++  const std::string shader = build_shader_source(config);
++  const auto identity = shader.find("var tc0_tmp = tc0.xyz;");
++  const auto guard = shader.find("if (in_texmtxidx0 < 60u) {", identity);
++  const auto lookup = shader.find("tc0_tmp = tc0 * ubuf.postex_mtx[in_texmtxidx0 / 3u];", guard);
++  const auto endGuard = shader.find('}', guard);
++  ASSERT_NE(identity, std::string::npos);
++  ASSERT_NE(guard, std::string::npos);
++  ASSERT_NE(lookup, std::string::npos);
++  ASSERT_NE(endGuard, std::string::npos);
++  EXPECT_LT(identity, guard);
++  EXPECT_LT(guard, lookup);
++  EXPECT_LT(lookup, endGuard);
++}
++
++} // namespace
++} // namespace aurora::gx

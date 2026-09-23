@@ -1,0 +1,46 @@
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -1079,5 +1079,11 @@
+   for (u32 idx = 0; idx < config.tevStageCount; ++idx) {
+     const auto& stage = config.tevStages[idx];
++    const bool alphaCompareUsesColor =
++        stage.alphaOp.op == GX_TEV_COMP_R8_GT || stage.alphaOp.op == GX_TEV_COMP_R8_EQ ||
++        stage.alphaOp.op == GX_TEV_COMP_GR16_GT || stage.alphaOp.op == GX_TEV_COMP_GR16_EQ ||
++        stage.alphaOp.op == GX_TEV_COMP_BGR24_GT || stage.alphaOp.op == GX_TEV_COMP_BGR24_EQ;
++    std::string alphaCompareA;
++    std::string alphaCompareB;
+     {
+       const auto color_arg = [&](GXTevColorArg arg) {
+         auto value = color_arg_reg(arg, idx, config, stage);
+@@ -1086,6 +1092,15 @@
+         }
+         return fmt::format("tev_overflow_vec3f({})", value);
+       };
++      // The GX alpha R8/GR16/BGR24 compare modes consume the color A/B
++      // inputs from the same TEV stage. Snapshot them before the color
++      // combiner writes its destination register, which may alias a source.
++      if (alphaCompareUsesColor) {
++        alphaCompareA = fmt::format("tev_alpha_cmp_a{}", idx);
++        alphaCompareB = fmt::format("tev_alpha_cmp_b{}", idx);
++        fragmentFn += fmt::format("\n    let {0} = {2};\n    let {1} = {3};", alphaCompareA, alphaCompareB,
++                                  color_arg(stage.colorPass.a), color_arg(stage.colorPass.b));
++      }
+       std::string_view outReg = regName[stage.colorOp.outReg];
+       std::string op = tev_color_op(stage.colorOp.op, tev_bias(stage.colorOp.bias), tev_scale(stage.colorOp.scale),
+                                     stage.colorOp.clamp, color_arg(stage.colorPass.a), color_arg(stage.colorPass.b),
+@@ -1101,10 +1116,12 @@
+         }
+         return fmt::format("tev_overflow_f32({})", value);
+       };
++      const std::string alphaA = alphaCompareUsesColor ? alphaCompareA : alpha_arg(stage.alphaPass.a);
++      const std::string alphaB = alphaCompareUsesColor ? alphaCompareB : alpha_arg(stage.alphaPass.b);
+       std::string_view outReg = regName[stage.alphaOp.outReg];
+       std::string op = tev_alpha_op(stage.alphaOp.op, tev_bias(stage.alphaOp.bias), tev_scale(stage.alphaOp.scale),
+-                                    stage.alphaOp.clamp, alpha_arg(stage.alphaPass.a), alpha_arg(stage.alphaPass.b),
+-                                    alpha_arg(stage.alphaPass.c), alpha_arg_reg(stage.alphaPass.d, idx, config, stage));
++                                    stage.alphaOp.clamp, alphaA, alphaB, alpha_arg(stage.alphaPass.c),
++                                    alpha_arg_reg(stage.alphaPass.d, idx, config, stage));
+       fragmentFn += fmt::format("\n    {0}.a = {1};", outReg, op);
+       alphaNormalized[stage.alphaOp.outReg] = stage.alphaOp.clamp;
+     }

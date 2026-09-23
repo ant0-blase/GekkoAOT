@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "disc_id": "GMFE69",
+  "name": "Medal of Honor: Frontline (USA)",
+  "pack_version": 3,
+  "source_project": "ant0-blase/MOHFrontline-GC-RECOMP",
+  "compatibility": {
+    "snapshot": "0.0.1",
+    "state": "boot-early-execution",
+    "note": "Boots and reaches early execution with several rendering/runtime glitches."
+  },
+  "runtime_features": [],
+  "planned_runtime_features": [
+    "world-fov",
+    "weapon-fov",
+    "aspect-correct-camera",
+    "hud-safe-area",
+    "frame-target",
+    "pc-input",
+    "native-vfs-audio-video-render",
+    "enhanced-postprocess"
+  ],
+  "ui": {
+    "title": "Medal of Honor: Frontline",
+    "options": []
+  }
+}

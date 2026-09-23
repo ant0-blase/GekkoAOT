@@ -1,0 +1,765 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: Rebuild and replace assets for the current version
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: gekkoaot-release-main
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      needs_release: ${{ steps.plan.outputs.needs_release }}
+      release_exists: ${{ steps.plan.outputs.release_exists }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Validate and plan release
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_publish || false }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
+            echo "Releases must be dispatched from main (got ${GITHUB_REF_NAME})" >&2
+            exit 2
+          fi
+
+          VERSION="$(tr -d '\r\n' < version.txt)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version.txt: $VERSION" >&2
+            exit 2
+          fi
+
+          python tools/release_notes.py --version "$VERSION" --check
+
+          TAG="v${VERSION}"
+          RELEASE_EXISTS=false
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            RELEASE_EXISTS=true
+          fi
+
+          NEEDS_RELEASE=true
+          if [[ "$RELEASE_EXISTS" == true && "$FORCE_PUBLISH" != true ]]; then
+            NEEDS_RELEASE=false
+          fi
+
+          PRERELEASE=false
+          if [[ "$VERSION" == 0.* ]]; then
+            PRERELEASE=true
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "needs_release=$NEEDS_RELEASE"
+            echo "release_exists=$RELEASE_EXISTS"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "version=$VERSION tag=$TAG needs_release=$NEEDS_RELEASE existing=$RELEASE_EXISTS prerelease=$PRERELEASE"
+
+  build-release:
+    needs: plan
+    if: needs.plan.outputs.needs_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: Linux
+            arch: x86_64
+          - os: windows-2022
+            platform: Windows
+            arch: x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+
+      - name: Install Qt (Linux)
+        if: runner.os == 'Linux'
+        uses: jurplel/install-qt-action@v4.4.0
+        with:
+          version: '6.8.3'
+          target: desktop
+          cache: true
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            g++ \
+            pkg-config \
+            libasound2-dev \
+            libpulse-dev \
+            libx11-dev \
+            libxext-dev \
+            libxrandr-dev \
+            libxcursor-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxss-dev \
+            libxtst-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libdecor-0-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev \
+            libegl1-mesa-dev \
+            libvulkan-dev \
+            libdbus-1-dev \
+            libudev-dev \
+            libpipewire-0.3-dev \
+            liburing-dev \
+            libusb-1.0-0-dev \
+            imagemagick
+
+      - name: Validate SDL3 Linux desktop dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for module in \
+            x11 \
+            xext \
+            xrandr \
+            xcursor \
+            xfixes \
+            xi \
+            xkbcommon \
+            wayland-client \
+            wayland-egl \
+            libdecor-0 \
+            libdrm \
+            gbm \
+            egl
+          do
+            if ! pkg-config --exists "$module"; then
+              echo "Missing SDL3 build dependency detected by pkg-config: $module" >&2
+              exit 1
+            fi
+          done
+
+          echo "SDL3 desktop build dependencies are ready."
+
+      - name: Install Qt (Windows)
+        if: runner.os == 'Windows'
+        uses: jurplel/install-qt-action@v4.4.0
+        with:
+          version: '6.8.3'
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Install LLVM 20.1.8 (Linux)
+        if: runner.os == 'Linux'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1.8"
+          directory: ${{ runner.temp }}/llvm
+
+      # The full Windows clang+llvm archive is several GB once unpacked.
+      # Cache the extracted development SDK so release runs do not repeatedly
+      # spend minutes in tar/xz extraction on the hosted Windows runner.
+      - name: Restore LLVM 20.1.8 development SDK cache (Windows)
+        id: llvm-windows-sdk-cache
+        if: runner.os == 'Windows'
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\gekkoaot-llvm-sdk
+          key: gekkoaot-llvm-20.1.8-x86_64-pc-windows-msvc-v1
+
+      - name: Install LLVM 20.1.8 development SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = "20.1.8"
+          $asset = "clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
+          $expectedSha256 = "f229769f11d6a6edc8ada599c0cda964b7dee6ab1a08c6cf9dd7f513e85b107f"
+
+          # Keep the extraction path deliberately short. LLVM contains a large
+          # number of deeply nested headers/CMake files and Windows path/AV
+          # overhead is noticeably worse under the normal _temp hierarchy.
+          $sdkRoot = "C:\gekkoaot-llvm-sdk"
+          $sdk = Join-Path $sdkRoot "clang+llvm-$version-x86_64-pc-windows-msvc"
+          $download = Join-Path $env:RUNNER_TEMP "llvm-sdk-download"
+          $archive = Join-Path $download $asset
+
+          function Test-LlvmSdk([string]$root) {
+            $config = Join-Path $root "lib\cmake\llvm\LLVMConfig.cmake"
+            $configAlt = Join-Path $root "lib\cmake\llvm\llvm-config.cmake"
+            return `
+              ((Test-Path $config) -or (Test-Path $configAlt)) -and `
+              (Test-Path (Join-Path $root "bin\clang.exe")) -and `
+              (Test-Path (Join-Path $root "bin\clang++.exe")) -and `
+              (Test-Path (Join-Path $root "bin\llvm-profdata.exe"))
+          }
+
+          if (Test-LlvmSdk $sdk) {
+            Write-Host "Using cached LLVM development SDK: $sdk"
+          } else {
+            if (Test-Path $sdkRoot) {
+              Write-Host "Removing incomplete LLVM SDK cache tree..."
+              Remove-Item -Recurse -Force $sdkRoot
+            }
+            New-Item -ItemType Directory -Force -Path $sdkRoot, $download | Out-Null
+
+            Write-Host "Downloading full LLVM development archive: $asset"
+            gh release download "llvmorg-$version" `
+              --repo llvm/llvm-project `
+              --pattern $asset `
+              --dir $download `
+              --clobber
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to download LLVM development SDK"
+            }
+            if (-not (Test-Path $archive)) {
+              throw "LLVM archive was not downloaded: $archive"
+            }
+
+            # Detect truncated/corrupt downloads before spending minutes
+            # unpacking them. The digest is for the official LLVM 20.1.8 asset.
+            $actualSha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+            if ($actualSha256 -ne $expectedSha256) {
+              throw "LLVM archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+            }
+
+            Write-Host "Extracting LLVM development SDK..."
+
+            # Run tar as a child process so PowerShell can emit a heartbeat.
+            # GitHub otherwise shows no output for several minutes and the job
+            # looks hung even while xz is actively decompressing.
+            $tar = (Get-Command tar.exe -ErrorAction Stop).Source
+            $arguments = @("-xf", $archive, "-C", $sdkRoot)
+            $process = Start-Process `
+              -FilePath $tar `
+              -ArgumentList $arguments `
+              -NoNewWindow `
+              -PassThru
+
+            $elapsed = 0
+            while (-not $process.HasExited) {
+              Start-Sleep -Seconds 20
+              $elapsed += 20
+              $process.Refresh()
+              if (-not $process.HasExited) {
+                $freeGiB = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+                Write-Host "LLVM extraction still running (${elapsed}s, C: free ${freeGiB} GiB)..."
+              }
+            }
+
+            if ($process.ExitCode -ne 0) {
+              throw "Failed to extract LLVM development SDK (tar exit code $($process.ExitCode))"
+            }
+            if (-not (Test-LlvmSdk $sdk)) {
+              Write-Host "LLVM SDK tree after extraction:"
+              Get-ChildItem -Path $sdkRoot -Depth 3 -ErrorAction SilentlyContinue |
+                Select-Object FullName
+              throw "LLVM development SDK extraction completed but the SDK is incomplete"
+            }
+
+            # The archive is no longer useful after extraction and can consume
+            # close to a GiB of the hosted runner's temporary disk.
+            Remove-Item -Force $archive -ErrorAction SilentlyContinue
+          }
+
+          $llvmConfig = Join-Path $sdk "lib\cmake\llvm\LLVMConfig.cmake"
+          $llvmConfigAlt = Join-Path $sdk "lib\cmake\llvm\llvm-config.cmake"
+          if ((-not (Test-Path $llvmConfig)) -and (Test-Path $llvmConfigAlt)) {
+            $llvmConfig = $llvmConfigAlt
+          }
+
+          "LLVM_PATH=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $sdk "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          Write-Host "LLVM_PATH=$sdk"
+          Write-Host "LLVMConfig=$llvmConfig"
+          & (Join-Path $sdk "bin\clang.exe") --version | Select-Object -First 1
+
+      - name: Save LLVM 20.1.8 development SDK cache (Windows)
+        if: runner.os == 'Windows' && steps.llvm-windows-sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\gekkoaot-llvm-sdk
+          key: gekkoaot-llvm-20.1.8-x86_64-pc-windows-msvc-v1
+
+      - name: Enable MSVC build environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure Linux release
+        if: runner.os == 'Linux'
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DGEKKOAOT_BUILD_GUI=ON
+          -DGEKKOAOT_BUILD_NATIVE_HOST=ON
+          -DGEKKOAOT_NATIVE_NOD=ON
+          -DGEKKOAOT_NATIVE_PORTABLE=ON
+
+      - name: Configure Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DGEKKOAOT_BUILD_GUI=ON `
+            -DGEKKOAOT_BUILD_NATIVE_HOST=ON `
+            -DGEKKOAOT_NATIVE_NOD=ON `
+            -DGEKKOAOT_NATIVE_PORTABLE=ON
+
+      - name: Build Linux release
+        if: runner.os == 'Linux'
+        run: cmake --build build --parallel 2
+
+      - name: Build Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config Release --parallel 2
+
+      - name: Install Linux package tree
+        if: runner.os == 'Linux'
+        run: cmake --install build --prefix "$PWD/package"
+
+      - name: Install Windows package tree
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --install build --config Release --prefix "$PWD/package"
+
+      - name: Deploy Windows Qt runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD "package\bin\gekkoaot.exe"
+          $dest = Join-Path $PWD "package\bin"
+
+          $tool = Get-Command windeployqt.exe -ErrorAction SilentlyContinue
+          if ($tool) {
+            $windeployqt = $tool.Source
+          } elseif ($env:QT_ROOT_DIR -and (Test-Path (Join-Path $env:QT_ROOT_DIR "bin\windeployqt.exe"))) {
+            $windeployqt = Join-Path $env:QT_ROOT_DIR "bin\windeployqt.exe"
+          } else {
+            throw "windeployqt.exe was not found"
+          }
+
+          Write-Host "Using windeployqt: $windeployqt"
+          & $windeployqt `
+            --release `
+            --force `
+            --no-translations `
+            --compiler-runtime `
+            --dir $dest `
+            $exe
+          if ($LASTEXITCODE -ne 0) {
+            throw "windeployqt failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Validate packaged Windows Qt runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $required = @(
+            "package\bin\gekkoaot.exe",
+            "package\bin\Qt6Core.dll",
+            "package\bin\Qt6Gui.dll",
+            "package\bin\Qt6Widgets.dll",
+            "package\bin\platforms\qwindows.dll"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) {
+              Write-Host "Windows package tree:"
+              Get-ChildItem -Path "package\bin" -Recurse | Select-Object FullName
+              throw "Missing deployed Windows runtime file: $path"
+            }
+          }
+
+      - name: Stage portable build toolchain
+        shell: bash
+        run: >-
+          python tools/stage_portable_toolchain.py bootstrap
+          --root "$PWD/package/share/gekkoaot"
+          --platform "${{ matrix.platform }}"
+
+      - name: Prebuild portable engine (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GEKKOAOT_RESOURCE_DIR: ${{ github.workspace }}/package/share/gekkoaot
+          GEKKOAOT_STATE_DIR: ${{ github.workspace }}/portable-engine-state
+          GEKKOAOT_LLVM_DIR: ${{ env.LLVM_PATH }}/lib/cmake/llvm
+        run: |
+          set -euo pipefail
+
+          LLVM_BIN="$LLVM_PATH/bin"
+          test -x "$LLVM_BIN/clang"
+          test -x "$LLVM_BIN/clang++"
+
+          LIBCXX_LINK="$(find "$LLVM_PATH" -type f \( -name 'libc++.so' -o -name 'libc++.so.1' \) -print -quit)"
+          if [[ -z "$LIBCXX_LINK" ]]; then
+            echo "Bundled LLVM libc++ runtime was not found under $LLVM_PATH" >&2
+            find "$LLVM_PATH" -maxdepth 6 -type f \( -name 'libc++*' -o -name 'libunwind*' \) -print || true
+            exit 1
+          fi
+
+          LIBCXX_LIB_DIR="$(dirname "$LIBCXX_LINK")"
+
+          export CC="$LLVM_BIN/clang"
+          export CXX="$LLVM_BIN/clang++"
+
+          # Let Clang discover both libc++'s generic and target-specific
+          # include roots. Forcing only include/c++/v1 hides __config_site.
+          export CXXFLAGS="${CXXFLAGS:-} -stdlib=libc++"
+          export LDFLAGS="${LDFLAGS:-} -fuse-ld=lld -stdlib=libc++ -L$LIBCXX_LIB_DIR -Wl,-rpath,$LIBCXX_LIB_DIR"
+
+          export LD_LIBRARY_PATH="$LIBCXX_LIB_DIR:$LLVM_PATH/lib:${LD_LIBRARY_PATH:-}"
+          export PATH="$LLVM_BIN:$PWD/package/share/gekkoaot/toolchain/cmake/bin:$PWD/package/share/gekkoaot/toolchain/bin:$PATH"
+
+          echo "Portable-engine compiler:"
+          "$CC" --version
+          "$CXX" --version
+          echo "libc++ runtime: $LIBCXX_LINK"
+          echo "CXXFLAGS=$CXXFLAGS"
+          echo "LDFLAGS=$LDFLAGS"
+
+          if command -v ld.lld >/dev/null 2>&1; then
+            ld.lld --version
+          fi
+
+          echo "Clang libc++ include search:"
+          "$CXX" -stdlib=libc++ -v -E -x c++ /dev/null 2>&1 |
+            sed -n '/#include <...> search starts here:/,/End of search list./p'
+
+          cat > "$RUNNER_TEMP/gekkoaot-libcxx-smoke.cpp" <<'EOF'
+          #include <string>
+          #include <vector>
+          int main() {
+            std::string s = "GekkoAOT";
+            std::vector<int> v{1, 2, 3};
+            return (s.size() == 8 && v.size() == 3) ? 0 : 1;
+          }
+          EOF
+
+          "$CXX" $CXXFLAGS "$RUNNER_TEMP/gekkoaot-libcxx-smoke.cpp"             $LDFLAGS -o "$RUNNER_TEMP/gekkoaot-libcxx-smoke"
+          "$RUNNER_TEMP/gekkoaot-libcxx-smoke"
+
+          ./package/bin/gekkoaotctl tools
+
+          python tools/stage_portable_toolchain.py capture-engine             --root "$PWD/package/share/gekkoaot"             --state "$PWD/portable-engine-state"             --platform Linux             --llvm-root "$LLVM_PATH"
+
+      - name: Prebuild portable engine (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GEKKOAOT_RESOURCE_DIR: ${{ github.workspace }}\package\share\gekkoaot
+          GEKKOAOT_STATE_DIR: ${{ github.workspace }}\portable-engine-state
+        run: |
+          $llvmConfig = Join-Path $env:LLVM_PATH "lib\cmake\llvm\LLVMConfig.cmake"
+          if (-not (Test-Path $llvmConfig)) {
+            throw "LLVMConfig.cmake is missing from LLVM_PATH=$env:LLVM_PATH"
+          }
+
+          $env:GEKKOAOT_LLVM_DIR = Join-Path $env:LLVM_PATH "lib\cmake\llvm"
+
+          # Build DolRecomp with the MSVC ABI matching the Windows LLVM SDK.
+          $env:CC = "cl.exe"
+          $env:CXX = "cl.exe"
+
+          $env:PATH = "$env:LLVM_PATH\bin;$PWD\package\share\gekkoaot\toolchain\cmake\bin;$PWD\package\share\gekkoaot\toolchain\bin;$env:PATH"
+
+          Write-Host "LLVM SDK: $env:LLVM_PATH"
+          Write-Host "LLVM_DIR: $env:GEKKOAOT_LLVM_DIR"
+          & cl.exe 2>&1 | Select-Object -First 3
+          & .\package\bin\gekkoaotctl.exe tools
+          if ($LASTEXITCODE -ne 0) { throw "portable engine prebuild failed" }
+          python tools/stage_portable_toolchain.py capture-engine `
+            --root "$PWD\package\share\gekkoaot" `
+            --state "$PWD\portable-engine-state" `
+            --platform Windows `
+            --llvm-root "$env:LLVM_PATH"
+
+      - name: Smoke-test bundled engine (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GEKKOAOT_RESOURCE_DIR: ${{ github.workspace }}/package/share/gekkoaot
+          GEKKOAOT_STATE_DIR: ${{ runner.temp }}/gekkoaot-portable-smoke
+        run: |
+          set -euo pipefail
+          output="$(./package/bin/gekkoaotctl tools 2>&1)"
+          printf '%s\\n' "$output"
+          grep -q 'GEKKOAOT_PORTABLE_TOOLCHAIN_V1=1' <<<"$output"
+          grep -q 'GEKKOAOT_BUNDLED_DOLRECOMP_V1=1' <<<"$output"
+          grep -q 'GEKKOAOT_BUNDLED_AURORAGX_V1=1' <<<"$output"
+
+      - name: Smoke-test bundled engine (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GEKKOAOT_RESOURCE_DIR: ${{ github.workspace }}\package\share\gekkoaot
+          GEKKOAOT_STATE_DIR: ${{ runner.temp }}\gekkoaot-portable-smoke
+        run: |
+          $output = (& .\package\bin\gekkoaotctl.exe tools 2>&1) | Out-String
+          Write-Host $output
+          if ($LASTEXITCODE -ne 0) { throw "bundled engine smoke test failed" }
+          foreach ($marker in @(
+            "GEKKOAOT_PORTABLE_TOOLCHAIN_V1=1",
+            "GEKKOAOT_BUNDLED_DOLRECOMP_V1=1",
+            "GEKKOAOT_BUNDLED_AURORAGX_V1=1"
+          )) {
+            if ($output -notmatch [regex]::Escape($marker)) {
+              throw "missing portable marker: $marker"
+            }
+          }
+
+      - name: Smoke-test installed Linux controller
+        if: runner.os == 'Linux'
+        env:
+          GEKKOAOT_RESOURCE_DIR: ${{ github.workspace }}/package/share/gekkoaot
+          GEKKOAOT_STATE_DIR: ${{ runner.temp }}/gekkoaot-state
+        run: ./package/bin/gekkoaotctl status
+
+      - name: Smoke-test installed Windows controller
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GEKKOAOT_RESOURCE_DIR: ${{ github.workspace }}\package\share\gekkoaot
+          GEKKOAOT_STATE_DIR: ${{ runner.temp }}\gekkoaot-state
+        run: '& .\package\bin\gekkoaotctl.exe status'
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="GekkoAOT-${{ needs.plan.outputs.tag }}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz"
+          tar -C package -czf "$NAME" .
+          sha256sum "$NAME" > "$NAME.sha256"
+
+      - name: Build Linux AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          APPDIR="$PWD/GekkoAOT.AppDir"
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr"
+          cp -a package/bin "$APPDIR/usr/"
+          cp -a package/share "$APPDIR/usr/"
+
+          mkdir -p "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+
+          ICON="$APPDIR/usr/share/icons/hicolor/256x256/apps/gekkoaot.png"
+
+          if command -v magick >/dev/null 2>&1; then
+            magick assets/gekkoaot-logo.png \
+              -background none \
+              -gravity center \
+              -resize '256x256>' \
+              -extent 256x256 \
+              "$ICON"
+          elif command -v convert >/dev/null 2>&1; then
+            convert assets/gekkoaot-logo.png \
+              -background none \
+              -gravity center \
+              -resize '256x256>' \
+              -extent 256x256 \
+              "$ICON"
+          else
+            echo "ImageMagick is required to prepare the AppImage icon" >&2
+            exit 1
+          fi
+
+          if command -v identify >/dev/null 2>&1; then
+            ICON_SIZE="$(identify -format '%wx%h' "$ICON")"
+            echo "AppImage icon size: $ICON_SIZE"
+            [[ "$ICON_SIZE" == "256x256" ]] || {
+              echo "Invalid generated AppImage icon size: $ICON_SIZE" >&2
+              exit 1
+            }
+          fi
+
+          cat > "$APPDIR/usr/share/applications/gekkoaot.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=GekkoAOT
+          Exec=gekkoaot
+          Icon=gekkoaot
+          Categories=Game;Development;
+          Terminal=false
+          EOF
+
+          curl -L --fail -o linuxdeploy-x86_64.AppImage             https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          curl -L --fail -o linuxdeploy-plugin-qt-x86_64.AppImage             https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
+
+          export QMAKE="$(command -v qmake6 || command -v qmake)"
+          export OUTPUT="GekkoAOT-${VERSION_TAG}-Linux-x86_64.AppImage"
+          args=(
+            --appdir "$APPDIR"
+            --executable "$APPDIR/usr/bin/gekkoaot"
+            --executable "$APPDIR/usr/bin/gekkoaotctl"
+            --executable "$APPDIR/usr/bin/gekkoaot-native-run"
+            --executable "$APPDIR/usr/share/gekkoaot/toolchain/bin/dolrecomp"
+            --desktop-file "$APPDIR/usr/share/applications/gekkoaot.desktop"
+            --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/gekkoaot.png"
+            --plugin qt
+            --output appimage
+          )
+          if [[ -f "$APPDIR/usr/share/gekkoaot/toolchain/bin/libgekkoaot-native-gx.so" ]]; then
+            args+=(--library "$APPDIR/usr/share/gekkoaot/toolchain/bin/libgekkoaot-native-gx.so")
+          fi
+          ./linuxdeploy-x86_64.AppImage --appimage-extract-and-run "${args[@]}"
+          sha256sum "$OUTPUT" > "$OUTPUT.sha256"
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "GekkoAOT-${{ needs.plan.outputs.tag }}-${{ matrix.platform }}-${{ matrix.arch }}.zip"
+          Compress-Archive -Path package\* -DestinationPath $name -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $name).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content -NoNewline "$name.sha256"
+
+      - name: Upload release build
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            GekkoAOT-${{ needs.plan.outputs.tag }}-${{ matrix.platform }}-${{ matrix.arch }}.*
+
+  publish-release:
+    needs:
+      - plan
+      - build-release
+    if: needs.plan.outputs.needs_release == 'true' && needs.build-release.result == 'success'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+
+      - name: Download platform packages
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Build release notes
+        run: python tools/release_notes.py --version "${{ needs.plan.outputs.version }}" --output release-notes.md
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_EXISTS: ${{ needs.plan.outputs.release_exists }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$RELEASE_EXISTS" != true ]]; then
+            flags=()
+            if [[ "$PRERELEASE" == true ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "GekkoAOT $TAG" \
+              --notes-file release-notes.md \
+              "${flags[@]}"
+          fi
+
+          mapfile -t assets < <(find dist -maxdepth 1 -type f -name 'GekkoAOT-*' -print | sort)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "No release assets found" >&2
+            exit 3
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber
+
+  release-please:
+    needs:
+      - plan
+      - publish-release
+    if: >-
+      ${{ always() &&
+          needs.plan.result == 'success' &&
+          ((needs.plan.outputs.needs_release == 'true' && needs.publish-release.result == 'success') ||
+           needs.plan.outputs.needs_release == 'false') }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Prepare next release PR
+        id: release_please
+        continue-on-error: true
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      - name: Report release PR permission issue
+        if: steps.release_please.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::Release Please could not create the next-version PR."
+          echo "Enable Settings > Actions > General > Workflow permissions > Allow GitHub Actions to create and approve pull requests,"
+          echo "or define the RELEASE_PLEASE_TOKEN repository secret with permission to create pull requests."
+          echo "The binary release itself is intentionally not failed by this repository policy issue."

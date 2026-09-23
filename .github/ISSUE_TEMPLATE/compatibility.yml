@@ -1,0 +1,72 @@
+name: Game compatibility report
+description: Report a GameCube title/demo boot, menu, gameplay or regression state.
+title: "[Compat] "
+labels:
+  - compatibility
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing GekkoAOT. Please report the furthest state you can reproduce; boot/menu does not mean playable.
+  - type: input
+    id: title
+    attributes:
+      label: Title
+      placeholder: Harry Potter and the Chamber of Secrets
+    validations:
+      required: true
+  - type: input
+    id: disc_id
+    attributes:
+      label: Disc ID / region
+      placeholder: GHSE69 / USA
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: GekkoAOT revision
+      description: Commit SHA or release tag.
+      placeholder: v0.0.1 or abcdef12
+    validations:
+      required: true
+  - type: dropdown
+    id: state
+    attributes:
+      label: Furthest state reached
+      options:
+        - Does not compile
+        - Compiles
+        - Boots
+        - Menu
+        - In-game / 3D with major issues
+        - Playable with issues
+        - Playable
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      placeholder: Arch Linux x86_64 / Ryzen 5 5600 / RX 6750 XT
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: What happens and where does it first diverge/fail?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt
+      render: shell
+  - type: checkboxes
+    id: legal
+    attributes:
+      label: Confirmation
+      options:
+        - label: I did not attach ROMs, disc images, SDK files, firmware or other proprietary binaries.
+          required: true

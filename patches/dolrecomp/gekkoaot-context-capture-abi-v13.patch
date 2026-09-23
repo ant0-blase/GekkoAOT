@@ -1,0 +1,131 @@
+diff --git a/src/backend/llvm/native_abi.cpp b/src/backend/llvm/native_abi.cpp
+index e618bc2..9aea047 100644
+--- a/src/backend/llvm/native_abi.cpp
++++ b/src/backend/llvm/native_abi.cpp
+@@ -1,6 +1,12 @@
+ #include "backend/llvm/native_abi.h"
+ 
+ #include "backend/llvm/emitter.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <sstream>
++#include <string>
+ #include <llvm/ADT/SmallVector.h>
+ #include <llvm/IR/DerivedTypes.h>
+ #include <llvm/IR/Module.h>
+@@ -37,6 +43,99 @@ bool emptyABI(const DolLLVMFunctionRange &range) {
+   return true;
+ }
+ 
++// GekkoAOT direct-token HLE can replace an SDK function before its guest body
++// executes.  For ordinary leaf helpers the local liveness-derived Native ABI is
++// sufficient.  A scheduler/wait primitive is different: it can snapshot the
++// *caller's* OSContext and resume it much later, so callee-local liveness does
++// not describe the architectural state that must cross the boundary.
++//
++// The GekkoAOT SDK manifest marks only those entries with the optional fourth
++// column "context-capture".  Keep the compiler generic: the manifest owns the
++// policy and DolRecomp merely turns that class into an ABI requirement.
++struct StaticContextCaptureEntry {
++  u32 address = 0;
++};
++
++void AddMaskBit(u64 *mask, DolIRStateSlot slot) {
++  const u32 value = static_cast<u32>(slot);
++  mask[value / 64u] |= 1ull << (value & 63u);
++}
++
++void AddContextCaptureInputs(DolLLVMFunctionRange &range) {
++  // Retail OSSaveContext preserves the stack/TOC, r3's staged return value,
++  // nonvolatile integer state, control state and GQRs.  GekkoAOT's host FP
++  // shadow also preserves the nonvolatile FP/paired-single bank.  These are
++  // ABI inputs even when the intercepted SDK function's own PPC body never
++  // reads them.
++  AddMaskBit(range.input_state, static_cast<DolIRStateSlot>(DOLIR_STATE_GPR0 + 1));
++  AddMaskBit(range.input_state, static_cast<DolIRStateSlot>(DOLIR_STATE_GPR0 + 2));
++  AddMaskBit(range.input_state, static_cast<DolIRStateSlot>(DOLIR_STATE_GPR0 + 3));
++  for (u32 reg = 13; reg < 32; ++reg)
++    AddMaskBit(range.input_state,
++               static_cast<DolIRStateSlot>(DOLIR_STATE_GPR0 + reg));
++  AddMaskBit(range.input_state, DOLIR_STATE_LR);
++  AddMaskBit(range.input_state, DOLIR_STATE_CTR);
++  AddMaskBit(range.input_state, DOLIR_STATE_CR);
++  AddMaskBit(range.input_state, DOLIR_STATE_XER);
++  AddMaskBit(range.input_state, DOLIR_STATE_MSR);
++  AddMaskBit(range.input_state, DOLIR_STATE_FPSCR);
++  for (u32 reg = 1; reg < 8; ++reg)
++    AddMaskBit(range.input_state,
++               static_cast<DolIRStateSlot>(DOLIR_STATE_GQR0 + reg));
++  for (u32 reg = 14; reg < 32; ++reg) {
++    AddMaskBit(range.input_state,
++               static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + reg));
++    AddMaskBit(range.input_state,
++               static_cast<DolIRStateSlot>(DOLIR_STATE_PS1_0 + reg));
++  }
++}
++
++std::vector<StaticContextCaptureEntry> StaticContextCaptureEntries() {
++  std::vector<StaticContextCaptureEntry> result;
++  const char *path = std::getenv("DOLRECOMP_STATIC_INTERCEPTS");
++  if (!path || !*path)
++    return result;
++  std::ifstream in(path);
++  if (!in)
++    return result;
++  std::string line;
++  while (std::getline(in, line)) {
++    if (line.empty() || line[0] == '#')
++      continue;
++    std::istringstream row(line);
++    std::string addressText, name, tokenText, abiClass;
++    if (!(row >> addressText >> name))
++      continue;
++    row >> tokenText >> abiClass;
++    if (abiClass != "context-capture")
++      continue;
++    char *end = nullptr;
++    const unsigned long value = std::strtoul(addressText.c_str(), &end, 0);
++    if (end == addressText.c_str() || *end != '\0' || value > 0xfffffffful)
++      continue;
++    result.push_back({static_cast<u32>(value)});
++  }
++  return result;
++}
++
++u32 ApplyStaticContextCaptureABI(std::vector<DolLLVMFunctionRange> &ranges) {
++  u32 applied = 0;
++  for (const auto &entry : StaticContextCaptureEntries()) {
++    DolLLVMFunctionRange *range = nullptr;
++    for (auto &candidate : ranges) {
++      if (entry.address >= candidate.start && entry.address < candidate.end) {
++        range = &candidate;
++        break;
++      }
++    }
++    if (!range)
++      continue;
++    AddContextCaptureInputs(*range);
++    ++applied;
++  }
++  return applied;
++}
++
+ } // namespace
+ 
+ namespace dolllvm {
+@@ -95,6 +194,13 @@ void prepareModuleABIs(const DolIRModule &source,
+       }
+     }
+   }
++  const u32 contextCapture = ApplyStaticContextCaptureABI(ranges);
++  if (contextCapture) {
++    std::fprintf(stderr,
++                 "GEKKOAOT_DOLRECOMP_CONTEXT_CAPTURE_ABI_V13=1 "
++                 "entries=%u policy=manifest-propagated-caller-state\n",
++                 contextCapture);
++  }
+   if (runtime == DOLLLVM_RUNTIME_MODERNGEKKO)
+     dolllvm_enable_native_services(ranges.data(),
+                                    static_cast<u32>(ranges.size()));

@@ -1,0 +1,72 @@
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -261,7 +261,9 @@
+       auto const& array = g_gxState.arrays[arrayType];
+       const u32 srcOffset = static_cast<u32>(srcArrayIdx) * array.stride;
+       const u32 srcSize = static_cast<u32>(len) * sizeof(u32);
+-      if (array.data == nullptr || array.stride == 0 || srcOffset > array.size ||
++      // A zero stride selects the same matrix/light source for every index.
++      // The byte-range check still rejects an incomplete or unmapped object.
++      if (array.data == nullptr || srcOffset > array.size ||
+           srcSize > array.size - srcOffset) {
+         static u32 invalidIndexedXfLogCount = 0;
+         if (invalidIndexedXfLogCount < 16) {
+diff --git a/tests/gx_fifo_test.cpp b/tests/gx_fifo_test.cpp
+--- a/tests/gx_fifo_test.cpp
++++ b/tests/gx_fifo_test.cpp
+@@ -2031,6 +2031,38 @@
+ 
+ // --- GXLoadPosMtxIndx (indexed XF load from GX_POS_MTX_ARRAY) ---
+ 
++TEST_F(GXFifoTest, LoadPosMtxIndx_ZeroStrideReusesSingleMatrix) {
++  aurora::Mat3x4<float> source{};
++  source.m0 = {1.0f, 2.0f, 3.0f, 4.0f};
++  source.m1 = {5.0f, 6.0f, 7.0f, 8.0f};
++  source.m2 = {9.0f, 10.0f, 11.0f, 12.0f};
++
++  // GXSetArray's address calculation is base + index * stride. A zero
++  // stride selects this one matrix for every index, including index 65535.
++  GXSetArray(GX_POS_MTX_ARRAY, &source, sizeof(source), 0, true);
++  GXLoadPosMtxIndx(7, GX_PNMTX0);
++  GXLoadPosMtxIndx(0xffff, GX_PNMTX1);
++  const auto bytes = capture_fifo();
++
++  reset_gx_state();
++  decode_fifo(bytes);
++  EXPECT_EQ(g_gxState.pnMtx[0].pos, source);
++  EXPECT_EQ(g_gxState.pnMtx[1].pos, source);
++}
++
++TEST_F(GXFifoTest, LoadPosMtxIndx_ZeroStrideStillChecksSourceLength) {
++  aurora::Mat3x4<float> source{};
++  source.m0 = {1.0f, 2.0f, 3.0f, 4.0f};
++  GXSetArray(GX_POS_MTX_ARRAY, &source, sizeof(source) - 1, 0, true);
++  GXLoadPosMtxIndx(7, GX_PNMTX0);
++  const auto bytes = capture_fifo();
++
++  reset_gx_state();
++  const auto before = g_gxState.pnMtx[0].pos;
++  decode_fifo(bytes);
++  EXPECT_EQ(g_gxState.pnMtx[0].pos, before);
++}
++
+ TEST_F(GXFifoTest, LoadPosMtxIndx_RoundTripWithFullIndexAndFollowingCommand) {
+   std::array<aurora::Mat3x4<float>, 257> matrices{};
+   auto& source = matrices[0x100];
+diff --git a/tests/gx_test_stubs.cpp b/tests/gx_test_stubs.cpp
+--- a/tests/gx_test_stubs.cpp
++++ b/tests/gx_test_stubs.cpp
+@@ -127,6 +127,12 @@
+ Range push_indices(const uint8_t* data, size_t length, size_t alignment) { return {}; }
+ Range push_uniform(const uint8_t* data, size_t length) { return {}; }
+ Range push_storage(const uint8_t* data, size_t length) { return {}; }
++// The standalone FIFO tests have no GPU staging buffer. These symbols are
++// needed after the storage-rollover path was added to command_processor.cpp.
++size_t storage_size() noexcept { return 0; }
++size_t storage_capacity() noexcept { return 64u * 1024u * 1024u; }
++size_t storage_alignment() noexcept { return 256u; }
++bool rollover_storage_pass(size_t) { return false; }
+ 
+ Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
+ void set_viewport(const Viewport& viewport) noexcept {}

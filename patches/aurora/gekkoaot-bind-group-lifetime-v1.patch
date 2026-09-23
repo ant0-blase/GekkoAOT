@@ -1,0 +1,160 @@
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+index 24306bf..49eb209 100644
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -667,11 +667,13 @@ void end_frame(EndFrameCallback callback) {
+   auto& frame = *recorded.packet;
+   const size_t frameSlot = recorded.frameSlot;
+   const uint64_t frameId = frame.frameId;
++  const uint32_t completedFrame = frame.frameIndex;
+   end_pipeline_frame();
+   ++g_frameIndex;
+ 
+   const size_t stagingSlot = frame.stagingBuffer;
+-  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
++  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, completedFrame,
++                                              callback = std::move(callback)]() mutable {
+     auto& packet = g_framePackets[frameSlot];
+     g_stagingBuffers[stagingSlot].Unmap();
+     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
+@@ -701,7 +703,9 @@ void end_frame(EndFrameCallback callback) {
+     }
+     (void)storageOverflow;
+     g_frameSlots.release(frameSlot);
+-    expire_cached_bind_groups();
++    // Expire only references older than the frame this worker just submitted.
++    // current_frame() belongs to the CPU recorder and may be many frames ahead.
++    expire_cached_bind_groups(completedFrame);
+     map_staging_buffer(stagingSlot, true);
+     process_events();
+   });
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index f03a57f..9a6ea03 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -904,7 +904,11 @@ RenderTargetLayout get_render_target_layout() noexcept {
+ 
+ void clear_caches() noexcept {
+   g_offscreenCache.clear();
+-  clear_bind_group_cache();
++  // A size change can occur while the CPU is recording a frame. That frame's
++  // DrawData stores bind-group IDs, not owning references; dropping the map
++  // here would invalidate those IDs before the render worker consumes them.
++  // New-size texture views have different descriptor IDs, and the old groups
++  // expire only after their recorded frames have been submitted.
+ }
+ 
+ bool push_custom_draw(DrawTypeId type, const void* payload, size_t payloadSize) {
+diff --git a/lib/gfx/resource_cache.cpp b/lib/gfx/resource_cache.cpp
+index 8c131ab..b37a44f 100644
+--- a/lib/gfx/resource_cache.cpp
++++ b/lib/gfx/resource_cache.cpp
+@@ -39,7 +39,6 @@ struct CachedBindGroup {
+   uint32_t lastUsedFrame = 0;
+ };
+ 
+-constexpr uint32_t BindGroupCacheRetainFrames = 32;
+ constexpr uint32_t BindGroupCacheSweepPeriod = 16;
+ 
+ absl::flat_hash_map<BindGroupRef, CachedBindGroup> g_cachedBindGroups;
+@@ -56,16 +55,16 @@ void clear_bind_group_cache() {
+   g_cachedBindGroups.clear();
+ }
+ 
+-void expire_cached_bind_groups() {
++void expire_cached_bind_groups(uint32_t completedFrame) {
+   std::lock_guard lock{g_bindGroupCacheMutex};
+-  const auto frameIndex = current_frame();
+-  if (g_cachedBindGroups.empty() || frameIndex == UINT32_MAX || frameIndex % BindGroupCacheSweepPeriod != 0) {
++  if (g_cachedBindGroups.empty() || completedFrame == UINT32_MAX ||
++      completedFrame % BindGroupCacheSweepPeriod != 0) {
+     return;
+   }
+ 
+   ZoneScoped;
+   for (auto it = g_cachedBindGroups.begin(); it != g_cachedBindGroups.end();) {
+-    if (frameIndex - it->second.lastUsedFrame > BindGroupCacheRetainFrames) {
++    if (bind_group_cache_expired(completedFrame, it->second.lastUsedFrame)) {
+       g_cachedBindGroups.erase(it++);
+     } else {
+       ++it;
+@@ -100,7 +99,7 @@ BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) {
+ wgpu::BindGroup find_bind_group(BindGroupRef id) {
+   std::lock_guard lock{g_bindGroupCacheMutex};
+   const auto it = g_cachedBindGroups.find(id);
+-  CHECK(it != g_cachedBindGroups.end(), "get_bind_group: failed to locate {:x}", id);
++  AURORA_ASSERT(it != g_cachedBindGroups.end(), "get_bind_group: failed to locate {:x}", id);
+   return it->second.bindGroup;
+ }
+ 
+diff --git a/lib/gfx/resource_cache.hpp b/lib/gfx/resource_cache.hpp
+index c133abd..4497b66 100644
+--- a/lib/gfx/resource_cache.hpp
++++ b/lib/gfx/resource_cache.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "types.hpp"
++#include "resource_cache_lifetime.hpp"
+ 
+ namespace aurora::gfx {
+ 
+@@ -10,7 +11,7 @@ wgpu::Sampler sampler_ref(const wgpu::SamplerDescriptor& descriptor);
+ 
+ namespace detail {
+ void clear_bind_group_cache();
+-void expire_cached_bind_groups();
++void expire_cached_bind_groups(uint32_t completedFrame);
+ void shutdown_resource_cache();
+ } // namespace detail
+ 
+diff --git a/lib/gfx/resource_cache_lifetime.hpp b/lib/gfx/resource_cache_lifetime.hpp
+new file mode 100644
+index 0000000..d061ff7
+--- /dev/null
++++ b/lib/gfx/resource_cache_lifetime.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include <cstdint>
++
++namespace aurora::gfx::detail {
++
++inline constexpr bool bind_group_cache_expired(std::uint32_t completedFrame,
++                                               std::uint32_t lastUsedFrame) noexcept {
++  // A bind group referenced by an already recorded but not yet submitted frame
++  // has a lastUsedFrame later than completedFrame. Signed modular age keeps it
++  // alive, including when the 32-bit frame counter wraps.
++  const auto age = completedFrame - lastUsedFrame;
++  return age > 32u && age < 0x80000000u;
++}
++
++} // namespace aurora::gfx::detail
+diff --git a/tests/render_worker_test.cpp b/tests/render_worker_test.cpp
+index 74e83ed..22038ec 100644
+--- a/tests/render_worker_test.cpp
++++ b/tests/render_worker_test.cpp
+@@ -1,4 +1,5 @@
+ #include "../lib/gfx/render_worker.hpp"
++#include "../lib/gfx/resource_cache_lifetime.hpp"
+ 
+ #include <atomic>
+ #include <chrono>
+@@ -41,6 +42,17 @@ TEST(RenderWorkerQueue, PreservesOrdering) {
+   EXPECT_FALSE(closed);
+ }
+ 
++TEST(BindGroupCacheLifetime, RetainsReferencesFromQueuedFrames) {
++  using aurora::gfx::detail::bind_group_cache_expired;
++  EXPECT_FALSE(bind_group_cache_expired(100, 101));
++  EXPECT_FALSE(bind_group_cache_expired(100, 100));
++  EXPECT_FALSE(bind_group_cache_expired(100, 68));
++  EXPECT_FALSE(bind_group_cache_expired(100, 70));
++  EXPECT_TRUE(bind_group_cache_expired(100, 67));
++  EXPECT_FALSE(bind_group_cache_expired(0, UINT32_MAX));
++  EXPECT_TRUE(bind_group_cache_expired(1, UINT32_MAX - 32));
++}
++
+ TEST(RenderWorkerQueue, PushBlocksWhenFull) {
+   BoundedQueue queue{1};
+   ASSERT_TRUE(queue.push(QueueItem{.type = ItemType::BeginFrame}));
