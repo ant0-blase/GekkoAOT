@@ -1,0 +1,101 @@
+diff --git a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -148,5 +148,5 @@ private:
+   llvm::Value *rangeCheck(llvm::Value *normalized, u32 base, llvm::Value *size,
+                           u32 width);
+   llvm::Value *endianLoad(llvm::Value *pointer, llvm::Type *result_type,
+-                          u32 width);
++                          u32 width, bool volatile_load = false);
+   llvm::Value *externalRead(llvm::Value *address, u32 width);
+@@ -214,5 +214,6 @@ private:
+   std::vector<llvm::BasicBlock *> blocks_;
+   std::vector<bool> region_leaders_;
+   std::vector<bool> loop_headers_;
++  std::vector<bool> loop_members_;
+   std::vector<llvm::Value *> values_;
+   std::vector<u32> continuations_;
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -139,5 +139,6 @@ void FunctionEmitter::scanContinuations() {
+
+ void FunctionEmitter::scanLoopHeaders() {
+   loop_headers_.assign(source_.block_count, false);
++  loop_members_.assign(source_.block_count, false);
+   for (u32 i = 0; i < source_.block_count; i++) {
+     const DolIRTerminator &term = source_.blocks[i].terminator;
+@@ -148,7 +149,17 @@ void FunctionEmitter::scanLoopHeaders() {
+                                                     : 0u;
+     for (u32 edge = 0; edge < count; edge++) {
+-      if (term.targets[edge] != DOLIR_NO_BLOCK && term.targets[edge] <= i)
+-        loop_headers_[term.targets[edge]] = true;
++      if (term.targets[edge] == DOLIR_NO_BLOCK || term.targets[edge] > i)
++        continue;
++
++      const u32 header = term.targets[edge];
++      loop_headers_[header] = true;
++
++      // A backedge proves that every instruction-address block in the lexical
++      // interval can execute inside a native loop.  Keep a conservative loop
++      // membership map so guest-RAM polling loads remain observable across
++      // scheduler/IRQ/DMA side exits without making all MEM1 accesses volatile.
++      for (u32 member = header; member <= i; ++member)
++        loop_members_[member] = true;
+     }
+   }
+ }
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -43,9 +43,10 @@ Value *FunctionEmitter::rangeCheck(Value *normalized, u32 base, Value *size,
+ }
+
+ Value *FunctionEmitter::endianLoad(Value *pointer, Type *resultType,
+-                                   u32 width) {
++                                   u32 width, bool volatileLoad) {
+   Type *integerType = IntegerType::get(context_, width * 8u);
+   LoadInst *load = builder_.CreateLoad(integerType, pointer, "native.load");
+   load->setAlignment(Align(1));
++  load->setVolatile(volatileLoad);
+   Value *loaded = load;
+   loaded = bswap(loaded);
+@@ -61,8 +63,17 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+     address = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
+   }
+
++  bool loopPollingLoad = false;
++  if (instruction.guest_pc >= source_.guest_start) {
++    const u32 block = (instruction.guest_pc - source_.guest_start) / 4u;
++    loopPollingLoad = block < loop_members_.size() && loop_members_[block];
++  }
++
+   Value *directOffset = nullptr;
+   if (Value *pointer =
+           provenMemoryPointer(instruction, address, width, &directOffset)) {
+-    Value *loaded = endianLoad(pointer, resultType, width);
++    // A proven direct pointer here is MEM1.  Volatile only while executing a
++    // loop member: this prevents LLVM from hoisting a shared flag load out of
++    // a PPC polling loop while preserving the ordinary MEM1 fast path.
++    Value *loaded = endianLoad(pointer, resultType, width, loopPollingLoad);
+     if (sign && width * 8u < resultType->getIntegerBitWidth()) {
+@@ -73,5 +84,6 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+   }
+   Value *stackOffset = nullptr;
+   if (Value *pointer = adaptiveStackMemoryPointer(address, width, &stackOffset)) {
+-    Value *loaded = endianLoad(pointer, resultType, width);
++    // r1-local stack traffic is private to the currently executing OSThread.
++    Value *loaded = endianLoad(pointer, resultType, width, false);
+     if (sign && width * 8u < resultType->getIntegerBitWidth()) {
+@@ -112,4 +124,4 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+   Value *mem1Ptr =
+       builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, mem1Offset);
+-  Value *mem1Value = endianLoad(mem1Ptr, resultType, width);
++  Value *mem1Value = endianLoad(mem1Ptr, resultType, width, loopPollingLoad);
+   builder_.CreateBr(join);
+@@ -132,4 +144,4 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+   Value *mem2Ptr =
+       builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), mem2_, mem2Offset);
+-  Value *mem2Value = endianLoad(mem2Ptr, resultType, width);
++  Value *mem2Value = endianLoad(mem2Ptr, resultType, width, loopPollingLoad);
+   builder_.CreateBr(join);

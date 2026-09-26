@@ -1,0 +1,130 @@
+diff --git a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+index 3f96b38..c621026 100644
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -2,6 +2,8 @@ private:
+   std::string blockName(u32 index) const;
+   std::string symbolName(llvm::StringRef base) const;
+   bool adaptiveHot() const;
++  llvm::Value *adaptiveStackMemoryPointer(llvm::Value *address, u32 width,
++                                          llvm::Value **offset);
+   llvm::Type *type(DolIRType type);
+   llvm::FunctionType *bodyFunctionType(const DolLLVMFunctionRange *range);
+   llvm::CallingConv::ID bodyCallingConvention() const;
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+index 2f248ab..0636e91 100644
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -4,6 +4,7 @@
+ #include <llvm/IR/BasicBlock.h>
+ #include <llvm/IR/Function.h>
+ #include <llvm/IR/GlobalVariable.h>
++#include <llvm/IR/Instructions.h>
+ #include <llvm/IR/MDBuilder.h>
+ #include <llvm/IR/Module.h>
+ #include <llvm/Support/Alignment.h>
+@@ -16,6 +17,64 @@ Value *FunctionEmitter::normalizeAddress(Value *address) {
+   return builder_.CreateAnd(address, builder_.getInt32(~0x40000000u));
+ }
+ 
++Value *FunctionEmitter::adaptiveStackMemoryPointer(Value *address, u32 width,
++                                                   Value **offset) {
++  // WiiCompiled's StackAddressFacts/GuestMemoryRangeLowering gets much of its
++  // win by proving that r1-relative accesses stay inside guest RAM and then
++  // reusing a resolved host base. DolRecomp already promotes PGO-hot state to
++  // SSA, so recognise the same affine shape directly in LLVM IR. The Gekko ABI
++  // requires r1 to be a valid cached MEM1 stack pointer; keep the accepted
++  // displacement deliberately small so this cannot turn arbitrary pointer
++  // arithmetic into a host access.
++  constexpr auto stackSlot =
++      static_cast<DolIRStateSlot>(DOLIR_STATE_GPR0 + 1);
++  if (!adaptiveHot() || !fixed_memory_layout_ || expected_mem2_size_ != 0u ||
++      expected_ram_size_ < 8192u || !offset || !state_[stackSlot])
++    return nullptr;
++
++  Value *cursor = address;
++  s64 displacement = 0;
++  for (u32 depth = 0; depth < 4u; ++depth) {
++    if (auto *load = dyn_cast<LoadInst>(cursor)) {
++      Value *source = load->getPointerOperand()->stripPointerCasts();
++      Value *stack = state_[stackSlot]->stripPointerCasts();
++      if (source != stack)
++        return nullptr;
++      if (displacement < -4096ll ||
++          displacement > 4096ll - static_cast<s64>(width))
++        return nullptr;
++
++      Value *normalizedStack = normalizeAddress(load);
++      Value *stackOffset = builder_.CreateSub(
++          normalizedStack, builder_.getInt32(GC_RAM_BASE), "stack.mem1.base");
++      *offset = builder_.CreateAdd(
++          stackOffset,
++          builder_.getInt32(static_cast<u32>(static_cast<s32>(displacement))),
++          "stack.mem1.offset");
++      function_->addFnAttr("dolrecomp-adaptive-stack-range", "mem1-4k");
++      return builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, *offset,
++                                        "stack.mem1.ptr");
++    }
++
++    auto *binary = dyn_cast<BinaryOperator>(cursor);
++    if (!binary)
++      return nullptr;
++    ConstantInt *constant = dyn_cast<ConstantInt>(binary->getOperand(1));
++    Value *next = binary->getOperand(0);
++    bool subtract = binary->getOpcode() == Instruction::Sub;
++    if (!constant && binary->getOpcode() == Instruction::Add) {
++      constant = dyn_cast<ConstantInt>(binary->getOperand(0));
++      next = binary->getOperand(1);
++    }
++    if (!constant || (binary->getOpcode() != Instruction::Add && !subtract))
++      return nullptr;
++    const s64 delta = constant->getSExtValue();
++    displacement += subtract ? -delta : delta;
++    cursor = next;
++  }
++  return nullptr;
++}
++
+ Value *FunctionEmitter::provenMemoryPointer(const DolIRInstruction &instruction,
+                                             Value *address, u32 width,
+                                             Value **offset) {
+@@ -34,6 +93,16 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+     }
+     return loaded;
+   }
++  Value *stackOffset = nullptr;
++  if (Value *pointer = adaptiveStackMemoryPointer(address, width, &stackOffset)) {
++    Value *loaded = endianLoad(pointer, resultType, width);
++    if (sign && width * 8u < resultType->getIntegerBitWidth()) {
++      Value *narrow = builder_.CreateTrunc(
++          loaded, IntegerType::get(context_, width * 8u));
++      return builder_.CreateSExt(narrow, resultType);
++    }
++    return loaded;
++  }
+   Value *normalized = normalizeAddress(address);
+   Value *mem1 = nullptr;
+   if (fixed_memory_layout_ && expected_mem2_size_ == 0 &&
+@@ -73,6 +142,22 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+     endianStore(pointer, value, width);
+     return;
+   }
++  if (instruction.address_domain == DOLIR_ADDRESS_FIFO ||
++      instruction.address_domain == DOLIR_ADDRESS_MMIO) {
++    clearReservation(address);
++    materializeFPRF();
++    function_->addFnAttr("dolrecomp-direct-hardware-store", "1");
++    externalWrite(address, value, width);
++    return;
++  }
++
++  Value *stackOffset = nullptr;
++  if (Value *pointer = adaptiveStackMemoryPointer(address, width, &stackOffset)) {
++    clearReservation(address);
++    journal(stackOffset, width);
++    endianStore(pointer, value, width);
++    return;
++  }
+   clearReservation(address);
+   Value *normalized = normalizeAddress(address);
+   BasicBlock *mem1Block = BasicBlock::Create(context_, "store_mem1", function_);

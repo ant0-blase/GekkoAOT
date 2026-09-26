@@ -1,0 +1,212 @@
+diff --git a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+index 0e60098..f45a6a1 100644
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -50,5 +50,6 @@ private:
+   std::string blockName(u32 index) const;
+   std::string symbolName(llvm::StringRef base) const;
++  bool adaptiveHot() const;
+   llvm::Type *type(DolIRType type);
+   llvm::FunctionType *bodyFunctionType(const DolLLVMFunctionRange *range);
+   llvm::CallingConv::ID bodyCallingConvention() const;
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+index 73c362e..90ac180 100644
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -154,14 +154,41 @@
+ void FunctionEmitter::clearReservation(Value *address) {
+   Value *valid = builder_.CreateLoad(Type::getInt1Ty(context_),
+                                      state_[DOLIR_STATE_RESERVE_VALID]);
++  // Hot functions keep reservation state in SSA. Branchless invalidation lets
++  // GVN/InstCombine propagate reserve_valid and delete the sequence entirely
++  // when no lwarx reservation reaches the store.
++  if (adaptiveHot()) {
++    Value *reserved = builder_.CreateLoad(Type::getInt32Ty(context_),
++                                          state_[DOLIR_STATE_RESERVE_ADDR]);
++    Value *differentLine = builder_.CreateICmpNE(
++        builder_.CreateAnd(builder_.CreateXor(reserved, address),
++                           builder_.getInt32(~31u)),
++        builder_.getInt32(0));
++    builder_.CreateStore(builder_.CreateAnd(valid, differentLine),
++                         state_[DOLIR_STATE_RESERVE_VALID]);
++    return;
++  }
++
++  BasicBlock *check = BasicBlock::Create(context_, "reserve_check", function_);
++  BasicBlock *clear = BasicBlock::Create(context_, "reserve_clear", function_);
++  BasicBlock *done = BasicBlock::Create(context_, "reserve_done", function_);
++  builder_.CreateCondBr(valid, check, done,
++                        MDBuilder(context_).createBranchWeights(1, 8192));
++
++  builder_.SetInsertPoint(check);
+   Value *reserved = builder_.CreateLoad(Type::getInt32Ty(context_),
+                                         state_[DOLIR_STATE_RESERVE_ADDR]);
+-  Value *differentLine = builder_.CreateICmpNE(
++  Value *sameLine = builder_.CreateICmpEQ(
+       builder_.CreateAnd(builder_.CreateXor(reserved, address),
+                          builder_.getInt32(~31u)),
+       builder_.getInt32(0));
+-  builder_.CreateStore(builder_.CreateAnd(valid, differentLine),
+-                       state_[DOLIR_STATE_RESERVE_VALID]);
++  builder_.CreateCondBr(sameLine, clear, done);
++
++  builder_.SetInsertPoint(clear);
++  builder_.CreateStore(builder_.getFalse(), state_[DOLIR_STATE_RESERVE_VALID]);
++  builder_.CreateBr(done);
++
++  builder_.SetInsertPoint(done);
+ }
+
+ void FunctionEmitter::journal(Value *offset, u32 width) {
+diff --git a/src/backend/llvm/passes.cpp b/src/backend/llvm/passes.cpp
+index cb100e6..7964e96 100644
+--- a/src/backend/llvm/passes.cpp
++++ b/src/backend/llvm/passes.cpp
+@@ -9,6 +9,11 @@
+ #include <mutex>
+ #include <llvm/Target/TargetMachine.h>
+
++#include <cstdlib>
++#include <fstream>
++#include <string>
++#include <unordered_set>
++
+ static void configureGekkoAOTLlvmOptions(const DolLLVMOptions &options) {
+   if (!options.profile_generate_path || !options.profile_generate_path[0])
+     return;
+@@ -25,6 +30,63 @@ namespace dolllvm {
+
+ using namespace llvm;
+
++static std::unordered_set<u32> adaptiveHotAddresses() {
++  std::unordered_set<u32> result;
++  const char *path = std::getenv("DOLRECOMP_ADAPTIVE_HOT_FUNCTIONS");
++  if (!path || !*path)
++    return result;
++
++  std::ifstream input(path);
++  std::string line;
++  while (std::getline(input, line)) {
++    const auto comment = line.find('#');
++    if (comment != std::string::npos)
++      line.resize(comment);
++    const auto first = line.find_first_not_of(" \t\r\n");
++    if (first == std::string::npos)
++      continue;
++    const auto last = line.find_last_not_of(" \t\r\n");
++    line = line.substr(first, last - first + 1u);
++
++    char *end = nullptr;
++    const unsigned long value = std::strtoul(line.c_str(), &end, 16);
++    if (end && *end == '\0' && value <= 0xfffffffful)
++      result.insert(static_cast<u32>(value));
++  }
++  return result;
++}
++
++static bool functionGuestAddress(const Function &function, u32 &address) {
++  const std::string name = function.getName().str();
++  if (name.size() < 13u || name.compare(0, 5, "func_") != 0)
++    return false;
++
++  const std::string text = name.substr(5, 8);
++  char *end = nullptr;
++  const unsigned long value = std::strtoul(text.c_str(), &end, 16);
++  if (!end || *end != '\0' || value > 0xfffffffful)
++    return false;
++
++  address = static_cast<u32>(value);
++  return true;
++}
++
++static u32 markAdaptiveHotFunctions(Module &module) {
++  const auto hot = adaptiveHotAddresses();
++  if (hot.empty())
++    return 0;
++
++  u32 marked = 0;
++  for (Function &function : module) {
++    u32 address = 0;
++    if (!functionGuestAddress(function, address) || !hot.count(address))
++      continue;
++    function.addFnAttr(Attribute::Hot);
++    ++marked;
++  }
++  return marked;
++}
++
+ static OptimizationLevel optimizationLevel(int level) {
+   if (level <= 0)
+     return OptimizationLevel::O0;
+@@ -61,6 +123,11 @@ bool optimizeModule(Module &module, TargetMachine &machine,
+   builder.registerFunctionAnalyses(functions);
+   builder.registerLoopAnalyses(loops);
+   builder.crossRegisterProxies(loops, functions, call_graph, modules);
++  // Feed profile-selected hot functions into the existing IR-PGO/O3 pipeline.
++  // Never run a second module pipeline here: LLVM IRUse owns the "CG Profile"
++  // module flag and a second default pipeline tries to create it again.
++  if (options.profile_use_path && options.profile_use_path[0])
++    markAdaptiveHotFunctions(module);
+   ModulePassManager pipeline = builder.buildPerModuleDefaultPipeline(
+       optimizationLevel(options.optimization_level));
+   pipeline.run(module, modules);
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+index 1455dab..1d52ea5 100644
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -4,6 +4,10 @@
+
+ #include <llvm/ADT/SmallVector.h>
+ #include <llvm/IR/Constants.h>
++#include <cstdlib>
++#include <fstream>
++#include <string>
++#include <unordered_set>
+ #include <llvm/IR/Dominators.h>
+ #include <llvm/Transforms/Utils/PromoteMemToReg.h>
+
+@@ -11,9 +15,44 @@ namespace dolllvm {
+
+ using namespace llvm;
+
++bool FunctionEmitter::adaptiveHot() const {
++  static const std::unordered_set<u32> hot = [] {
++    std::unordered_set<u32> result;
++    const char *path = std::getenv("DOLRECOMP_ADAPTIVE_HOT_FUNCTIONS");
++    if (!path || !*path)
++      return result;
++
++    std::ifstream input(path);
++    std::string line;
++    while (std::getline(input, line)) {
++      const auto comment = line.find('#');
++      if (comment != std::string::npos)
++        line.resize(comment);
++      const auto first = line.find_first_not_of(" \t\r\n");
++      if (first == std::string::npos)
++        continue;
++      const auto last = line.find_last_not_of(" \t\r\n");
++      line = line.substr(first, last - first + 1u);
++      char *end = nullptr;
++      const unsigned long value = std::strtoul(line.c_str(), &end, 16);
++      if (end && *end == '\0' && value <= 0xfffffffful)
++        result.insert(static_cast<u32>(value));
++    }
++    return result;
++  }();
++  return hot.count(source_.guest_start) != 0;
++}
++
+ bool FunctionEmitter::slotInMemory(DolIRStateSlot slot) const {
+   if (!state_in_memory_ || native_abi_)
+     return false;
++  // PGO-selected hot functions use full state residency. Every used guest
++  // register/state slot gets an entry alloca that finalizeStateSSA() promotes
++  // with mem2reg. Runtime/side-exit boundaries already materialize dirty state,
++  // so keeping it in SSA between boundaries is semantically equivalent while
++  // exposing cross-instruction value propagation to LLVM.
++  if (adaptiveHot())
++    return false;
+   return !((slot >= DOLIR_STATE_CR0 && slot <= DOLIR_STATE_CR7) ||
+            (slot >= DOLIR_STATE_XER_CA && slot <= DOLIR_STATE_XER_SO) ||
+            slot == DOLIR_STATE_XER);

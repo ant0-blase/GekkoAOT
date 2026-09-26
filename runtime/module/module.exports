@@ -1,0 +1,7 @@
+{
+  global:
+    gekkoaot_get_module;
+    gekkoaot_module_capabilities;
+    gekkoaot_flush_profile;
+  local: *;
+};

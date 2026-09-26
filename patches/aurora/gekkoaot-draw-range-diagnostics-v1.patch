@@ -1,0 +1,140 @@
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -2,6 +2,7 @@
+-
++
+ #include "../gfx/depth_peek.hpp"
+ #include "../gfx/recording.hpp"
++#include "../gfx/resources.hpp"
+ #include "../internal.hpp"
+ #include "dolphin/gd/GDGeometry.h"
+ #include "dolphin/gx/GXAurora.h"
+@@ -14,7 +15,10 @@
+ #include <tracy/Tracy.hpp>
+-
++
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstdint>
+ #include <span>
+ #include <vector>
+@@ -23,7 +27,106 @@
+ namespace {
+ constexpr Module Log{"aurora::gx::fifo"};
+-
++
++struct DrawRangeDiagnostics {
++  const bool enabled = [] {
++    const char* value = std::getenv("GEKKOAOT_GX_DIAG_DRAW_RANGES");
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++  }();
++  std::atomic<uint64_t> generated{0};
++  std::atomic<uint64_t> submitted{0};
++  std::atomic<uint64_t> anomalies{0};
++  std::atomic<uint64_t> indexCountOverflow{0};
++  std::atomic<uint64_t> vertexIndexOverflow{0};
++  std::atomic<uint64_t> partialQuads{0};
++  std::atomic<uint64_t> drawRangeOverflow{0};
++
++  ~DrawRangeDiagnostics() {
++    if (enabled) {
++      std::fprintf(stderr,
++                   "GEKKOAOT_GX_DIAG_DRAW_RANGES summary submitted=%llu generated=%llu anomalies=%llu "
++                   "index_count_overflow=%llu vertex_index_overflow=%llu partial_quads=%llu draw_range_overflow=%llu\n",
++                   static_cast<unsigned long long>(submitted.load()),
++                   static_cast<unsigned long long>(generated.load()),
++                   static_cast<unsigned long long>(anomalies.load()),
++                   static_cast<unsigned long long>(indexCountOverflow.load()),
++                   static_cast<unsigned long long>(vertexIndexOverflow.load()),
++                   static_cast<unsigned long long>(partialQuads.load()),
++                   static_cast<unsigned long long>(drawRangeOverflow.load()));
++    }
++  }
++};
++
++DrawRangeDiagnostics g_drawRangeDiagnostics;
++
++void diagnose_draw_ranges(gfx::Range verts, gfx::Range indices, uint32_t vtxCount,
++                          uint32_t indexCount, uint32_t vtxStride) {
++  if (!g_drawRangeDiagnostics.enabled) return;
++  const uint64_t submitted = g_drawRangeDiagnostics.submitted.fetch_add(1) + 1;
++  const bool overflow = static_cast<uint64_t>(verts.offset) + verts.size > gfx::VertexBufferSize ||
++                        static_cast<uint64_t>(indices.offset) + indices.size > gfx::IndexBufferSize ||
++                        static_cast<uint64_t>(vtxCount) * vtxStride > verts.size ||
++                        (indexCount != 0 && indexCount > indices.size / sizeof(u16));
++  if (overflow) {
++    g_drawRangeDiagnostics.drawRangeOverflow.fetch_add(1);
++    const uint64_t event = g_drawRangeDiagnostics.anomalies.fetch_add(1) + 1;
++    if (event <= 3) {
++      std::fprintf(stderr,
++                   "GEKKOAOT_GX_DIAG_DRAW_RANGES event=%llu vtx=%u stride=%u vert=%u+%u "
++                   "indices=%u idx=%u+%u\n",
++                   static_cast<unsigned long long>(event), vtxCount, vtxStride,
++                   verts.offset, verts.size, indexCount, indices.offset, indices.size);
++    }
++  }
++  if (submitted == 100 || submitted == 1000 || submitted == 10000 || submitted == 100000 ||
++      submitted == 1000000 || submitted == 10000000) {
++    std::fprintf(stderr,
++                 "GEKKOAOT_GX_DIAG_DRAW_RANGES checkpoint submitted=%llu anomalies=%llu "
++                 "draw_range_overflow=%llu index_count_overflow=%llu vertex_index_overflow=%llu partial_quads=%llu\n",
++                 static_cast<unsigned long long>(submitted),
++                 static_cast<unsigned long long>(g_drawRangeDiagnostics.anomalies.load()),
++                 static_cast<unsigned long long>(g_drawRangeDiagnostics.drawRangeOverflow.load()),
++                 static_cast<unsigned long long>(g_drawRangeDiagnostics.indexCountOverflow.load()),
++                 static_cast<unsigned long long>(g_drawRangeDiagnostics.vertexIndexOverflow.load()),
++                 static_cast<unsigned long long>(g_drawRangeDiagnostics.partialQuads.load()));
++  }
++}
++
+ u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
++  if (g_drawRangeDiagnostics.enabled) {
++    const uint32_t count = vtxCount;
++    const uint32_t expected =
++        prim == GX_QUADS ? (count / 4u) * 6u :
++        (prim == GX_TRIANGLEFAN || prim == GX_TRIANGLESTRIP) ? (count < 3u ? count : 3u * count - 6u) : count;
++    const bool countOverflow = expected > UINT16_MAX;
++    const bool vertexOverflow = static_cast<uint32_t>(vtxStart) + count > 65536u;
++    const bool partialQuad = prim == GX_QUADS && (count % 4u) != 0u;
++    const uint64_t generated = g_drawRangeDiagnostics.generated.fetch_add(1) + 1;
++    if (countOverflow) g_drawRangeDiagnostics.indexCountOverflow.fetch_add(1);
++    if (vertexOverflow) g_drawRangeDiagnostics.vertexIndexOverflow.fetch_add(1);
++    if (partialQuad) g_drawRangeDiagnostics.partialQuads.fetch_add(1);
++    if (countOverflow || vertexOverflow || partialQuad) {
++      const uint64_t event = g_drawRangeDiagnostics.anomalies.fetch_add(1) + 1;
++      if (event <= 3) {
++        std::fprintf(stderr,
++                     "GEKKOAOT_GX_DIAG_DRAW_RANGES event=%llu prim=%u start=%u vertices=%u expected_indices=%u "
++                     "count_overflow=%u vertex_overflow=%u partial_quad=%u\n",
++                     static_cast<unsigned long long>(event), static_cast<unsigned>(prim),
++                     static_cast<unsigned>(vtxStart), count, expected, countOverflow, vertexOverflow, partialQuad);
++      }
++    }
++    // Some native hosts deliberately skip renderer teardown on a requested
++    // stop. Emit only a few bounded checkpoints so those runs retain totals.
++    if (generated == 10000 || generated == 100000 || generated == 1000000 || generated == 10000000) {
++      std::fprintf(stderr,
++                   "GEKKOAOT_GX_DIAG_DRAW_RANGES checkpoint generated=%llu anomalies=%llu "
++                   "index_count_overflow=%llu vertex_index_overflow=%llu partial_quads=%llu\n",
++                   static_cast<unsigned long long>(generated),
++                   static_cast<unsigned long long>(g_drawRangeDiagnostics.anomalies.load()),
++                   static_cast<unsigned long long>(g_drawRangeDiagnostics.indexCountOverflow.load()),
++                   static_cast<unsigned long long>(g_drawRangeDiagnostics.vertexIndexOverflow.load()),
++                   static_cast<unsigned long long>(g_drawRangeDiagnostics.partialQuads.load()));
++    }
++  }
+   u16 numIndices = 0;
+   if (prim == GX_QUADS) {
+     buf.reserve_extra((vtxCount / 4) * 6 * sizeof(u16));
+@@ -511,6 +614,7 @@
+     instanceCount = vtxCount;
+   }
+   cache.lastDrawFmt = fmt;
++  diagnose_draw_ranges(vertRange, idxRange, vtxCount, numIndices, cache.config.shaderConfig.vtxStride);
+   gfx::push_draw_command(DrawData{
+       .pipeline = cache.pipelineRef,
+       .bindGroups = cache.bindGroups,

@@ -1,0 +1,35 @@
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+index fe860e7..8b24d99 100644
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -173,6 +173,30 @@ void FunctionEmitter::scanRegionLeaders() {
+         }
+       }
+     }
++
++    // GekkoAOT standalone has no interpreter safety net. A lazy-FPU
++    // unavailable exception returns with RFI to the faulting instruction, so
++    // every block containing the FP-availability gate must be directly
++    // enterable by the native wrapper. Without this, an RFI to e.g. NDDEMO
++    // 0x80062AC0 enters fallback_dispatch, executes one fallback instruction,
++    // advances to 0x80062AC4, then spins there forever even though ADDIS is
++    // fully lowered by DolIR.
++    //
++    // Key this narrowly on DOLIR_HELPER_FP_AVAILABLE instead of MAY_EXIT. The
++    // latter is intentionally too broad and fragments hot regions. This adds
++    // only architectural FP restart points, which are genuine external resume
++    // targets after lazy FPU exceptions.
++    {
++      const DolIRBlock &body = source_.blocks[i];
++      for (u32 n = 0; n < body.instruction_count; n++) {
++        const DolIRInstruction &inst = body.instructions[n];
++        if (inst.op == DOLIR_OP_HELPER_CALL &&
++            inst.aux == DOLIR_HELPER_FP_AVAILABLE) {
++          region_leaders_[i] = true;
++          break;
++        }
++      }
++    }
+     u32 count = term.kind == DOLIR_TERM_COND_BRANCH ? 2u
+                 : term.kind == DOLIR_TERM_BRANCH    ? 1u
+                 : term.kind == DOLIR_TERM_INDIRECT  ? 2u

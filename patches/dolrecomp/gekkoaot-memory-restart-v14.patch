@@ -1,0 +1,35 @@
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -222,6 +222,19 @@
+       region_leaders_[i] = true;
+       if (i + 1u < source_.block_count)
+         region_leaders_[i + 1u] = true;
++    }
++    // Synchronous memory faults save the faulting instruction in SRR0.
++    // After the guest supplies a page and executes RFI, native-only hosts must
++    // re-enter that load/store, including interior non-branch targets.
++    // Helpers for paired accesses have the same restart contract.
++    for (u32 n = 0; n < source_.blocks[i].instruction_count; ++n) {
++      const DolIRInstruction &inst = source_.blocks[i].instructions[n];
++      if (inst.op == DOLIR_OP_GUEST_LOAD || inst.op == DOLIR_OP_GUEST_STORE ||
++          (inst.op == DOLIR_OP_HELPER_CALL &&
++           (inst.aux == DOLIR_HELPER_PSQ_LOAD || inst.aux == DOLIR_HELPER_PSQ_STORE))) {
++        region_leaders_[i] = true;
++        break;
++      }
+     }
+     const DolIRTerminator &term = source_.blocks[i].terminator;
+     if (term.kind == DOLIR_TERM_FALLBACK)
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -56,7 +56,7 @@
+ #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
+ #define DOLLLVM_DEFAULT_WORKER_BATCH 1u
+ // SSA regions, ABI v4 variants and ThinLTO summaries.
+-#define DOLLLVM_CACHE_VERSION "dolllvm-v29"
++#define DOLLLVM_CACHE_VERSION "dolllvm-v29-gekkoaot-memory-restart-v14"
+ 
+ typedef struct {
+     const PPCInst* insts;

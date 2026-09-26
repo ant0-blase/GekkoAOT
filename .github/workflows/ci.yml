@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+      - 'fix/**'
+      - 'release/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            platform: Linux
+            arch: x86_64
+          - name: Windows x86_64
+            os: windows-2022
+            platform: Windows
+            arch: x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install Qt (Linux)
+        if: runner.os == 'Linux'
+        uses: jurplel/install-qt-action@v4.4.0
+        with:
+          version: '6.8.3'
+          target: desktop
+          cache: true
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ pkg-config
+
+      - name: Install Qt (Windows)
+        if: runner.os == 'Windows'
+        uses: jurplel/install-qt-action@v4.4.0
+        with:
+          version: '6.8.3'
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Validate repository metadata
+        shell: bash
+        run: |
+          python tools/release_notes.py --version "$(tr -d '\r\n' < version.txt)" --check
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          paths = (sorted(Path('game-packs').rglob('*.json')) +
+                   sorted(Path('crossgame-db').rglob('*.json')) +
+                   [Path('release-please-config.json'), Path('.release-please-manifest.json')])
+          for path in paths:
+              with path.open(encoding='utf-8') as handle:
+                  json.load(handle)
+              print(f'validated {path}')
+          PY
+          python -m py_compile tools/adaptive_pgo.py tools/crossgame_db.py tools/release_notes.py tools/stage_portable_toolchain.py
+          ! grep -RniE 'run-native-gx-v4[12]|native_gx_v4[12]' --exclude-dir=.git .
+
+      - name: Configure Linux
+        if: runner.os == 'Linux'
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DGEKKOAOT_BUILD_GUI=ON
+          -DGEKKOAOT_BUILD_NATIVE_HOST=ON
+          -DGEKKOAOT_NATIVE_NOD=ON
+          -DGEKKOAOT_NATIVE_PORTABLE=ON
+
+      - name: Configure Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DGEKKOAOT_BUILD_GUI=ON `
+            -DGEKKOAOT_BUILD_NATIVE_HOST=ON `
+            -DGEKKOAOT_NATIVE_NOD=ON `
+            -DGEKKOAOT_NATIVE_PORTABLE=ON
+
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        run: cmake --build build --parallel 2
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config Release --parallel 2
+
+      - name: Install Linux staging tree
+        if: runner.os == 'Linux'
+        run: cmake --install build --prefix "$PWD/stage"
+
+      - name: Install Windows staging tree
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --install build --config Release --prefix "$PWD/stage"
+
+      - name: Deploy Windows Qt runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD "stage\bin\gekkoaot.exe"
+          $dest = Join-Path $PWD "stage\bin"
+
+          $tool = Get-Command windeployqt.exe -ErrorAction SilentlyContinue
+          if ($tool) {
+            $windeployqt = $tool.Source
+          } elseif ($env:QT_ROOT_DIR -and (Test-Path (Join-Path $env:QT_ROOT_DIR "bin\windeployqt.exe"))) {
+            $windeployqt = Join-Path $env:QT_ROOT_DIR "bin\windeployqt.exe"
+          } else {
+            throw "windeployqt.exe was not found"
+          }
+
+          Write-Host "Using windeployqt: $windeployqt"
+          & $windeployqt `
+            --release `
+            --force `
+            --no-translations `
+            --compiler-runtime `
+            --dir $dest `
+            $exe
+          if ($LASTEXITCODE -ne 0) {
+            throw "windeployqt failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Validate Windows Qt deployment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $required = @(
+            "stage\bin\gekkoaot.exe",
+            "stage\bin\Qt6Core.dll",
+            "stage\bin\Qt6Gui.dll",
+            "stage\bin\Qt6Widgets.dll",
+            "stage\bin\platforms\qwindows.dll"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) {
+              Write-Host "Windows stage tree:"
+              Get-ChildItem -Path "stage\bin" -Recurse | Select-Object FullName
+              throw "Missing deployed Windows runtime file: $path"
+            }
+          }
+
+      - name: Smoke-test installed Linux controller
+        if: runner.os == 'Linux'
+        env:
+          GEKKOAOT_RESOURCE_DIR: ${{ github.workspace }}/stage/share/gekkoaot
+          GEKKOAOT_STATE_DIR: ${{ runner.temp }}/gekkoaot-state
+        run: ./stage/bin/gekkoaotctl status
+
+      - name: Smoke-test installed Windows controller
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GEKKOAOT_RESOURCE_DIR: ${{ github.workspace }}\stage\share\gekkoaot
+          GEKKOAOT_STATE_DIR: ${{ runner.temp }}\gekkoaot-state
+        run: '& .\stage\bin\gekkoaotctl.exe status'

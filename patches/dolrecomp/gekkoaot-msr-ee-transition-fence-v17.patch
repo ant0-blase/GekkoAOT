@@ -1,0 +1,27 @@
+--- a/src/backend/llvm/special_instructions.cpp
++++ b/src/backend/llvm/special_instructions.cpp
+@@ -24,13 +24,20 @@
+       builder_.CreateLoad(Type::getInt32Ty(context_), state_[inst.aux]);
+   builder_.CreateStore(value, state_[inst.aux]);
+   noteStateWrite(slot, value);
+-  Value *enabled = builder_.CreateAnd(builder_.CreateNot(old), value);
+-  enabled = builder_.CreateICmpNE(
+-      builder_.CreateAnd(enabled, builder_.getInt32(0x8000)),
++
++  // GEKKOAOT_DOLRECOMP_MSR_EE_FENCE_V17:
++  // An mtmsr that changes MSR[EE] is an asynchronous-event scheduling
++  // boundary for the standalone runtime. The previous backend only exited
++  // for 0->1 transitions. Exit on either transition so the original PPC
++  // interrupt leaves remain guest-AOT while exposing the architectural
++  // interrupt-state transition to the host dispatcher immediately.
++  Value *eeChanged = builder_.CreateXor(old, value);
++  eeChanged = builder_.CreateICmpNE(
++      builder_.CreateAnd(eeChanged, builder_.getInt32(0x8000)),
+       builder_.getInt32(0));
+   BasicBlock *exit = BasicBlock::Create(context_, "msr_ee_exit", function_);
+   BasicBlock *resume = BasicBlock::Create(context_, "msr_ee_resume", function_);
+-  builder_.CreateCondBr(enabled, exit, resume);
++  builder_.CreateCondBr(eeChanged, exit, resume);
+   builder_.SetInsertPoint(exit);
+   sideExit(inst.guest_pc + 4u);
+   builder_.SetInsertPoint(resume);

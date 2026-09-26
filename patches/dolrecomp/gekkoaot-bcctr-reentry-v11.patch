@@ -1,0 +1,38 @@
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+index 73bbe9a..65a4c32 100644
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -4,6 +4,33 @@ void FunctionEmitter::scanRegionLeaders() {
+   if (!source_.block_count)
+     return;
+   region_leaders_[0] = true;
++
++
++  // Computed CTR branches are the normal PowerPC lowering for C/C++ switch
++  // jump tables.  The table itself commonly lives in DOL data/rodata, so the
++  // generic LLVM entry-point collector cannot see those interior code
++  // addresses while scanning executable sections.  If such a target lands in
++  // the middle of a coalesced native region, the external dispatcher has no
++  // entry case and falls into the instruction fallback even though the opcode
++  // is fully supported (for example Sunshine Hx_Logo -> 0x8017F8C4).
++  //
++  // Keep this deliberately function-local: only functions containing BCCTR
++  // need arbitrary instruction-aligned re-entry.  Splitting those functions
++  // into per-instruction regions is more conservative than guessing the
++  // contents/length of a jump table and leaves ordinary hot functions
++  // untouched. BCLR/BLR is excluded (XO 16); BCCTR/BCTR is XO 528.
++  bool has_computed_ctr_branch = false;
++  for (u32 i = 0; i < source_.block_count; i++) {
++    const u32 raw = source_.blocks[i].raw;
++    if ((raw >> 26) == 19u && ((raw >> 1) & 0x3ffu) == 528u) {
++      has_computed_ctr_branch = true;
++      break;
++    }
++  }
++  if (has_computed_ctr_branch) {
++    for (u32 i = 0; i < source_.block_count; i++)
++      region_leaders_[i] = true;
++  }
+   for (u32 i = 0; i < source_.block_count; i++) {
+     if (modern_runtime_ && native_abi_ && needsInterpreter(source_.blocks[i])) {
+       region_leaders_[i] = true;

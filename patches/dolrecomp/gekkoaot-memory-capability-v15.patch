@@ -1,0 +1,19 @@
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -1288,10 +1288,15 @@
+     }
+     if (modern_runtime) {
+         emit_native_module(header, &funcs, options->game_id);
++        // This compiler provides restartable memory instructions for guest
++        // DSI handlers. Export a capability in the generated native header so
++        // the host can leave older cached modules on their legacy VM path.
++        fprintf(header, "\n#define GEKKOAOT_AOT_RESTARTABLE_MEMORY 1\n");
+     } else {
+     emit_dispatch_helpers(header, &funcs, entry_point);
+     emit_llvm_variant_table(header, &funcs, profiles, profile_count,
+                             options->fast_semantics);
++    fprintf(header, "\n#define GEKKOAOT_AOT_RESTARTABLE_MEMORY 1\n");
+     }
+     emit_footer(header);
+     fprintf(manifest, "\n// %u native objects\n", file_count);

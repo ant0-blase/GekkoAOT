@@ -1,0 +1,35 @@
+diff --git a/src/backend/llvm/timing.cpp b/src/backend/llvm/timing.cpp
+--- a/src/backend/llvm/timing.cpp
++++ b/src/backend/llvm/timing.cpp
+@@ -129,12 +129,25 @@ void FunctionEmitter::emitBudgetGuard(u32 pc) {
+   Value *cycles = builder_.CreateAdd(
+       builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_local_),
+       builder_.CreateLoad(Type::getInt64Ty(context_), cycles_));
+-  Value *overCycles = builder_.CreateICmpUGE(
+-      cycles, modern_runtime_ ? builder_.CreateLoad(Type::getInt64Ty(context_),
+-                                                    builder_.CreateStructGEP(
+-                                                        chainType(), chain_, 4))
+-                              : static_cast<Value *>(ConstantInt::get(
+-                                    Type::getInt64Ty(context_), recompcoreGuardCycles())));
++  Value *cycleBudget =
++      modern_runtime_
++          ? builder_.CreateLoad(Type::getInt64Ty(context_),
++                                builder_.CreateStructGEP(chainType(), chain_, 4),
++                                "chain_cycle_budget")
++          : static_cast<Value *>(ConstantInt::get(Type::getInt64Ty(context_),
++                                                  recompcoreGuardCycles()));
++  if (modern_runtime_) {
++    // A runtime budget of zero means "host boundary as often as possible", not
++    // "execute zero guest blocks".  Guards are emitted before the loop-header
++    // block is charged; comparing accumulated cycles against literal zero made
++    // re-entry at a loop header side-exit forever without executing the block.
++    // Give the current block one guest cycle of forward progress.  The next
++    // backedge/call guard immediately returns to the host again.
++    cycleBudget = builder_.CreateSelect(
++        builder_.CreateICmpEQ(cycleBudget, builder_.getInt64(0)),
++        builder_.getInt64(1), cycleBudget, "effective_chain_cycle_budget");
++  }
++  Value *overCycles = builder_.CreateICmpUGE(cycles, cycleBudget);
+   Value *exhausted = overCycles;
+   if (!native_abi_ || !cold_escapes_) {
+     Value *steps =
