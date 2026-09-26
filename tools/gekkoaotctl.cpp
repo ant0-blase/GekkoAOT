@@ -87,12 +87,32 @@ std::string ReadText(const fs::path& p) {
   return std::string(std::istreambuf_iterator<char>(in),std::istreambuf_iterator<char>());
 }
 void ReplaceOnceInFile(const fs::path& p,std::string_view needle,std::string_view replacement,std::string_view tag) {
-  auto text=ReadText(p);
-  const auto first=text.find(needle);
+  // Git for Windows may check third-party sources out with CRLF while all
+  // embedded patch anchors in GekkoAOT are authored with LF. Match against a
+  // normalized representation so exact source transforms are platform-neutral.
+  const auto normalizeLf=[](std::string_view input) {
+    std::string out;
+    out.reserve(input.size());
+    for(std::size_t i=0;i<input.size();++i) {
+      if(input[i]=='\r') {
+        if(i+1<input.size() && input[i+1]=='\n') continue;
+        out.push_back('\n');
+      } else {
+        out.push_back(input[i]);
+      }
+    }
+    return out;
+  };
+
+  auto text=normalizeLf(ReadText(p));
+  const auto normalizedNeedle=normalizeLf(needle);
+  const auto normalizedReplacement=normalizeLf(replacement);
+
+  const auto first=text.find(normalizedNeedle);
   if(first==std::string::npos) throw std::runtime_error(std::string(tag)+": anchor not found in "+p.string());
-  if(text.find(needle,first+needle.size())!=std::string::npos)
+  if(text.find(normalizedNeedle,first+normalizedNeedle.size())!=std::string::npos)
     throw std::runtime_error(std::string(tag)+": anchor is not unique in "+p.string());
-  text.replace(first,needle.size(),replacement);
+  text.replace(first,normalizedNeedle.size(),normalizedReplacement);
   WriteText(p,text);
 }
 std::string FileHash64(const fs::path& p) {
