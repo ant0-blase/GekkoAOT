@@ -366,6 +366,137 @@ jobs:
         with:
           arch: x64
 
+      # Official LLVM Windows archives can export the DIA SDK path from the
+      # machine that built LLVM (for 20.1.8 this is VS2019 Professional).
+      # Rebind that imported CMake dependency to the DIA SDK installed on the
+      # current GitHub runner instead of creating a fake VS2019 directory.
+      - name: Rebind LLVM DIA SDK to current Visual Studio (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:LLVM_PATH) {
+            throw "LLVM_PATH is not set"
+          }
+
+          $llvmCmakeDir = Join-Path $env:LLVM_PATH "lib\cmake\llvm"
+          if (-not (Test-Path $llvmCmakeDir)) {
+            throw "LLVM CMake directory not found: $llvmCmakeDir"
+          }
+
+          $diaCandidates = [System.Collections.Generic.List[string]]::new()
+
+          if ($env:VSINSTALLDIR) {
+            $diaCandidates.Add(
+              (Join-Path $env:VSINSTALLDIR "DIA SDK\lib\amd64\diaguids.lib")
+            )
+          }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vsInstall = (& $vswhere `
+              -latest `
+              -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath |
+              Select-Object -First 1)
+            if ($vsInstall) {
+              $diaCandidates.Add(
+                (Join-Path $vsInstall "DIA SDK\lib\amd64\diaguids.lib")
+              )
+            }
+          }
+
+          $dia = $diaCandidates |
+            Where-Object { $_ -and (Test-Path $_) } |
+            Select-Object -First 1
+
+          if (-not $dia) {
+            Write-Host "VSINSTALLDIR=$env:VSINSTALLDIR"
+            Write-Host "Checked DIA candidates:"
+            $diaCandidates | ForEach-Object { Write-Host "  $_" }
+            throw "Could not locate the Visual Studio DIA SDK diaguids.lib"
+          }
+
+          $diaCmake = $dia.Replace('\', '/')
+          Write-Host "Using DIA SDK library: $diaCmake"
+
+          $cmakeFiles = Get-ChildItem `
+            -Path $llvmCmakeDir `
+            -Filter "*.cmake" `
+            -File `
+            -Recurse
+
+          # LLVM's exported target contains an absolute DIA path. Replace any
+          # absolute amd64 DIA-SDK diaguids.lib path, regardless of VS edition
+          # or version, with the path discovered on this runner.
+          $diaRegex = '(?i)[A-Za-z]:[/\\][^";\r\n]*?DIA SDK[/\\]lib[/\\]amd64[/\\]diaguids\.lib'
+          $patchedFiles = 0
+          $patchedRefs = 0
+
+          foreach ($file in $cmakeFiles) {
+            $content = [IO.File]::ReadAllText($file.FullName)
+            $matches = [regex]::Matches($content, $diaRegex)
+            if ($matches.Count -eq 0) {
+              continue
+            }
+
+            $updated = [regex]::Replace(
+              $content,
+              $diaRegex,
+              [System.Text.RegularExpressions.MatchEvaluator]{
+                param($match)
+                return $diaCmake
+              }
+            )
+
+            if ($updated -ne $content) {
+              [IO.File]::WriteAllText(
+                $file.FullName,
+                $updated,
+                [Text.UTF8Encoding]::new($false)
+              )
+              $patchedFiles++
+              $patchedRefs += $matches.Count
+              Write-Host "Patched LLVM DIA reference: $($file.FullName)"
+            }
+          }
+
+          if ($patchedRefs -eq 0) {
+            # Newer/fixed LLVM packages may no longer contain the bug. Do not
+            # fail in that case, but make sure any existing DIA reference is
+            # already usable.
+            $diaRefs = Select-String `
+              -Path ($cmakeFiles.FullName) `
+              -Pattern "diaguids\.lib" `
+              -ErrorAction SilentlyContinue
+
+            if ($diaRefs) {
+              Write-Host "LLVM DIA references were already portable/current:"
+              $diaRefs | ForEach-Object { Write-Host $_.Line }
+            } else {
+              Write-Host "LLVM CMake exports contain no DIA SDK dependency."
+            }
+          } else {
+            Write-Host "Rebound $patchedRefs DIA reference(s) in $patchedFiles LLVM CMake file(s)."
+          }
+
+          $stale = Select-String `
+            -Path ($cmakeFiles.FullName) `
+            -Pattern '(?i)Microsoft Visual Studio[/\\]2019[/\\]Professional[/\\]DIA SDK[/\\]lib[/\\]amd64[/\\]diaguids\.lib' `
+            -ErrorAction SilentlyContinue
+
+          if ($stale) {
+            $stale | ForEach-Object { Write-Host $_.Line }
+            throw "Stale LLVM VS2019 DIA SDK reference remains after rebinding"
+          }
+
+          if (-not (Test-Path $dia)) {
+            throw "Resolved DIA SDK library disappeared: $dia"
+          }
+
       - name: Configure Linux release
         if: runner.os == 'Linux'
         run: >-
