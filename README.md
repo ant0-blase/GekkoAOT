@@ -50,7 +50,31 @@ GameCube disc (ISO/GCM/RVZ/WIA/WBFS/GCZ/...)
 
 There is no emulator chassis in the normal runtime path. The GUI launches `gekkoaotctl`, a native C++ controller. Normal build/run orchestration is native C++; Python is only used by optional development tooling such as adaptive PGO/CrossGameDB helpers, not as a runtime dependency for the recompiled game.
 
+## Screenshots
 
+### GekkoAOT frontend
+
+<p align="center">
+  <img src="assets/screenshots/gekkoaot-gui-build.webp" alt="GekkoAOT GUI building the native toolchain" width="600" />
+</p>
+
+### Mario Kart: Double Dash!!
+
+<p align="center">
+  <img src="assets/screenshots/mario-kart-double-dash-title.webp" alt="Mario Kart: Double Dash!! running in GekkoAOT" width="48%" />
+  <img src="assets/screenshots/mario-kart-double-dash-gameplay.webp" alt="Mario Kart: Double Dash!! gameplay in GekkoAOT with rendering glitches" width="48%" />
+</p>
+
+Mario Kart: Double Dash!! reaches gameplay / early 3D. Rendering is still visibly incomplete.
+
+### Super Mario Sunshine
+
+<p align="center">
+  <img src="assets/screenshots/super-mario-sunshine-title.webp" alt="Super Mario Sunshine running in GekkoAOT" width="48%" />
+  <img src="assets/screenshots/super-mario-sunshine-menu-glitches.webp" alt="Super Mario Sunshine running in GekkoAOT with graphics glitches" width="48%" />
+</p>
+
+Super Mario Sunshine reaches gameplay / early 3D. Graphics/runtime correctness is still incomplete.
 
 ## Current compatibility snapshot
 
