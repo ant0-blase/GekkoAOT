@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/gekkoaot-logo.png" alt="GekkoAOT" width="420" />
+  <img src="assets/gekkoaot-logo.png" alt="GekkoAOT" width="360" />
 </p>
 
 <h1 align="center">GekkoAOT</h1>
@@ -9,613 +9,596 @@
 </p>
 
 <p align="center">
-  PowerPC analysis · LLVM AOT · AuroraGX · Native runtime
+  PowerPC → LLVM AOT · NativeOS · NativeVFS · AuroraGX · Native DSP
+</p>
+
+<p align="center">
+  <a href="https://github.com/ant0-blase/GekkoAOT/actions/workflows/ci.yml">
+    <img src="https://github.com/ant0-blase/GekkoAOT/actions/workflows/ci.yml/badge.svg" alt="CI" />
+  </a>
+  <a href="https://github.com/ant0-blase/GekkoAOT/releases">
+    <img src="https://img.shields.io/github/v/release/ant0-blase/GekkoAOT?include_prereleases&label=release" alt="Release" />
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/github/license/ant0-blase/GekkoAOT" alt="License" />
+  </a>
+  <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="Pre-alpha" />
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6c757d" alt="Windows and Linux" />
+</p>
+
+<p align="center">
+  <a href="#overview">Overview</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#screenshots">Screenshots</a> ·
+  <a href="#compatibility">Compatibility</a> ·
+  <a href="#downloads--build">Downloads & Build</a> ·
+  <a href="#roadmap">Roadmap</a> ·
+  <a href="#documentation">Docs</a>
 </p>
 
 ---
 
-GekkoAOT is a standalone GameCube static-recompilation frontend and native PC runtime.
-
 > [!WARNING]
 > **GekkoAOT is pre-alpha software.** Compatibility is incomplete and title-dependent.
-> Booting, reaching a menu or rendering early 3D does not mean a title is fully playable.
+> Reaching a menu or an early 3D scene does **not** imply full playability.
 
-The current project focuses on a practical LLVM AOT execution pipeline with native runtime services and AuroraGX integration, while the long-term architecture aims to progressively turn GameCube PowerPC software into native host applications.
+## Overview
 
-## Current v0.0.2 architecture
+GekkoAOT is a standalone GameCube static-recompilation frontend and native PC runtime.
 
-The v0.0.2 architecture is intentionally small:
+Instead of permanently running a complete console emulator around the game, the project is built around a different direction:
 
-```text
-GameCube disc (ISO/GCM/RVZ/WIA/WBFS/GCZ/...)
-        |
-        v
- encounter/nod
-        |
-        +--> boot.bin / bi2.bin / fst.bin / main.dol
-        |
-        v
- DolRecomp (PowerPC -> LLVM AOT objects)
-        |
-        v
- GekkoAOT per-game module
-        |
-        v
- GekkoAOT native runtime
-   |        |        |
-   |        |        +--> native SDK/HLE services
-   |        +-----------> native HW/DSP services
-   +--------------------> AuroraGX retail FIFO renderer
-```
+1. read the GameCube disc with **encounter/nod**;
+2. analyze and recompile PowerPC code ahead of time with **DolRecomp + LLVM**;
+3. execute the generated per-game native module inside the **GekkoAOT runtime**;
+4. progressively replace GameCube OS, hardware, filesystem, DSP and graphics services with native host implementations;
+5. send the retail GX/FIFO path to **AuroraGX**.
 
-There is no emulator chassis in the normal runtime path. The GUI launches `gekkoaotctl`, a native C++ controller. Normal build/run orchestration is native C++; Python is only used by optional development tooling such as adaptive PGO/CrossGameDB helpers, not as a runtime dependency for the recompiled game.
+### At a glance
+
+| Area | Current implementation |
+| --- | --- |
+| **CPU** | PowerPC → LLVM AOT through pinned DolRecomp |
+| **Runtime** | GekkoAOT-owned CPU/module ABI, NativeOS and hardware services |
+| **Graphics** | AuroraGX through the retail GX/WGPIPE/FIFO path |
+| **Disc / VFS** | encounter/nod + NativeVFS |
+| **Audio / DSP** | Native DSP services, AX/JAudio work, LLE fallback |
+| **Input** | SDL3 keyboard / gamepad / joystick path |
+| **Frontend** | Qt 6 GUI + native `gekkoaotctl` controller |
+| **Hosts** | Windows x86-64 and Linux x86-64 |
+
+There is no Dolphin Core/System chassis in the normal runtime path. Python is only used by optional development tooling such as adaptive PGO and CrossGameDB helpers.
+
+## Screenshots
+
+### GekkoAOT frontend
+
+<p align="center">
+  <img src="assets/screenshots/gekkoaot-frontend-build.png" alt="GekkoAOT frontend building the AOT compiler" width="100%" />
+</p>
+
+### Mario Kart: Double Dash!!
+
+<p align="center">
+  <img src="assets/screenshots/mario-kart-double-dash-title.png" alt="Mario Kart: Double Dash!! title screen running in GekkoAOT" width="100%" />
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/mario-kart-double-dash-gameplay.png" alt="Mario Kart: Double Dash!! gameplay running in GekkoAOT" width="100%" />
+</p>
+
+> Reaches **gameplay / early 3D**. Rendering is still visibly incomplete.
+
+### Super Mario Sunshine
+
+<p align="center">
+  <img src="assets/screenshots/super-mario-sunshine-title.png" alt="Super Mario Sunshine title screen running in GekkoAOT" width="100%" />
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/super-mario-sunshine-menu-glitch.png" alt="Super Mario Sunshine running in GekkoAOT with current rendering glitches" width="100%" />
+</p>
+
+> Reaches **gameplay / early 3D**. Graphics/runtime correctness is still incomplete.
 
 
-
-## Current compatibility snapshot
-
-The table below records the furthest state observed in the current development snapshot. It is not a compatibility guarantee.
-
-| Title | Region / ID | Current state | Notes |
-| --- | --- | --- | --- |
-| Harry Potter and the Sorcerer's Stone | USA / `GHLE69` | **Gameplay / early 3D** | Reaches gameplay; 3D rendering is visibly glitched. |
-| Harry Potter and the Chamber of Secrets | USA / `GHSE69` | **Gameplay / early 3D** | Reaches gameplay; visible graphics/rendering glitches remain. |
-| Nintendo Developer Demo | developer sample | **Working** | Current tested demo path completes without a known blocker. |
-| Super Mario Sunshine | USA / `GMSE01` | **Gameplay / early 3D** | Reaches gameplay; graphics/runtime correctness remains incomplete. |
-| Mario Kart: Double Dash!! | USA / `GM4E01` | **Gameplay / early 3D** | Reaches gameplay; some graphics/runtime glitches remain. |
-| Medal of Honor: Frontline | USA / `GMFE69` | **Boot / early execution** | Boots with several compatibility/rendering glitches. |
-
-For detailed status definitions and per-title notes, see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
-
-## Long-term architecture
-
-The current v0.0.2 pipeline is the practical foundation. The long-term architecture is organized around three major components:
-
-```text
-GekkoAOT
-|
-+-- GekkoTranslate
-|   +-- PowerPC disassembly
-|   +-- CFG / data-flow reconstruction
-|   +-- ABI / SDA / SDA2 analysis
-|   +-- DOL + REL whole-program reconstruction
-|   +-- function / callback / indirect-call recovery
-|   +-- optional type and structure recovery
-|   +-- direct LLVM backend
-|   +-- reconstructed portable C++ backend
-|   `-- native x86-64 / ARM64 code generation
-|
-+-- GCINE
-|   `-- native GameCube compatibility runtime
-|
-`-- AuroraGX
-    `-- native GX graphics implementation
-```
-
-The objective is not to permanently emulate a complete GameCube machine. GekkoAOT should progressively replace guest-side execution and hardware emulation with statically resolved native code and native compatibility services.
-
-### GekkoTranslate
-
-`GekkoTranslate` is the planned static translation and automatic program-reconstruction frontend.
-
-Its long-term goal is to **disassemble GameCube PowerPC binaries, reconstruct their program structure automatically, and transform them into highly optimized native host code**.
-
-C++ itself is not x86-specific. The intended architecture therefore has two complementary output paths:
+## Architecture
 
 ```text
-PowerPC DOL / ELF / REL
-          |
-          v
-      Disassembly
-          |
-          v
- CFG / data-flow / ABI analysis
-          |
-          v
-      GekkoAOT IR
-          |
-          +-----------------------------+
-          |                             |
-          v                             v
- Direct LLVM backend            C++ reconstruction
-          |                             |
-          v                             v
- LLVM IR + optimization             Clang / LLVM
-          |                             |
-          +--------------+--------------+
-                         |
-                         v
-                native x86-64 / ARM64
+                         GameCube disc
+                              |
+                              v
+                        encounter / nod
+                              |
+               +--------------+--------------+
+               |              |              |
+               v              v              v
+            boot.bin        fst.bin       main.dol
+                                             |
+                                             v
+                                DolRecomp + LLVM AOT
+                                             |
+                                             v
+                                  per-game native module
+                                             |
+                                             v
+                                  GekkoAOT native runtime
+                  +------------------+-------------------+
+                  |                  |                   |
+                  v                  v                   v
+               NativeOS         Native HW/DSP        NativeVFS
+                  |                  |                   |
+                  +------------------+-------------------+
+                                             |
+                                             v
+                                      AuroraGX / GX FIFO
+                                             |
+                                             v
+                                           Host
 ```
 
-#### Direct LLVM path
+The current runtime owns the host-facing CPU state/module ABI, native GameCube services, disc/cache orchestration and AuroraGX bridge.
 
-The direct path is intended to remain the lowest-overhead and highest-fidelity compiler path:
+More detail: [Architecture](docs/ARCHITECTURE.md) · [Native VFS](docs/NATIVE_VFS.md) · [Roadmap](docs/ROADMAP.md)
+
+## Technical deep dive
+
+GekkoAOT is intentionally more than a frontend around an existing emulator core. The project is split into a static compiler path and a native compatibility/runtime path, with the goal of moving as much work as possible from runtime emulation into ahead-of-time translation and native host services.
+
+### PowerPC → native AOT pipeline
+
+The current compiler path is:
 
 ```text
-PPC
- |
- v
-GekkoAOT IR
- |
- v
-LLVM IR
- |
- v
--O3 / LTO / PGO
- |
- v
-native machine code
+main.dol / REL / executable code
+             |
+             v
+       PowerPC analysis
+             |
+             v
+   DolRecomp LLVM backend
+             |
+             +--> static function lowering
+             +--> native re-entry boundaries
+             +--> execution-budget barriers
+             +--> direct SDK/HLE intercept lowering
+             +--> computed CTR fencing
+             +--> PGO instrumentation/use
+             |
+             v
+       LLVM IR / objects
+             |
+             v
+     per-game native module
+             |
+             v
+      GekkoAOT runtime ABI
 ```
 
-This path does not require generated C++.
+The long-term objective is to make ordinary known control flow become ordinary host control flow. A runtime dispatcher should remain only where targets are genuinely dynamic or unresolved.
 
-#### Automatic C++ reconstruction
+### Guest/host ABI boundaries
 
-The second path aims to reconstruct portable C++ automatically from the PowerPC program:
+A recompiled function cannot freely jump into a native service without first materializing architectural PowerPC state. GekkoAOT therefore treats native service boundaries as explicit ABI transitions.
+
+Important state includes:
+
+- GPRs and control state;
+- CR/LR/CTR/XER;
+- SRR0/SRR1 around exceptions;
+- GQR state;
+- FPR0–31;
+- paired-single PS0–31;
+- FPSCR;
+- MSR[EE] and interrupt-visible state;
+- cycle accounting before returning to the dispatcher/runtime.
+
+For computed `bctr` / `bctrl` control flow, GekkoAOT fences architectural state before routing the target so stale host temporaries cannot leak across dynamic call edges.
+
+### NativeOS and guest-AOT coexistence
+
+NativeOS provides host-side implementations for substantial parts of the GameCube OS surface, including:
+
+- scheduler and thread selection;
+- thread creation/lifecycle;
+- ready and wait queues;
+- priorities, suspend/resume and sleep/wakeup;
+- mutexes and condition variables;
+- message queues;
+- alarms/timers;
+- `OSContext` handling;
+- FPU context helpers.
+
+This is **not** an all-or-nothing HLE switch. GekkoAOT can leave small retail SDK leaves in guest AOT when executing the original PPC semantics is more accurate or safer.
+
+For example, interrupt leaves such as:
 
 ```text
-main.dol + REL modules
-        |
-        v
-PowerPC disassembly
-        |
-        v
-whole-program analysis
-        |
-        v
-control-flow reconstruction
-        |
-        v
-data-flow / ABI / type recovery
-        |
-        v
-reconstructed portable C++
-        |
-        v
-Clang / LLVM
-        |
-        v
-native x86-64 / ARM64 executable
+OSDisableInterrupts
+OSEnableInterrupts
+OSRestoreInterrupts
 ```
 
-The generated C++ is not intended to reproduce unavailable original source code. It is an independently reconstructed representation of equivalent behavior derived from executable analysis.
+can remain recompiled PPC while higher-level scheduler/context services use native implementations. MSR[EE] transition fences and interrupt-entry boundaries keep asynchronous events observable at correct PPC architectural points.
 
-An early low-level result may still look like:
+### SDK AutoResolver
 
-```cpp
-void fn_80128450(PPCContext* ctx)
-{
-    const uint32_t object = ctx->gpr[3];
-    // translated PPC semantics...
-}
-```
-
-As reconstruction improves, the same logic may become structurally closer to:
-
-```cpp
-void Player_Update(Player* player)
-{
-    player->position.x += player->velocity.x;
-    player->position.y += player->velocity.y;
-
-    if (player->state & STATE_JUMPING)
-        Player_UpdateJump(player);
-}
-```
-
-The long-term target is not limited to instruction translation: GekkoTranslate should progressively reconstruct higher-level program structure where analysis is reliable.
+The runtime/compiler can identify SDK entrypoints structurally and emit a per-game native-intercept manifest.
 
 ```text
-Level 1
-PPC instructions
-    |
-    v
-semantically equivalent LLVM/native operations
-
-Level 2
-basic blocks + functions
-    |
-    +-- loops
-    +-- if / else
-    +-- switch recovery
-    `-- direct calls
-
-Level 3
-whole-program reconstruction
-    |
-    +-- function relationships
-    +-- callbacks
-    +-- indirect-call targets
-    +-- structures/types where inferable
-    +-- native SDK interfaces
-    `-- readable portable C++
-```
-
-Level 3 is intentionally ambitious and should be developed progressively rather than required for basic compatibility.
-
-### Whole-program DOL + REL reconstruction
-
-GekkoTranslate should eventually treat a title as one global program:
-
-```text
-main.dol
+DOL code
    |
-   +-- REL A
-   +-- REL B
-   +-- REL C
-   `-- runtime references
-        |
-        v
- global symbol database
-        |
-        v
- global call graph
-        |
-        v
- GekkoAOT IR
-        |
-        +-------------------+
-        |                   |
-        v                   v
-     LLVM IR          reconstructed C++
-        |                   |
-        +---------+---------+
-                  |
-                  v
-          whole-program LTO
-                  |
-                  v
-          native executable
+   v
+SDK scanner
+   |
+   +--> exact normalized signatures
+   +--> tiny-leaf ABI proofs
+   +--> call-target / adjacency proofs
+   +--> context/scheduler semantic proofs
+   |
+   v
+native-intercepts manifest
+   |
+   v
+compile-time direct lowering
 ```
 
-This gives LLVM visibility across modules and allows more callbacks, function pointers and indirect branches to become ordinary native calls.
+The policy is designed to fail closed: an uncertain match should remain guest AOT rather than becoming an unsafe native replacement.
 
-### Removing the guest dispatcher
-
-An early recompilation path may still require runtime lookup:
+Current resolver work covers families such as:
 
 ```text
-PPC PC -> lookup(pc) -> function pointer -> AOT function
+OSContext
+interrupts
+alarms
+message queues
+mutexes / conditions
+scheduler / threads
+time / tick helpers
 ```
 
-The target is to replace known destinations with native calls:
+### Memory model
+
+GameCube software expects console-visible memory semantics that do not map 1:1 onto a modern desktop process.
+
+Current runtime work includes:
 
 ```text
-CallGuestFunction(0x80123450)
-            |
-            v
-      fn_80123450()
-            |
-            v
-        native call
+reported MEM1     24 MiB
+host MEM1 backing 32 MiB compatibility allocation
+FakeVMEM          0x7e000000 + 32 MiB
+MMIO              intercepted separately
+locked cache      dedicated guest-visible handling
 ```
 
-The dispatcher should eventually remain only for unresolved or genuinely dynamic cases such as:
+The goal is to specialize proven RAM accesses toward direct host loads/stores while retaining explicit handlers for hardware-visible regions.
 
-- unresolved indirect branches;
-- runtime-loaded REL targets;
-- unproven function pointers;
-- dynamic callbacks;
-- exception vectors;
-- unsupported code;
-- debugging or compatibility fallback.
-
-### GCINE
-
-`GCINE` is the planned native GameCube compatibility environment.
+Conceptually:
 
 ```text
-                GCINE
-                  |
-     +------------+-------------+
-     |            |             |
-     v            v             v
-     OS        Hardware         I/O
-     |            |             |
- threads          PI            DVD
- mutexes          MI            SI
- queues           VI            EXI
- alarms           AI            input
- timers           DSP
- interrupts       GX
+generic guest access
+       |
+       +--> MEM1/MEM2/FakeVMEM -> direct/native memory path
+       |
+       +--> MMIO              -> device/register semantics
+       |
+       +--> WGPIPE            -> GX FIFO
+       |
+       `--> locked cache      -> LC semantics
 ```
 
-Typical native replacement paths are:
+### Hardware runtime
+
+GekkoAOT owns GameCube-facing service work for:
 
 ```text
-OSCreateThread  -> native scheduler / host threads
-OSMutex         -> native synchronization
-OSAlarm         -> native timer system
-OSGetTime       -> native timing source
-
-GX*             -> AuroraGX
-DSP*            -> native DSP runtime
-AI*             -> native audio backend
-DVD*            -> nod / asynchronous host I/O
-SI*             -> native input system
-EXI*            -> native device implementation
+CP  Command Processor
+PE  Pixel Engine
+PI  Processor Interface
+MI  Memory Interface
+AI  Audio Interface
+DI  Disc Interface
+EXI External Interface
+SI  Serial Interface
+VI  Video Interface
+LC  Locked Cache
 ```
 
-The implementation may be completely native while still preserving the GameCube-visible semantics expected by games.
+Interrupt routing is modeled through the guest-visible PI/VI/etc. state rather than treating device events as arbitrary host callbacks.
+
+### Clock domains and frame scheduling
+
+CPU execution and hardware time are deliberately separated.
+
+The runtime can let the AOT CPU run uncapped while hardware-visible timing follows host realtime:
+
+```text
+AOT CPU       -> execution as fast as possible
+VI            -> realtime domain
+Time Base     -> realtime domain
+Decrementer   -> realtime domain
+DSP / AI      -> realtime domain
+presentation  -> independent host frame scheduler
+```
+
+This separation is important for future FPS unlocking: increasing host presentation rate must not blindly accelerate game logic, audio or timers.
+
+### NativeVFS / nod
+
+The disc path is native and independent of an emulator frontend:
+
+```text
+ISO / GCM / RVZ / WIA / WBFS / GCZ
+                 |
+                 v
+           encounter / nod
+                 |
+                 +--> system files
+                 +--> FST
+                 +--> main.dol
+                 +--> game metadata
+                 |
+                 v
+             NativeVFS
+```
+
+The controller caches extracted executable/system data per title and can mount/read the game partition through the native path.
+
+DI DMA completion is modeled asynchronously so disc reads are not necessarily made visible to the guest at the instant the host finishes I/O.
 
 ### AuroraGX
 
-The earlier conceptual `GXVK` layer is superseded by AuroraGX:
+AuroraGX is the intended native graphics backend.
 
 ```text
-Game code
-   |
-   v
-GX calls / WGPIPE
-   |
-   v
-FIFO decode
-   |
-   v
+game GX code
+    |
+    v
+CP / XF / BP state
+    |
+    v
+WGPIPE / retail FIFO
+    |
+    v
 AuroraGX
-   |
-   v
-host graphics API
-   |
-   v
-GPU
+    |
+    v
+host graphics API / GPU
 ```
 
-AuroraGX is intended to own the normal graphics path without requiring a Dolphin graphics backend.
+GekkoAOT currently carries compatibility work around:
 
-### Native host threading model
+- CP/XF Matrix Index A/B synchronization;
+- 6-bit PNMTXIDX / TEXMTXIDX behavior;
+- partial XF transform/normal loads;
+- dynamic indexed-array coherency;
+- first-use pipeline correctness;
+- EFB color/depth peeks;
+- EFB → texture/display copies;
+- TEV alpha / destination-alpha behavior;
+- Z-textures.
 
-A possible logical worker layout is:
+#### Z-textures and depth copies
+
+The native GX path includes `GXSetZTexture` plumbing and depth-format handling.
+
+Z-texture source formats:
 
 ```text
-Core 0
-`-- Guest PPC / LLVM AOT
-    +-- game logic
-    +-- OS scheduler
-    +-- MMIO
-    `-- IRQ delivery
-
-Core 1
-`-- GX worker
-    +-- WGPIPE
-    +-- FIFO decode
-    `-- AuroraGX submission
-
-Core 2
-`-- DSP / audio
-    +-- DSP execution
-    +-- mixer
-    `-- host audio output
-
-Core 3+
-+-- nod / DVD async
-+-- texture work
-+-- shader compilation
-`-- miscellaneous workers
+Z8
+Z16
+Z24X8
 ```
 
-These are logical worker roles, not mandatory fixed CPU affinities. The host scheduler should normally remain free to place threads unless profiling proves explicit affinity useful.
-
-### Native memory specialization
-
-Generic guest memory access may initially look like:
+Operations:
 
 ```text
-PPC access
-   |
-   v
-Read32 / Write32
-   |
-   +-- guest address translation
-   +-- region checks
-   `-- endian conversion
-   |
-   v
-host RAM
+GX_ZT_ADD
+GX_ZT_REPLACE
 ```
 
-When analysis proves that an address is a normal MEM1/MEM2 access, GekkoTranslate should specialize it toward:
+EFB depth-copy work includes formats such as:
 
 ```text
-known RAM access
+Z4
+Z8
+Z16
+Z24X8
+Z8M
+Z8L
+Z16R
+Z16L
+```
+
+These details matter because several retail titles depend on depth copy/readback behavior that is easy to miss in simpler GX implementations.
+
+### DSP / audio
+
+The native audio path is split into multiple compatibility layers:
+
+```text
+Game audio code
       |
-      v
-direct host load/store
+      +--> AX HLE
+      |     +-- VPB voices
+      |     +-- ADPCM / PCM
+      |     +-- SRC / resampling
+      |     `-- mixer / sends
       |
-      v
-required endian operation only
+      +--> JAudio HLE
+      |     +-- AFC / PCM voices
+      |     +-- filters
+      |     `-- command processing
+      |
+      `--> DSP LLE fallback
+            `-- unsupported/unknown ucodes
 ```
 
-MMIO for PI, MI, VI, DSP, AI, DI, EXI, SI, GX FIFO and other hardware remains interceptable.
+The goal is to keep the audio subsystem independent from a Dolphin Core/System runtime while still retaining a correctness fallback for unknown DSP programs.
 
-### SDK/native call recognition
+### Host threading model
 
-Known SDK/library functions can be resolved to GCINE implementations:
+The runtime is designed around logical host workers rather than one giant emulation loop:
 
 ```text
-PowerPC OSGetTime
-       |
-       v
-SDK AutoResolver
-       |
-       v
-GCINE::OSGetTime()
+CPU/AOT worker
+  +-- recompiled game code
+  +-- NativeOS
+  +-- MMIO
+  `-- IRQ delivery
+
+GX worker
+  +-- WGPIPE/FIFO
+  +-- state decode
+  `-- AuroraGX submission
+
+DSP/audio worker
+  +-- DSP execution/HLE
+  +-- mixer
+  `-- host audio
+
+I/O workers
+  +-- nod/DVD
+  +-- shader compilation
+  +-- asset/cache work
+  `-- miscellaneous async services
 ```
 
-The same approach can progressively cover:
+These are logical roles; GekkoAOT does not require fixed CPU affinity unless profiling demonstrates a benefit.
+
+### Runtime fast paths
+
+Performance work focuses on removing avoidable abstraction layers before micro-optimizing individual instructions.
+
+Current directions include:
+
+- bounded native superchains;
+- fewer dispatcher round trips;
+- compile-time-pruned intercept lookup;
+- RAM-first guest-pointer paths;
+- O(1)-style NativeOS ready-thread caches;
+- batched host clock sampling;
+- WGPIPE fast paths;
+- static direct-call lowering;
+- LTO/IPO;
+- LLVM PGO;
+- CrossGameDB profiling/knowledge reuse.
+
+The priority remains correctness first: fast paths are kept behind architectural barriers where interrupts, MMIO, HLE/native boundaries or timing can become visible.
+
+## Compatibility
+
+Current snapshot: **v0.0.2 — 2026-09-26**
+
+| Title | ID | State | Current blocker |
+| --- | --- | --- | --- |
+| Harry Potter and the Sorcerer's Stone | `GHLE69` | **Gameplay / early 3D** | Visible graphics/rendering glitches |
+| Harry Potter and the Chamber of Secrets | `GHSE69` | **Gameplay / early 3D** | Visible graphics/rendering glitches |
+| Nintendo Developer Demo | developer sample | **Working** | No known blocker on the tested path |
+| Super Mario Sunshine | `GMSE01` | **Gameplay / early 3D** | Graphics/runtime correctness incomplete |
+| Mario Kart: Double Dash!! | `GM4E01` | **Gameplay / early 3D** | Graphics/runtime glitches |
+| Medal of Honor: Frontline | `GMFE69` | **Boot / early execution** | Multiple rendering/runtime glitches |
+
+No retail title is currently claimed as fully **Playable**.
+
+See the complete status definitions and reporting format in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+
+## Native runtime
+
+GekkoAOT is progressively replacing guest-side SDK and hardware behavior with native implementations while preserving the GameCube-visible semantics titles expect.
+
+### NativeOS
+
+Current work includes:
+
+- thread lifecycle, scheduler and ready/wait queues;
+- suspend/resume, sleep/wakeup and priorities;
+- mutexes, conditions, message queues and alarms;
+- `OSContext` save/load/current-context handling;
+- FPR0–31, paired-single PS0–31 and FPSCR capture;
+- FPU context helpers;
+- interrupt / MSR[EE] correctness boundaries.
+
+Tiny retail interrupt leaves such as `OSDisableInterrupts`, `OSEnableInterrupts` and `OSRestoreInterrupts` remain guest-AOT by default when exact PPC semantics are preferable.
+
+### Native hardware
+
+The runtime contains GameCube-facing work for:
 
 ```text
-OS*
-GX*
-DVD*
-AI*
-DSP*
-SI*
-EXI*
-VI*
+CP · PE · PI · MI · AI · DI · EXI · SI · VI · Locked Cache
 ```
 
-### Performance philosophy
+### AuroraGX
 
-Performance work should prioritize removing unnecessary translation and compatibility layers before focusing on small local optimizations:
+The graphics path is built around the GameCube GX/WGPIPE/FIFO model rather than a generic emulator renderer.
+
+Current integration work includes:
+
+- CP/XF matrix synchronization;
+- 6-bit PNMTXIDX/TEXMTXIDX handling;
+- dynamic mesh coherency;
+- EFB color/depth readback;
+- EFB depth-copy formats;
+- TEV/destination-alpha compatibility work;
+- `GXSetZTexture` with Z8/Z16/Z24X8 and ADD/REPLACE depth operations.
+
+### NativeVFS / DVD
+
+The native disc path uses encounter/nod and supports the container families used by the pinned nod revision, including:
 
 ```text
-interpreter                  -> remove
-JIT dispatch                 -> remove
-runtime PPC decode           -> remove
-known indirect calls         -> resolve
-known SDK code               -> replace
-generic guest helpers        -> specialize/remove
-legacy GX backend            -> AuroraGX
-legacy DSP path              -> native DSP
-blocking disc I/O            -> asynchronous workers
+ISO/GCM · RVZ · WIA · WBFS · GCZ
 ```
 
-Strictly zero overhead is not realistic because the GameCube and a modern host differ in endianness, memory model, graphics APIs, timing and devices.
+System files and executable metadata are cached below the GekkoAOT state directory for repeat launches.
 
-The target is to minimize unnecessary CPU-emulation overhead in the normal execution path.
+## Downloads & Build
 
-### Long-term native pipeline
+### Portable releases
 
-```text
-                  GameCube title
-                       |
-       +---------------+---------------+
-       |               |               |
-       v               v               v
-    main.dol           REL             ELF
-       |               |               |
-       +---------------+---------------+
-                       |
-                       v
-                Binary analyzer
-                       |
-       +---------------+---------------+
-       |               |               |
-       v               v               v
- CFG recovery     SDK resolver     relocations
-       |               |               |
-       +---------------+---------------+
-                       |
-                       v
-                 GekkoAOT IR
-                       |
-          +------------+------------+
-          |                         |
-          v                         v
-     Direct LLVM             C++ reconstruction
-          |                         |
-          v                         v
-     native code               Clang / LLVM
-          |                         |
-          +------------+------------+
-                       |
-                       v
-              native executable
-                       |
-        +--------------+--------------+
-        |              |              |
-        v              v              v
-      GCINE         AuroraGX      native DSP
-        |              |              |
-        +--------------+--------------+
-                       |
-                       v
-                     Host OS
-```
+Pre-alpha binary packages are published on the [GitHub Releases](https://github.com/ant0-blase/GekkoAOT/releases) page.
 
-## What is included
+| Package | Contents |
+| --- | --- |
+| **Windows x86-64 ZIP** | Qt, platform plugins, VC runtime, prebuilt DolRecomp/AuroraGX and portable toolchain |
+| **Linux x86-64 AppImage** | Qt/application libraries, prebuilt engine and portable toolchain |
+| **Linux x86-64 tar.gz** | Portable staged release tree |
 
-- Qt 6 GUI with **Open Game**, **Play**, **Stop**, graphics/input settings and log/progress views.
-- Native `gekkoaotctl` controller.
-- Native nod disc reader (`gekkoaot-native-disc`).
-- DolRecomp LLVM AOT build pipeline.
-- GekkoAOT-owned CPU/module ABI.
-- Native MEM1/MEM2, boot, scheduler/HLE, hardware, DSP, input and disc services.
-- Direct AuroraGX FIFO bridge.
-- Per-game module cache under `.gekkoaot/cache/modules/`.
-- Pinned external source revisions for reproducible builds.
+Normal Play does not require a manually patched DolRecomp or Aurora checkout.
 
-## Pinned dependencies
+### Linux source build
 
-- DolRecomp: `71ce7f97419b1bb1ba9a9596c41507f6629e0fb0`
-- Aurora: `3840bf9ae735191026e4d4edb0ce6f24d91f7eea`
-- encounter/nod: `v2.0.0-alpha.12`
-
-The controller clones only DolRecomp and Aurora into `.gekkoaot/src/` when they are not already present. nod is consumed as a CMake package by the native host.
-
-## Linux build
-
-Dependencies: CMake, Ninja, Git, Qt 6 Widgets, a C/C++ compiler and LLVM 19 or 20 for DolRecomp's LLVM backend.
+Dependencies: CMake, Ninja, Git, Qt 6 Widgets, a C/C++ compiler and LLVM 19/20.
 
 ```bash
 ./build-linux.sh
 ./bin/gekkoaot
 ```
 
-If LLVM is not in CMake's default search path, set it in **Advanced -> LLVM** or configure with the appropriate `LLVM_DIR`.
-
-## Windows build
+### Windows source build
 
 Windows x86-64 uses Visual Studio 2022 / MSVC.
-
-Required on the host:
-
-- Visual Studio 2022 / Build Tools with **Desktop development with C++**;
-- CMake;
-- Git;
-- Python 3 for the first-time automatic Qt bootstrap.
-
-Then simply run:
 
 ```bat
 build-windows.cmd
 ```
 
-If Qt is missing, the build helper automatically installs the pinned **Qt 6.8.3 MSVC 2022 x64** package under `.deps/Qt/`. The final tree under `dist/GekkoAOT/` is deployed with the Qt DLLs and `platforms/qwindows.dll`, so `gekkoaot.exe` does not require a separate global Qt installation.
+If Qt is missing, the helper can bootstrap the pinned **Qt 6.8.3 MSVC 2022 x64** package under `.deps/Qt/`.
 
-You can also bootstrap Qt explicitly:
+Full build documentation: [`docs/BUILDING.md`](docs/BUILDING.md)
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-qt6-windows.ps1
-```
+## Using GekkoAOT
 
-Or point GekkoAOT to an existing Qt installation with `GEKKOAOT_QT_DIR`.
+### GUI
 
-## Portable releases
+1. Start GekkoAOT.
+2. **File → Open Game...**
+3. Select a supported GameCube disc image.
+4. Press **Play**.
+5. The controller prepares/reuses the native toolchain, reads the disc, recompiles the executable and launches the native runtime.
 
-Official end-user releases bundle the build/runtime pieces needed by normal
-Play.
-
-**Windows x86-64 ZIP:** Qt + platform plugins + VC runtime, prebuilt
-DolRecomp/AuroraGX, patched DolRecomp source, portable CMake/Ninja/Zig. Git and
-Visual Studio are not required on the target machine.
-
-**Linux x86-64 AppImage:** Qt and application libraries plus the same prebuilt
-engine and portable CMake/Ninja/Zig toolchain. Git and a system compiler are not
-required for normal Play.
-
-The operating-system kernel and hardware drivers remain host requirements.
-
-## GUI launch flow
-
-1. Start `./bin/gekkoaot`.
-2. **File -> Open Game...** and select an ISO/GCM/RVZ/WIA/WBFS/GCZ image.
-3. Press **Play** (opening a new image can auto-play as well).
-4. The GUI runs the native controller directly:
-   - builds/reuses the pinned toolchain,
-   - extracts the disc through nod,
-   - compiles `main.dol` with DolRecomp LLVM,
-   - links the GekkoAOT module,
-   - starts `gekkoaot-native-run`,
-   - sends the retail GX FIFO directly to AuroraGX.
-
-On X11/XWayland the Aurora SDL window is reparented into the Qt Game View when the platform exposes an X11 window handle. Pure Wayland uses Aurora's native top-level window.
-
-## Command-line controller
-
-The same pipeline is available without the GUI:
+### CLI
 
 ```bash
 GEKKOAOT_ISO='/path/to/game.rvz' ./bin/gekkoaotctl run
@@ -632,100 +615,295 @@ GEKKOAOT_ISO='/path/to/game.rvz' ./bin/gekkoaotctl pgo
 ./bin/gekkoaotctl clean
 ```
 
-### LLVM PGO
+## LLVM PGO and profiling
 
-With the LLVM backend selected, **Tools -> Train PGO** (or the Advanced-panel **Train PGO** button) builds an instrumented module and launches the game. Exercise representative scenes, then press **Stop**. GekkoAOT exits the runtime cleanly, merges the generated profiles with `llvm-profdata`, validates them, builds a PGO-use module, and automatically uses the cumulative profile on later Play launches. Re-run training in different scenes to improve coverage.
-
-Set `GEKKOAOT_LLVM_PROFDATA` if `llvm-profdata` cannot be discovered automatically. `GEKKOAOT_PGO_ACCUMULATE=0` disables cumulative training for one session, and `GEKKOAOT_PGO_AUTO_USE=0` launches the normal non-PGO module without deleting the trained profile.
-
-
-## Release process
-
-`version.txt` is the canonical project version.
-
-On `main`, GitHub Actions builds Linux x86_64 and Windows x86_64. When the version in `version.txt` does not already have a matching GitHub release, the release workflow builds, stages and publishes:
+With the LLVM backend, GekkoAOT can build an instrumented module, run representative gameplay and merge the collected profiles with `llvm-profdata`.
 
 ```text
-GekkoAOT-vX.Y.Z-Linux-x86_64.tar.gz
-GekkoAOT-vX.Y.Z-Linux-x86_64.tar.gz.sha256
-GekkoAOT-vX.Y.Z-Windows-x86_64.zip
-GekkoAOT-vX.Y.Z-Windows-x86_64.zip.sha256
+AOT module
+   |
+   v
+PGO instrumentation
+   |
+   v
+representative runtime workload
+   |
+   v
+.profraw
+   |
+   v
+llvm-profdata merge
+   |
+   v
+PGO-use rebuild
 ```
 
-Pre-1.0 releases are marked as prereleases.
+CrossGameDB and profiling tools are intended to collect architecture-neutral information that can help identify hot paths, compatibility patterns and candidates for static optimization.
 
-Release Please is used to prepare later version/changelog pull requests from Conventional Commits. See [`docs/RELEASING.md`](docs/RELEASING.md) for the complete workflow.
+## Reproducibility
+
+GekkoAOT pins its main external components:
+
+| Component | Pin |
+| --- | --- |
+| DolRecomp | `71ce7f97419b1bb1ba9a9596c41507f6629e0fb0` |
+| Aurora | `3840bf9ae735191026e4d4edb0ce6f24d91f7eea` |
+| encounter/nod | `v2.0.0-alpha.12` |
+
+Upstream patches are stored in the repository and checked with `git apply --check` before application.
+
+Mutable source/build/cache/profile data is kept outside installed read-only resources.
+
+## GekkoTranslate and long-term reconstruction
+
+The existing DolRecomp/LLVM path is the practical compiler foundation. The longer-term GekkoTranslate work aims to move from low-level instruction translation toward whole-program reconstruction.
+
+### Direct LLVM path
+
+```text
+PowerPC
+   |
+   v
+GekkoAOT IR / translated semantics
+   |
+   v
+LLVM IR
+   |
+   v
+-O3 / LTO / PGO
+   |
+   v
+native x86-64 / ARM64
+```
+
+This remains the lowest-level, fidelity-oriented path and does **not** require generated C++.
+
+### Reconstructed C++ path
+
+The second planned output path is portable reconstructed C++:
+
+```text
+main.dol + REL modules
+        |
+        v
+PowerPC disassembly
+        |
+        v
+CFG / data-flow / ABI analysis
+        |
+        v
+whole-program reconstruction
+        |
+        +--> functions / direct calls
+        +--> loops / if / switch
+        +--> callbacks / function pointers
+        +--> SDA / SDA2 usage
+        +--> types / structures where provable
+        |
+        v
+reconstructed portable C++
+        |
+        v
+Clang / LLVM
+        |
+        v
+native host executable
+```
+
+Generated C++ is intended to be an independently reconstructed representation of executable behavior, **not** recovered proprietary source code.
+
+### Reconstruction levels
+
+```text
+Level 1
+PPC instructions
+   -> equivalent native/LLVM semantics
+
+Level 2
+functions + CFG
+   -> loops
+   -> if/else
+   -> switch
+   -> direct calls
+
+Level 3
+whole-program reconstruction
+   -> DOL + REL relationships
+   -> callback targets
+   -> function-pointer resolution
+   -> inferred structures/types
+   -> native SDK interfaces
+   -> readable portable C++
+```
+
+Level 3 is deliberately ambitious and is not required for ordinary AOT compatibility.
+
+### Whole-program DOL + REL
+
+The target architecture treats all executable modules as one analyzable program:
+
+```text
+main.dol
+   |
+   +-- REL A
+   +-- REL B
+   +-- REL C
+   `-- runtime-loaded references
+        |
+        v
+ global symbol database
+        |
+        v
+ global call graph
+        |
+        v
+ canonical GekkoAOT IR
+        |
+        +--> direct LLVM
+        `--> reconstructed C++
+        |
+        v
+ whole-program optimization
+```
+
+The more indirect calls can be proven statically, the less runtime routing is needed.
+
+### Removing the guest dispatcher
+
+An early AOT runtime may still do:
+
+```text
+guest PC -> lookup -> host function pointer -> AOT function
+```
+
+The target for known code is:
+
+```text
+known guest target
+      |
+      v
+native direct call
+```
+
+The dispatcher should eventually remain only for cases such as:
+
+- unresolved indirect branches;
+- runtime-loaded REL targets;
+- unproven function pointers;
+- dynamic callbacks;
+- exception vectors;
+- unsupported code;
+- diagnostic/compatibility fallbacks.
+
+### GCINE
+
+**GCINE** is the name reserved for the longer-term native GameCube compatibility environment that sits below recompiled game logic.
+
+```text
+                   GCINE
+                     |
+       +-------------+-------------+
+       |             |             |
+       v             v             v
+      OS          Hardware         I/O
+       |             |             |
+   threads        PI / MI          DVD
+   mutexes        VI / AI          SI
+   queues         DSP              EXI
+   alarms         GX               input
+   timers
+   interrupts
+```
+
+Typical replacement direction:
+
+```text
+OS*   -> native scheduler/synchronization/timers
+GX*   -> AuroraGX
+DSP*  -> native DSP / HLE / LLE service
+AI*   -> native audio
+DVD*  -> nod + asynchronous I/O
+SI*   -> native input
+EXI*  -> native device services
+```
+
+The host implementation can be completely different internally as long as the GameCube-visible contract expected by the title is preserved.
+
+## Roadmap
+
+The current AOT pipeline is the practical foundation for the larger GekkoAOT direction.
+
+```text
+GameCube binaries
+       |
+       v
+  GekkoTranslate
+       |
+       +--> direct LLVM backend
+       |
+       +--> reconstructed portable C++
+       |
+       v
+    native code
+       |
+       +--> GCINE / NativeOS / native hardware
+       +--> AuroraGX
+       +--> native DSP/audio
+       |
+       v
+     Host OS
+```
+
+### Main goals
+
+- reduce dispatcher/runtime translation overhead;
+- resolve known calls statically;
+- expand native SDK/hardware coverage;
+- reconstruct DOL + REL modules as one program;
+- add a canonical GekkoAOT IR;
+- support direct LLVM and reconstructed C++ output paths;
+- target x86-64, ARM64 and eventually WebAssembly/WebGPU;
+- add widescreen and frame-rate decoupling infrastructure.
+
+The full long-term design lives in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+## Documentation
+
+| Document | Purpose |
+| --- | --- |
+| [Architecture](docs/ARCHITECTURE.md) | Current runtime ownership and process model |
+| [Compatibility](docs/COMPATIBILITY.md) | Status definitions and per-title results |
+| [Building](docs/BUILDING.md) | Source build requirements and instructions |
+| [Native VFS](docs/NATIVE_VFS.md) | Disc/image and filesystem path |
+| [Optimizations](docs/OPTIMIZATIONS.md) | Performance work and profiling |
+| [Roadmap](docs/ROADMAP.md) | GekkoTranslate / GCINE long-term direction |
+| [Clean-room](docs/CLEAN_ROOM.md) | Reconstruction and source-separation policy |
+| [Releasing](docs/RELEASING.md) | Versioning and release workflow |
 
 ## Repository layout
 
-- `src/` - Qt GUI.
-- `tools/gekkoaotctl.cpp` - native build/run controller.
-- `tools/module_meta.cpp` - native module metadata generator.
-- `runtime/native/` - standalone host and nod disc reader.
-- `runtime/module/` - per-game AOT module linker.
-- `runtime/gx/aurora/` - direct AuroraGX bridge.
-- `runtime/gx/host/` - renderer plugin ABI used by the host.
-- `runtime/os`, `runtime/sdk`, `runtime/hw`, `runtime/dsp` - native GameCube services.
-- `crossgame-db/` - cross-title compatibility, profiling and shared knowledge.
+<details>
+<summary><strong>Show repository structure</strong></summary>
 
-Future revisions may introduce dedicated `GekkoTranslate` and `GCINE` top-level components as those subsystems become independent enough to justify separate boundaries.
+```text
+src/                    Qt frontend
+tools/                  native controller and tooling
+runtime/native/         standalone native host / disc path
+runtime/module/         per-game AOT module linker
+runtime/gx/             AuroraGX bridge and host ABI
+runtime/os/             NativeOS services
+runtime/sdk/            SDK recognition / native services
+runtime/hw/             GameCube hardware services
+runtime/dsp/            DSP/audio services
+patches/                pinned upstream integration patches
+crossgame-db/           cross-title profiling / compatibility data
+game-packs/             per-title configuration
+docs/                   architecture, build and research documentation
+```
 
-## Long-term roadmap
+</details>
 
-### Phase 1 - Native compatibility foundation
-
-- [ ] Stabilize native OS/scheduler/timers/interrupts.
-- [ ] Stabilize native PI/MI/SI/EXI/DI and memory services.
-- [ ] Stabilize native DSP/audio.
-- [ ] Stabilize AuroraGX WGPIPE/FIFO rendering.
-- [ ] Keep nod as the asynchronous DVD/image backend.
-
-### Phase 2 - Reduce guest/runtime overhead
-
-- [ ] Replace known SDK calls with GCINE-native calls.
-- [ ] Resolve direct AOT calls statically.
-- [ ] Reduce dispatcher use.
-- [ ] Specialize proven MEM1/MEM2 accesses.
-- [ ] Keep MMIO interception only where hardware semantics require it.
-
-### Phase 3 - Whole-program GekkoTranslate
-
-- [ ] Build global DOL + REL symbol and call graphs.
-- [ ] Resolve function pointers and callbacks where provable.
-- [ ] Add a canonical GekkoAOT IR.
-- [ ] Lower the IR directly to LLVM.
-- [ ] Apply LTO, PGO, inlining, devirtualization and layout optimization.
-
-### Phase 4 - Automatic C++ reconstruction
-
-- [ ] Recover structured control flow.
-- [ ] Recover loops, `if`/`else` and `switch` constructs.
-- [ ] Recover function relationships and callbacks.
-- [ ] Infer types/structures where reliable.
-- [ ] Emit portable reconstructed C++.
-- [ ] Compile reconstructed C++ with Clang/LLVM.
-- [ ] Validate reconstructed behavior against the direct LLVM backend.
-
-### Phase 5 - Additional native targets/features
-
-- [ ] x86-64 host target.
-- [ ] ARM64 host target.
-- [ ] WebAssembly target.
-- [ ] WebGPU target.
-- [ ] Widescreen infrastructure.
-- [ ] Frame-rate decoupling/unlocking infrastructure.
-- [ ] Modern input and keyboard/mouse support.
-
----
-
-## v0.0.1 compatibility goal
-
-v0.0.1 keeps the same user-facing one-click launch intent as the former native-GX launcher: a disc image enters the pipeline and the standalone host starts the game. The implementation is now owned by GekkoAOT instead of relying on runtime patch injection.
-
-Because game compatibility depends on the exact title and host GPU/driver, release validation should include at least one cold build and one cache-hit launch for each supported test game before publishing a binary release.
-
-
-## Clean-room reconstruction note
+## Clean-room reconstruction
 
 GekkoAOT is intended to use independently implemented compatibility and reconstruction code.
 
@@ -733,26 +911,15 @@ Documentation, executable analysis, hardware behavior, public research and behav
 
 The planned C++ reconstruction backend is intended to reconstruct equivalent behavior from executable analysis, not reproduce unavailable original source code.
 
-## Long-term target
+---
 
-A mature GekkoAOT title should increasingly resemble:
+<p align="center">
+  <strong>PowerPC binaries → native LLVM / reconstructed C++ → GCINE + AuroraGX + native DSP</strong>
+</p>
 
-```text
-                Native game
-                    |
-         +----------+-----------+
-         |          |           |
-         v          v           v
-       CPU         GPU         DSP
-    x86-64/ARM64  AuroraGX     native
-         |          |           |
-         +----------+-----------+
-                    |
-                  GCINE
-                    |
-                 Host OS
-```
-
-At that stage, game logic executes as native machine code, known calls are direct, most dispatcher overhead is gone, SDK functions use native implementations, graphics use AuroraGX, DSP/audio run independently, and DOL/REL modules can be optimized as one program.
-
-> **Static GameCube recompilation plus automatic program reconstruction: PowerPC binaries analyzed into native LLVM or reconstructed portable C++, backed by GCINE, AuroraGX, native DSP/audio and whole-program optimization.**
+<p align="center">
+  <a href="https://github.com/ant0-blase/GekkoAOT/releases">Releases</a> ·
+  <a href="docs/COMPATIBILITY.md">Compatibility</a> ·
+  <a href="docs/ROADMAP.md">Roadmap</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
