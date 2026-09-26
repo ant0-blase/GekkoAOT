@@ -8,6 +8,13 @@ state observed during development testing and do not imply full playability.
 The project follows [Semantic Versioning](https://semver.org/) while it is pre-1.0.
 Future release entries are maintained by Release Please from Conventional Commits.
 
+## [0.0.3](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.2...v0.0.3) (2026-09-26)
+
+
+### Documentation
+
+* add GekkoAOT gameplay screenshots ([fed246f](https://github.com/ant0-blase/GekkoAOT/commit/fed246f7091f029579eb8ce62c2bdaa9fa3ea0b1))
+
 ## [Unreleased]
 
 ## [0.0.2](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.1...v0.0.2) (2026-09-26)
