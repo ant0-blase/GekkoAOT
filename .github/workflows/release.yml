@@ -1,9 +1,6 @@
 name: Release
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       force_publish:
@@ -14,12 +11,9 @@ on:
 
 permissions:
   contents: write
-  issues: write
-  pull-requests: write
-  actions: write
 
 concurrency:
-  group: gekkoaot-release-main
+  group: gekkoaot-release-manual
   cancel-in-progress: false
 
 jobs:
@@ -895,82 +889,3 @@ jobs:
             exit 3
           fi
           gh release upload "$TAG" "${assets[@]}" --clobber
-
-  release-please:
-    needs:
-      - plan
-      - publish-release
-    if: >-
-      ${{ always() &&
-          needs.plan.result == 'success' &&
-          ((needs.plan.outputs.needs_release == 'true' && needs.publish-release.result == 'success') ||
-           needs.plan.outputs.needs_release == 'false') }}
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Prepare next release PR
-        id: release_please
-        continue-on-error: true
-        uses: googleapis/release-please-action@v5
-        with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-          skip-github-release: true
-
-      # Release Please is PR-based by design. For GekkoAOT releases we want the
-      # version bump/changelog PR to be an implementation detail rather than a
-      # manual release gate, so merge only Release Please's own pending PR.
-      #
-      # A merge performed with GITHUB_TOKEN does not trigger an ordinary push
-      # workflow. In that fallback case explicitly dispatch this workflow again;
-      # workflow_dispatch is allowed to create a new run from GITHUB_TOKEN.
-      - name: Auto-merge Release Please PR
-        if: steps.release_please.outcome == 'success' && steps.release_please.outputs.prs_created == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
-          RELEASE_PR_JSON: ${{ steps.release_please.outputs.pr }}
-          HAS_RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
-        run: |
-          set -euo pipefail
-
-          pr_number="$(jq -r '.number // empty' <<<"${RELEASE_PR_JSON:-}")"
-
-          if [[ -z "$pr_number" ]]; then
-            pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --state open --label "autorelease: pending" --json number,headRefName --jq '[.[] | select(.headRefName | startswith("release-please--branches--main--"))][0].number // empty')"
-          fi
-
-          if [[ -z "$pr_number" ]]; then
-            echo "::error::Release Please reported a PR but no matching release PR could be found."
-            exit 1
-          fi
-
-          pr_info="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json number,title,baseRefName,headRefName,headRefOid)"
-          base_ref="$(jq -r '.baseRefName' <<<"$pr_info")"
-          head_ref="$(jq -r '.headRefName' <<<"$pr_info")"
-          head_sha="$(jq -r '.headRefOid' <<<"$pr_info")"
-
-          if [[ "$base_ref" != "main" || "$head_ref" != release-please--branches--main--* ]]; then
-            echo "::error::Refusing to auto-merge unexpected PR #$pr_number ($head_ref -> $base_ref)."
-            exit 2
-          fi
-
-          echo "Auto-merging Release Please PR #$pr_number ($head_ref -> main)"
-          gh pr merge "$pr_number" --repo "$GITHUB_REPOSITORY" --squash --delete-branch --match-head-commit "$head_sha"
-
-          if [[ "$HAS_RELEASE_PLEASE_TOKEN" != "true" ]]; then
-            echo "Merge used GITHUB_TOKEN; dispatching Release explicitly."
-            gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main -f force_publish=false
-          else
-            echo "Merge used RELEASE_PLEASE_TOKEN; the push to main will trigger Release."
-          fi
-
-      - name: Report release PR permission issue
-        if: steps.release_please.outcome == 'failure'
-        shell: bash
-        run: |
-          echo "::warning::Release Please could not create the next-version PR."
-          echo "Enable Settings > Actions > General > Workflow permissions > Allow GitHub Actions to create and approve pull requests,"
-          echo "or define the RELEASE_PLEASE_TOKEN repository secret with permission to create pull requests."
-          echo "The binary release itself is intentionally not failed by this repository policy issue."
