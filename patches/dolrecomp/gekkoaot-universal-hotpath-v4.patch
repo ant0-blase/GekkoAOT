@@ -1,0 +1,91 @@
+diff --git a/src/backend/llvm/branch_targets.cpp b/src/backend/llvm/branch_targets.cpp
+--- a/src/backend/llvm/branch_targets.cpp
++++ b/src/backend/llvm/branch_targets.cpp
+@@ -29,6 +29,11 @@ u32 nativeInlineBytes() {
+   return value;
+ }
+ 
++u32 nativeInlineHintBytes() {
++  static const u32 value = configuredNativeBytes("DOLRECOMP_NATIVE_INLINE_HINT_BYTES", 4096u);
++  return value;
++}
++
+ u32 relaxedCallGuardBytes() {
+   static const u32 value = configuredNativeBytes("DOLRECOMP_RELAXED_CALL_GUARD_BYTES", 256u);
+   return value;
+@@ -119,14 +124,18 @@ BasicBlock *FunctionEmitter::externalDestination(const DolIRTerminator &term,
+     calleeFunction->setCallingConv(bodyCallingConvention());
+     calleeFunction->setVisibility(GlobalValue::HiddenVisibility);
+     calleeFunction->setDSOLocal(true);
++    const u32 calleeBytes = range->end > range->start ? range->end - range->start : 0u;
+     // Small PPC helpers are extremely common (SDK getters, list helpers,
+     // audio-state probes). With native ABI + ThinLTO their argument/state
+     // marshalling often costs more than the translated body. Mark compact
+     // linked native functions always-inline so LLVM can fold guest state and
+     // cycle plumbing into the caller. Recursive SCCs are still protected by
+     // LLVM's inliner and by the existing call-depth guard.
+-    if (nativeTarget && term.linked && range->end > range->start &&
+-        range->end - range->start <= nativeInlineBytes()) {
++    if (nativeTarget && term.linked && calleeBytes != 0u &&
++        calleeBytes <= nativeInlineBytes()) {
+       calleeFunction->addFnAttr(Attribute::AlwaysInline);
++    } else if (nativeTarget && term.linked && calleeBytes != 0u &&
++               calleeBytes <= nativeInlineHintBytes()) {
++      calleeFunction->addFnAttr(Attribute::InlineHint);
+     }
+   }
+@@ -158,3 +171,12 @@ BasicBlock *FunctionEmitter::externalDestination(const DolIRTerminator &term,
+   CallInst *nativeCall = builder_.CreateCall(callee, arguments);
+   nativeCall->setCallingConv(bodyCallingConvention());
++  // Force the policy at the call site too: ThinLTO may otherwise keep a
++  // cross-partition helper out-of-line even when the declaration is marked.
++  if (nativeTarget && term.linked && range->end > range->start) {
++    const u32 calleeBytes = range->end - range->start;
++    if (calleeBytes <= nativeInlineBytes())
++      nativeCall->addFnAttr(Attribute::AlwaysInline);
++    else if (calleeBytes <= nativeInlineHintBytes())
++      nativeCall->addFnAttr(Attribute::InlineHint);
++  }
+   if (nativeTarget) {
+
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -1,5 +1,6 @@
+ #include "backend/llvm/emitter.h"
+ #include "cpu/cpu.h"
++#include <cstdlib>
+
+ #include <llvm/IR/BasicBlock.h>
+ #include <llvm/IR/Function.h>
+@@ -55,5 +56,15 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+                                       Value *address, Type *resultType,
+                                       u32 width, bool sign) {
++  const char *relTranslate = std::getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
++  if (relTranslate && relTranslate[0] && relTranslate[0] != '0') {
++    Type *i32 = Type::getInt32Ty(context_);
++    auto *translateType = FunctionType::get(
++        i32, {ctx_->getType(), i32}, false);
++    auto translate = module_.getOrInsertFunction(
++        "gekkoaot_rel_translate_address", translateType);
++    address = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
++  }
++
+   Value *directOffset = nullptr;
+   if (Value *pointer =
+           provenMemoryPointer(instruction, address, width, &directOffset)) {
+@@ -151,4 +161,14 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+                                      Value *address, Value *value, u32 width) {
++  const char *relTranslate = std::getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
++  if (relTranslate && relTranslate[0] && relTranslate[0] != '0') {
++    Type *i32 = Type::getInt32Ty(context_);
++    auto *translateType = FunctionType::get(
++        i32, {ctx_->getType(), i32}, false);
++    auto translate = module_.getOrInsertFunction(
++        "gekkoaot_rel_translate_address", translateType);
++    address = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
++  }
++
+   Value *directOffset = nullptr;
+   if (Value *pointer =
+           provenMemoryPointer(instruction, address, width, &directOffset)) {

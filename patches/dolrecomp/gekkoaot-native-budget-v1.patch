@@ -1,0 +1,63 @@
+diff --git a/src/backend/llvm/timing.cpp b/src/backend/llvm/timing.cpp
+index 72634d7..fbfea24 100644
+--- a/src/backend/llvm/timing.cpp
++++ b/src/backend/llvm/timing.cpp
+@@ -1,6 +1,9 @@
+ #include "backend/llvm/emitter.h"
+ #include "cpu/cpu.h"
+ 
++#include <cerrno>
++#include <cstdlib>
++
+ #include <llvm/IR/BasicBlock.h>
+ #include <llvm/IR/Constants.h>
+ #include <llvm/IR/Function.h>
+@@ -9,6 +12,30 @@ namespace dolllvm {
+ 
+ using namespace llvm;
+ 
++namespace {
++u64 configuredBudget(const char* name, u64 fallback, u64 minimum, u64 maximum) {
++  const char* text = std::getenv(name);
++  if (!text || !*text)
++    return fallback;
++  char* end = nullptr;
++  errno = 0;
++  const unsigned long long value = std::strtoull(text, &end, 10);
++  if (errno || !end || *end || value < minimum || value > maximum)
++    return fallback;
++  return static_cast<u64>(value);
++}
++
++u64 recompcoreGuardCycles() {
++  static const u64 value = configuredBudget("DOLRECOMP_GUARD_CYCLES", 2048u, 256u, 1048576u);
++  return value;
++}
++
++u64 recompcoreGuardSteps() {
++  static const u64 value = configuredBudget("DOLRECOMP_GUARD_STEPS", 8192u, 2048u, 1048576u);
++  return value;
++}
++} // namespace
++
+ void FunctionEmitter::chargeCycles(u32 cycles) {
+   chargeCycles(ConstantInt::get(Type::getInt64Ty(context_), cycles));
+ }
+@@ -105,7 +132,7 @@ void FunctionEmitter::emitBudgetGuard(u32 pc) {
+                                                     builder_.CreateStructGEP(
+                                                         chainType(), chain_, 4))
+                               : static_cast<Value *>(ConstantInt::get(
+-                                    Type::getInt64Ty(context_), 256)));
++                                    Type::getInt64Ty(context_), recompcoreGuardCycles())));
+   Value *exhausted = overCycles;
+   if (!native_abi_ || !cold_escapes_) {
+     Value *steps =
+@@ -114,7 +141,7 @@ void FunctionEmitter::emitBudgetGuard(u32 pc) {
+         steps, ConstantInt::get(Type::getInt64Ty(context_), 1));
+     builder_.CreateStore(nextSteps, guard_steps_);
+     Value *overSteps = builder_.CreateICmpUGE(
+-        nextSteps, ConstantInt::get(Type::getInt64Ty(context_), 2048));
++        nextSteps, ConstantInt::get(Type::getInt64Ty(context_), recompcoreGuardSteps()));
+     exhausted = builder_.CreateOr(overCycles, overSteps);
+   }
+   BasicBlock *run = BasicBlock::Create(context_, "budget_run", function_);

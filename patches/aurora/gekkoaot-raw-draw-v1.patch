@@ -1,0 +1,69 @@
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index b202748..0ad0ecd 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -261,8 +261,14 @@ ProcessResult process(const u8* data, u32 size) noexcept {
+       auto const& array = g_gxState.arrays[arrayType];
+       const u32 srcOffset = static_cast<u32>(srcArrayIdx) * array.stride;
+       const u32 srcSize = static_cast<u32>(len) * sizeof(u32);
+-      AURORA_ASSERT(array.data != nullptr, "indexed XF load from unmapped array {}", arrayType);
+-      AURORA_ASSERT(srcOffset <= array.size && srcSize <= array.size - srcOffset,
+-                    "indexed XF load outside array {}: offset={}, size={}, array size={}", arrayType, srcOffset,
+-                    srcSize, array.size);
++      if (array.data == nullptr || array.stride == 0 || srcOffset > array.size ||
++          srcSize > array.size - srcOffset) {
++        static u32 invalidIndexedXfLogCount = 0;
++        if (invalidIndexedXfLogCount < 16) {
++          Log.warn("Skipping indexed XF load with invalid source array: array={} idx={} stride={} offset={} bytes={} size={} dst=0x{:04X}",
++                   arrayType, srcArrayIdx, array.stride, srcOffset, srcSize, array.size, dstAddr);
++          ++invalidIndexedXfLogCount;
++        }
++        break;
++      }
+       auto const* srcData = static_cast<const u8*>(array.data) + srcOffset;
+@@ -550,6 +550,21 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
+   draw_prim(prim, fmt, reader.read<u16>(), reader);
+ }
+ 
++bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vertexCount,
++                     const u8* vertexData, u32 vertexBytes) noexcept {
++  if (!vertexData || vertexCount == 0u) return false;
++  u32 vtxSize;
++  if (g_gxState.lastVtxFmt == fmt)
++    vtxSize = g_gxState.lastVtxSize;
++  else
++    vtxSize = calc_vtx_size(fmt);
++  if (vtxSize == 0u || static_cast<u64>(vertexCount) * vtxSize != vertexBytes)
++    return false;
++  ByteReader reader{{vertexData, vertexBytes}};
++  draw_prim(prim, fmt, vertexCount, reader);
++  return reader.empty();
++}
++
+ void handle_aurora(ByteReader& reader) noexcept {
+   ZoneScoped;
+   const u16 subCmd = reader.read<u16>();
+diff --git a/lib/gx/command_processor.hpp b/lib/gx/command_processor.hpp
+index fb9fe15..91ca1f4 100644
+--- a/lib/gx/command_processor.hpp
++++ b/lib/gx/command_processor.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "../internal.hpp"
++#include "dolphin/gx/GXEnum.h"
+ 
+ #include <cstdint>
+ 
+@@ -13,6 +14,11 @@ struct ProcessResult {
+ 
+ // Process GX FIFO commands until the next draw done event or end of buffer
+ ProcessResult process(const uint8_t* data, uint32_t size) noexcept;
++// Fast path for hosts that have already framed a retail draw command. This
++// skips reparsing the opcode/count header while retaining Aurora's native draw
++// merging, pipeline cache and indexed-array machinery.
++bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, uint16_t vertex_count,
++                     const uint8_t* vertex_data, uint32_t vertex_bytes) noexcept;
+ void clear_draw_cache() noexcept;
+ 
+ } // namespace aurora::gx::fifo

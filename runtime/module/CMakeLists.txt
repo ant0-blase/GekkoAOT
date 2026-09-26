@@ -1,0 +1,123 @@
+cmake_minimum_required(VERSION 3.24)
+project(GekkoAOTGameModule LANGUAGES C)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+set(GAME_ID "" CACHE STRING "Six-character GameCube disc id")
+set(GENERATED_DIR "" CACHE PATH "DolRecomp generated output directory")
+set(DOLRECOMP_DIR "" CACHE PATH "Pinned DolRecomp checkout")
+set(GEKKOAOT_ROOT "" CACHE PATH "GekkoAOT source root")
+set(MODULE_TABLES "" CACHE FILEPATH "Generated GekkoAOT module metadata include")
+set(GEKKOAOT_PGO_MODE "off" CACHE STRING "PGO mode: off, gen or use")
+set_property(CACHE GEKKOAOT_PGO_MODE PROPERTY STRINGS off gen use)
+set(GEKKOAOT_PGO_PROFILE "" CACHE FILEPATH "Merged LLVM PGO profile")
+option(GEKKOAOT_USE_THINLTO "Link DolRecomp LLVM bitcode with ThinLTO when available" OFF)
+if(NOT GAME_ID OR NOT EXISTS "${GENERATED_DIR}/generated.h" OR
+   NOT EXISTS "${DOLRECOMP_DIR}/src/cpu/cpu.c" OR NOT EXISTS "${MODULE_TABLES}")
+  message(FATAL_ERROR "GAME_ID, GENERATED_DIR, DOLRECOMP_DIR and MODULE_TABLES are required")
+endif()
+
+file(GLOB_RECURSE CHUNK_INPUTS CONFIGURE_DEPENDS
+  "${GENERATED_DIR}/*.o" "${GENERATED_DIR}/*.obj")
+file(GLOB_RECURSE BITCODE_INPUTS CONFIGURE_DEPENDS
+  "${GENERATED_DIR}/*.o.bc")
+file(GLOB_RECURSE C_INPUTS CONFIGURE_DEPENDS
+  "${GENERATED_DIR}/*.c")
+
+if(GEKKOAOT_USE_THINLTO AND BITCODE_INPUTS AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+  set(DOLRECOMP_BACKEND "llvm-thinlto")
+  set_source_files_properties(${BITCODE_INPUTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  set(DOLRECOMP_INPUTS ${BITCODE_INPUTS})
+  list(LENGTH BITCODE_INPUTS GEKKOAOT_BITCODE_COUNT)
+  message(STATUS "GekkoAOT: linking ${GEKKOAOT_BITCODE_COUNT} LLVM bitcode partitions with ThinLTO")
+elseif(CHUNK_INPUTS)
+  set(DOLRECOMP_BACKEND "llvm")
+  set_source_files_properties(${CHUNK_INPUTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  set(DOLRECOMP_INPUTS ${CHUNK_INPUTS})
+elseif(C_INPUTS)
+  set(DOLRECOMP_BACKEND "c")
+  set_source_files_properties(${C_INPUTS} PROPERTIES GENERATED TRUE)
+  set(DOLRECOMP_INPUTS ${C_INPUTS})
+else()
+  message(FATAL_ERROR "No DolRecomp LLVM object chunks or Portable C sources found below ${GENERATED_DIR}")
+endif()
+message(STATUS "GekkoAOT game module backend: ${DOLRECOMP_BACKEND}")
+
+file(READ "${GENERATED_DIR}/generated.h" GENERATED_HEADER_TEXT)
+set(MODULE_NAME "g${GAME_ID}_recomp")
+add_library(${MODULE_NAME} SHARED
+  "${GEKKOAOT_ROOT}/runtime/module/module_export.c"
+  "${DOLRECOMP_DIR}/src/cpu/cpu.c"
+  ${DOLRECOMP_INPUTS})
+set_target_properties(${MODULE_NAME} PROPERTIES PREFIX "" OUTPUT_NAME "${MODULE_NAME}" UNITY_BUILD OFF)
+
+# IPO also helps the LLVM backend's C-side module glue. Static-intercept AOT
+# removes ordinary native-region admission calls before object emission, so the
+# remaining cpu.c helper path is cold and exact rather than cached at runtime.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT GEKKOAOT_IPO_OK OUTPUT GEKKOAOT_IPO_ERROR LANGUAGES C)
+if(GEKKOAOT_IPO_OK AND NOT DOLRECOMP_BACKEND STREQUAL "llvm-thinlto")
+  set_property(TARGET ${MODULE_NAME} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  message(STATUS "GekkoAOT game module IPO/LTO: enabled (${DOLRECOMP_BACKEND})")
+elseif(DOLRECOMP_BACKEND STREQUAL "llvm-thinlto")
+  message(STATUS "GekkoAOT game module IPO/LTO: explicit ThinLTO owns the link")
+else()
+  message(STATUS "GekkoAOT game module IPO/LTO: unavailable (${GEKKOAOT_IPO_ERROR})")
+endif()
+
+target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_GAME_ID="${GAME_ID}")
+if(DOLRECOMP_BACKEND STREQUAL "c")
+  target_compile_definitions(${MODULE_NAME} PRIVATE DOLRECOMP_C_MAX_CALL_DEPTH=64)
+endif()
+if(GENERATED_HEADER_TEXT MATCHES "dolrecomp_call__x86_64_v3")
+  target_compile_definitions(${MODULE_NAME} PRIVATE DOLRECOMP_MODULE_HAVE_X86_64_V3=1)
+endif()
+target_include_directories(${MODULE_NAME} PRIVATE
+  "${GENERATED_DIR}"
+  "${DOLRECOMP_DIR}/src"
+  "${GEKKOAOT_ROOT}/runtime"
+  "${CMAKE_CURRENT_BINARY_DIR}")
+configure_file("${MODULE_TABLES}" "${CMAKE_CURRENT_BINARY_DIR}/module_tables.inc" COPYONLY)
+
+if(NOT WIN32)
+  target_link_libraries(${MODULE_NAME} PRIVATE m)
+endif()
+
+if(NOT GEKKOAOT_PGO_MODE STREQUAL "off")
+  if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "GekkoAOT LLVM PGO requires Clang so compiler-rt profiling can be linked")
+  endif()
+  if(GEKKOAOT_PGO_MODE STREQUAL "gen")
+    target_compile_definitions(${MODULE_NAME} PRIVATE GEKKOAOT_PGO_GENERATE=1)
+    target_link_options(${MODULE_NAME} PRIVATE -fprofile-instr-generate)
+    message(STATUS "GekkoAOT PGO: instrumentation runtime enabled")
+  elseif(GEKKOAOT_PGO_MODE STREQUAL "use")
+    if(NOT EXISTS "${GEKKOAOT_PGO_PROFILE}")
+      message(FATAL_ERROR "GEKKOAOT_PGO_PROFILE is required for PGO-use")
+    endif()
+    message(STATUS "GekkoAOT PGO: optimized profile ${GEKKOAOT_PGO_PROFILE}")
+  else()
+    message(FATAL_ERROR "GEKKOAOT_PGO_MODE must be off, gen or use")
+  endif()
+endif()
+
+if(DOLRECOMP_BACKEND STREQUAL "llvm-thinlto")
+  target_compile_options(${MODULE_NAME} PRIVATE -flto=thin)
+  target_link_options(${MODULE_NAME} PRIVATE -flto=thin -O3 -fno-semantic-interposition)
+  message(STATUS "GekkoAOT game module ThinLTO: enabled (link-O3, cross-partition hot-path import)")
+endif()
+if(UNIX AND NOT APPLE)
+  target_link_options(${MODULE_NAME} PRIVATE "LINKER:--version-script=${GEKKOAOT_ROOT}/runtime/module/module.exports")
+endif()
+if(MSVC)
+  target_compile_options(${MODULE_NAME} PRIVATE /O2 /fp:strict)
+else()
+  target_compile_options(${MODULE_NAME} PRIVATE -O3 -ffp-contract=off -fno-fast-math -fvisibility=hidden -fno-semantic-interposition -fomit-frame-pointer)
+  if(UNIX AND NOT APPLE)
+    target_compile_options(${MODULE_NAME} PRIVATE -fno-plt)
+  endif()
+  if(NOT APPLE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|aarch64|arm64"))
+    target_compile_options(${MODULE_NAME} PRIVATE -march=native -mtune=native)
+  endif()
+endif()

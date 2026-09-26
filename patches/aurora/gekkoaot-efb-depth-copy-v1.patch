@@ -1,0 +1,96 @@
+diff --git a/lib/gfx/tex_copy_conv.cpp b/lib/gfx/tex_copy_conv.cpp
+--- a/lib/gfx/tex_copy_conv.cpp
++++ b/lib/gfx/tex_copy_conv.cpp
+@@ -232,6 +232,14 @@ static constexpr std::string_view FragGB8 = R"(
+ }
+ )"sv;
+ 
++// GX_CTF_Z4: upper four bits of the 24-bit EFB depth value -> I4.
++static constexpr std::string_view FragZ4 = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let z4 = f32((gx_z24(in.uv) >> 20u) & 0xFu) / 15.0;
++    return vec4f(z4, z4, z4, z4);
++}
++)"sv;
++
+ // GX_TF_Z8: Upper 8-bits depth -> I8
+ static constexpr std::string_view FragZ8 = R"(
+ @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+@@ -253,6 +261,41 @@ static constexpr std::string_view FragZ16 = R"(
+ }
+ )"sv;
+ 
++// GX_CTF_Z8M / GX_CTF_Z8L select the middle / low byte of Z24.
++static constexpr std::string_view FragZ8M = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let z8 = f32((gx_z24(in.uv) >> 8u) & 0xFFu) / 255.0;
++    return vec4f(z8, z8, z8, z8);
++}
++)"sv;
++
++static constexpr std::string_view FragZ8L = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let z8 = f32(gx_z24(in.uv) & 0xFFu) / 255.0;
++    return vec4f(z8, z8, z8, z8);
++}
++)"sv;
++
++// Z16L is the middle/low pair. Z16R (raw copy format 0xB) is the
++// high/middle pair and therefore has the same sampled IA8 result as FragZ16.
++static constexpr std::string_view FragZ16L = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let z = gx_z24(in.uv);
++    let i = f32((z >> 8u) & 0xFFu) / 255.0;
++    let a = f32(z & 0xFFu) / 255.0;
++    return vec4f(i, i, i, a);
++}
++)"sv;
++
++// Z24X8 samples as the three Z bytes plus an opaque X byte.
++static constexpr std::string_view FragZ24X8 = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let z = gx_z24(in.uv);
++    return vec4f(f32((z >> 16u) & 0xFFu), f32((z >> 8u) & 0xFFu),
++                 f32(z & 0xFFu), 255.0) / 255.0;
++}
++)"sv;
++
+ // Depth -> R32Float (no scaling)
+ static constexpr std::string_view DepthSnapshotShader = R"(
+ @group(0) @binding(0) var src: texture_depth_2d;
+@@ -317,9 +360,19 @@ static constexpr std::array ConvPipelines{
+     ConvPipeline{GX_CTF_GB8, FragGB8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv GB8"},
+ };
+ 
++// Nintendo's public GX enum omits a symbolic Z16R value even though the copy
++// hardware uses raw format 0xB for it. _GX_TF_ZTF|_GX_TF_CTF|0xB == 0x3B.
++static constexpr GXTexFmt GekkoAOTZ16R = static_cast<GXTexFmt>(0x3B);
++
+ static constexpr std::array DepthConvPipelines{
++    ConvPipeline{GX_CTF_Z4, FragZ4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z4"},
+     ConvPipeline{GX_TF_Z8, FragZ8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z8"},
+     ConvPipeline{GX_TF_Z16, FragZ16, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z16"},
++    ConvPipeline{GX_TF_Z24X8, FragZ24X8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z24X8"},
++    ConvPipeline{GX_CTF_Z8M, FragZ8M, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z8M"},
++    ConvPipeline{GX_CTF_Z8L, FragZ8L, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z8L"},
++    ConvPipeline{GekkoAOTZ16R, FragZ16, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z16R"},
++    ConvPipeline{GX_CTF_Z16L, FragZ16L, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z16L"},
+ };
+ 
+ static wgpu::BindGroupLayout g_bindGroupLayout;
+diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -472,8 +472,11 @@ static inline bool requires_load_conversion(const GXTexObj_& obj) {
+ }
+ static inline bool is_palette_format(u32 fmt) { return fmt == GX_TF_C4 || fmt == GX_TF_C8 || fmt == GX_TF_C14X2; }
+ static inline bool is_depth_format(u32 fmt) {
++  // Raw EFB copy format 0xB is Z16R when PE is in depth-copy mode. GXEnum.h
++  // does not expose a GX_CTF_Z16R symbol, but its encoded GXTexFmt value is
++  // 0x0B | _GX_TF_ZTF | _GX_TF_CTF == 0x3B.
+   return fmt == GX_TF_Z8 || fmt == GX_TF_Z16 || fmt == GX_TF_Z24X8 || fmt == GX_CTF_Z4 || fmt == GX_CTF_Z8M ||
+-         fmt == GX_CTF_Z8L || fmt == GX_CTF_Z16L;
++         fmt == GX_CTF_Z8L || fmt == 0x3Bu || fmt == GX_CTF_Z16L;
+ }
+ 
+ struct AttrConfig {

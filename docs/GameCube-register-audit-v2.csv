@@ -1,0 +1,131 @@
+subsystem,address,width,register,read_semantics,write_semantics,clear_on_write,interrupt_behavior,implementation,status,evidence
+PI,0xCC003000,32,InterruptCause,latched cause + reset state,write-one-to-clear,written bits,cause & mask,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC003004,32,InterruptMask,mask,replace mask,none,cause & mask,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC00300C,32,FifoBase,CPU FIFO base,mask 0x03ffffe0,none,none,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC003010,32,FifoEnd,last aligned CPU FIFO burst,mask 0x03ffffe0,none,none,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC003014,32,FifoWritePointer,write pointer,mask 0x03ffffe0,none,none,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC003018,32,FifoReset,unmapped,bit 0 sets reset request,consumed by runtime,none,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC00301C,32,ErrorCause,stored low bits,mask 7,none,no producer modeled,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC003020,32,ErrorAddress,stored value,rejected,none,no producer modeled,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC003024,32,ResetCode,stored value,replace,none,none,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC003028,32,Unknown28,initial 0x1ff,mask 0x3ff,none,none,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC00302C,32,FlipperRevision,constant 0x246500b1,rejected,none,none,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+PI,0xCC003030,32,BusStrength,initial 0x02492492,mask 0x07ffffff,none,none,runtime/hw/pi/native_pi.cpp:Read32/Write32,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004000,16,Region0First,stored,replace,none,protection enforcement missing,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004002,16,Region0Last,stored,replace,none,protection enforcement missing,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004004,16,Region1First,stored,replace,none,protection enforcement missing,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004006,16,Region1Last,stored,replace,none,protection enforcement missing,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004008,16,Region2First,stored,replace,none,protection enforcement missing,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00400A,16,Region2Last,stored,replace,none,protection enforcement missing,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00400C,16,Region3First,stored,replace,none,protection enforcement missing,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00400E,16,Region3Last,stored,replace,none,protection enforcement missing,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004010,16,ProtectionType,stored,replace; no W1C implementation,none implemented,no protection event producer,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00401C,16,IrqMask,stored,replace; no W1C implementation,none implemented,no protection event producer,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00401E,16,IrqFlag,stored,replace; no W1C implementation,none implemented,no protection event producer,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004020,16,Unknown20,stored,replace; no W1C implementation,none implemented,no protection event producer,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004022,16,ProtectionAddrLo,stored,replace; no W1C implementation,none implemented,no protection event producer,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004024,16,ProtectionAddrHi,stored,replace; no W1C implementation,none implemented,no protection event producer,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00405A,16,Unknown5A,stored,replace; no W1C implementation,none implemented,no protection event producer,runtime/hw/mi/native_mi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004032,16,Timer0Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004034,16,Timer0Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004036,16,Timer1Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004038,16,Timer1Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00403A,16,Timer2Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00403C,16,Timer2Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00403E,16,Timer3Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004040,16,Timer3Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004042,16,Timer4Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004044,16,Timer4Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004046,16,Timer5Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004048,16,Timer5Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00404A,16,Timer6Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00404C,16,Timer6Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC00404E,16,Timer7Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004050,16,Timer7Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004052,16,Timer8Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004054,16,Timer8Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004056,16,Timer9Hi,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+MI,0xCC004058,16,Timer9Lo,stored (does not advance),replace half,none,none,runtime/hw/mi/native_mi.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001000,16,ZConf,CPU mirror,replace mirror,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001002,16,AlphaConf,CPU mirror,replace mirror,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001004,16,DstAlphaConf,CPU mirror,replace mirror,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001006,16,AlphaMode,CPU mirror,replace mirror,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001008,16,AlphaRead,CPU mirror,replace mirror,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC00100A,16,Control,enables bits 0/1 only,enable bits 0/1; ACK bits 2/3,bit 2 token; bit 3 finish,separate pending latches AND enable,runtime/hw/pe/native_pe.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC00100E,16,Token,last BP token,rejected,none,BP token interrupt -> PI,runtime/hw/pe/native_pe.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001010,16,BBoxLeft,zero; no renderer update,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001012,16,BBoxRight,zero; no renderer update,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001014,16,BBoxTop,zero; no renderer update,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001016,16,BBoxBottom,zero; no renderer update,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001018,16,Performance18,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC00101A,16,Performance1A,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC00101C,16,Performance1C,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC00101E,16,Performance1E,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001020,16,Performance20,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001022,16,Performance22,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001024,16,Performance24,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001026,16,Performance26,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC001028,16,Performance28,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC00102A,16,Performance2A,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC00102C,16,Performance2C,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+PE,0xCC00102E,16,Performance2E,constant zero,rejected,none,none,runtime/hw/pe/native_pe.cpp:Read16/Write16,Missing,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002000,16,VerticalTiming,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002002,16,Control,stored,writable mask; reset pulse,reset clears four IRQs and beam phase,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002004,16,HorizontalTiming0Hi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002006,16,HorizontalTiming0Lo,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002008,16,HorizontalTiming1Hi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00200A,16,HorizontalTiming1Lo,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00200C,16,VblankOddHi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00200E,16,VblankOddLo,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002010,16,VblankEvenHi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002012,16,VblankEvenLo,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002014,16,BurstOddHi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002016,16,BurstOddLo,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002018,16,BurstEvenHi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00201A,16,BurstEvenLo,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00201C,16,FbLeftTopHi,stored,replace; bits 13..15 clear POFF bit12,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00201E,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002020,16,FbRightTopHi,stored,replace; bits 13..15 clear POFF bit12,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002022,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002024,16,FbLeftBottomHi,stored,replace; bits 13..15 clear POFF bit12,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002026,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002028,16,FbRightBottomHi,stored,replace; bits 13..15 clear POFF bit12,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00202A,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00202C,16,VerticalBeam,generated beam position,ignored,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00202E,16,HorizontalBeam,generated beam position,ignored,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002030,16,PreRetraceHi,target/mask/status,replace high half,status bit 31 cleared by writing 0,target match sets status; enabled status -> PI Video,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002032,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002034,16,PostRetraceHi,target/mask/status,replace high half,status bit 31 cleared by writing 0,target match sets status; enabled status -> PI Video,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002036,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002038,16,DisplayInterrupt2Hi,target/mask/status,replace high half,status bit 31 cleared by writing 0,target match sets status; enabled status -> PI Video,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00203A,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00203C,16,DisplayInterrupt3Hi,target/mask/status,replace high half,status bit 31 cleared by writing 0,target match sets status; enabled status -> PI Video,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00203E,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002040,16,DisplayLatch0Hi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002042,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002044,16,DisplayLatch1Hi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002046,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002048,16,HScaleW,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00204A,16,HScaleR,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00204C,16,Filter0Hi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00204E,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002050,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002052,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002054,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002056,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002058,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00205A,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00205C,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00205E,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002060,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002062,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002064,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002066,16,StoredHalfword,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002068,16,UnknownAaHi,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00206A,16,UnknownAaLo,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00206C,16,Clock,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC00206E,16,DtvStatus,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002070,16,FbWidth,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002072,16,BorderBlankEnd,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+VI,0xCC002074,16,BorderBlankStart,stored,replace,none,none,runtime/hw/vi/native_vi.cpp:Read16/Write16,Partial,Runtime inspection; hardware conformance not yet fully tested
+SI,0xCC006430,32,SIPOLL,X/Y timing and EN0-EN3 automatic poll enables,replace register,none,only enabled ports may create automatic RDST data,runtime/hw/si/native_si.cpp:PollNow,Partial,Before/after selective-port test; explicit COMCSR transfer remains independent; game input unverified

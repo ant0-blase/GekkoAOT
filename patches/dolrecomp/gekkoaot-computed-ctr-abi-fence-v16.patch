@@ -1,0 +1,32 @@
+--- a/src/backend/llvm/abi_liveness.cpp
++++ b/src/backend/llvm/abi_liveness.cpp
+@@ -9,7 +9,28 @@
+   *blockers = 0;
+   for (u32 blockIndex = 0; blockIndex < function.block_count; blockIndex++) {
+     const DolIRBlock &block = function.blocks[blockIndex];
+-    if (!block.cycle_cost || block.terminator.kind == DOLIR_TERM_FALLBACK)
++
++    // A BCCTR/BCTRL target is selected from CTR at runtime.  Unlike a direct
++    // call edge, prepareModuleABIs cannot know the destination range and
++    // therefore cannot propagate that callee's Native ABI inputs back into
++    // this function.  Letting such a function remain Native-ABI eligible can
++    // strand pass-through PPC state in LLVM SSA: the computed branch returns
++    // through returnNative(target), which only exports this function's known
++    // output_state.  The global dispatcher then enters the dynamic callee from
++    // CPUState and observes stale registers (notably floating arguments such
++    // as f1-f4 used by UI/GX helpers).
++    //
++    // Fence only computed CTR branches.  BCLR/BLR uses XO 16 and remains on
++    // the fast Native ABI path, so ordinary function returns are unaffected.
++    // BCCTR/BCTR uses primary opcode 19 and XO 528 (LK is intentionally not
++    // part of the test: jump-table re-entry crosses the same architectural
++    // state boundary as an indirect call).
++    const u32 raw = block.raw;
++    const bool computedCtrBranch =
++        block.terminator.kind == DOLIR_TERM_INDIRECT &&
++        (raw >> 26) == 19u && ((raw >> 1) & 0x3ffu) == 528u;
++    if (!block.cycle_cost || block.terminator.kind == DOLIR_TERM_FALLBACK ||
++        computedCtrBranch)
+       *blockers |= DOLLLVM_ABI_BLOCK_CONTROL;
+     if (block.terminator.kind == DOLIR_TERM_SYSTEM_CALL)
+       *blockers |= DOLLLVM_ABI_BLOCK_EXCEPTION;

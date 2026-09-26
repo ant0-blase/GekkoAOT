@@ -1,0 +1,28 @@
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -190,4 +190,25 @@
+         builder_.SetInsertPoint(invoke);
++
++        // GEKKOAOT_DOLRECOMP_STATIC_DIRECT_HLE_STATE_SYNC_V4:
++        // Native-ABI calls can arrive with the architectural register state in
++        // SSA arguments rather than CPUState. A direct HLE service consumes
++        // CPUState, so publish every state slot used by this function before
++        // crossing the host boundary. Without this, scheduler/context HLE can
++        // observe stale r3/r4/LR/MSR values from the previous AOT region.
++        if (native_abi_) {
++          for (u32 slot = 0; slot < DOLIR_STATE_COUNT; ++slot) {
++            if (!used_[slot])
++              continue;
++            auto stateSlot = static_cast<DolIRStateSlot>(slot);
++            if (!slotInMemory(stateSlot))
++              syncState(stateSlot);
++          }
++          storeContext(DOLIR_STATE_PC, entry_pc_);
++          settleCycles();
++        } else {
++          materialize(entry_pc_);
++        }
++
+         Value* handled = builder_.CreateCall(
+             hostCallType, hostCall,
+             {ctx_, builder_.getInt32(entry.direct_token)});

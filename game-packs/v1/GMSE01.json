@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "disc_id": "GMSE01",
+  "name": "Super Mario Sunshine (USA)",
+  "pack_version": 1,
+  "compatibility": {
+    "snapshot": "0.0.1",
+    "state": "boot",
+    "note": "Boots; later execution is not yet considered working."
+  },
+  "runtime_features": [],
+  "planned_runtime_features": [],
+  "ui": {
+    "title": "Super Mario Sunshine",
+    "options": []
+  }
+}

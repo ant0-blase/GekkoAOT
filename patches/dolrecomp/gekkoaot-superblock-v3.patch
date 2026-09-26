@@ -1,0 +1,199 @@
+diff --git a/src/backend/llvm/branch_targets.cpp b/src/backend/llvm/branch_targets.cpp
+--- a/src/backend/llvm/branch_targets.cpp
++++ b/src/backend/llvm/branch_targets.cpp
+@@ -1,7 +1,9 @@
+ #include "backend/llvm/emitter.h"
+ #include "cpu/cpu.h"
+ 
++#include <cerrno>
+ #include <cstdio>
++#include <cstdlib>
+ 
+ #include <llvm/ADT/SmallVector.h>
+ #include <llvm/IR/BasicBlock.h>
+@@ -11,6 +13,36 @@ namespace dolllvm {
+ 
+ using namespace llvm;
+ 
++namespace {
++u32 configuredNativeBytes(const char *name, u32 fallback) {
++  const char *text = std::getenv(name);
++  if (!text || !*text)
++    return fallback;
++  char *end = nullptr;
++  errno = 0;
++  const unsigned long value = std::strtoul(text, &end, 10);
++  if (errno || !end || *end || value > 4096ul)
++    return fallback;
++  return static_cast<u32>(value);
++}
++
++u32 nativeInlineBytes() {
++  static const u32 value = configuredNativeBytes("DOLRECOMP_NATIVE_INLINE_BYTES", 256u);
++  return value;
++}
++
++u32 relaxedCallGuardBytes() {
++  static const u32 value = configuredNativeBytes("DOLRECOMP_RELAXED_CALL_GUARD_BYTES", 256u);
++  return value;
++}
++
++bool smallLinkedNativeCall(const DolIRTerminator &term,
++                           const DolLLVMFunctionRange *range) {
++  return term.linked && range && range->end > range->start &&
++         range->end - range->start <= relaxedCallGuardBytes();
++}
++} // namespace
++
+ BasicBlock *FunctionEmitter::directDestination(const DolIRTerminator &term,
+                                                u32 slot) {
+   if (term.targets[slot] != DOLIR_NO_BLOCK) {
+@@ -51,8 +82,15 @@ BasicBlock *FunctionEmitter::externalDestination(const DolIRTerminator &term,
+   BasicBlock *callBlock = BasicBlock::Create(
+       context_, term.linked ? "direct_call" : "direct_tail", function_);
+   IRBuilderBase::InsertPoint saved = builder_.saveIP();
+   builder_.SetInsertPoint(callBlock);
+-  emitBudgetGuard(target);
++  // A tiny linked native callee cannot hide an unbounded CPU loop: any loop it
++  // contains still owns its loop-header guard, and MMIO/HLE services settle
++  // cycles before crossing into the host. Avoid paying another full 64-bit
++  // horizon check at every hot leaf-call edge.
++  const bool relaxedCallGuard =
++      nativeTarget && smallLinkedNativeCall(term, range);
++  if (!relaxedCallGuard)
++    emitBudgetGuard(target);
+   char name[64];
+   snprintf(name, sizeof(name), "func_%08X_budget", range->start);
+   const std::string targetName = symbolName(name);
+@@ -80,6 +117,16 @@ BasicBlock *FunctionEmitter::externalDestination(const DolIRTerminator &term,
+     calleeFunction->setCallingConv(bodyCallingConvention());
+     calleeFunction->setVisibility(GlobalValue::HiddenVisibility);
+     calleeFunction->setDSOLocal(true);
++    // Small PPC helpers are extremely common (SDK getters, list helpers,
++    // audio-state probes). With native ABI + ThinLTO their argument/state
++    // marshalling often costs more than the translated body. Mark compact
++    // linked native functions always-inline so LLVM can fold guest state and
++    // cycle plumbing into the caller. Recursive SCCs are still protected by
++    // LLVM's inliner and by the existing call-depth guard.
++    if (nativeTarget && term.linked && range->end > range->start &&
++        range->end - range->start <= nativeInlineBytes()) {
++      calleeFunction->addFnAttr(Attribute::AlwaysInline);
++    }
+   }
+   Value *calleeReturnPC =
+       term.linked ? static_cast<Value *>(builder_.getInt32(term.guest_pc + 4u))
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -66,9 +66,20 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+     }
+     return loaded;
+   }
+-  materializeFPRF();
+   Value *normalized = normalizeAddress(address);
+-  Value *mem1 = rangeCheck(normalized, GC_RAM_BASE, ram_size_, width);
++  Value *mem1 = nullptr;
++  if (fixed_memory_layout_ && expected_mem2_size_ == 0 &&
++      expected_ram_size_ >= width) {
++    // GameCube fixed-layout fast path: the runtime guarantees the exact MEM1
++    // size and no MEM2. One unsigned offset compare covers both 0x8/0xC aliases
++    // and rejects physical/MMIO addresses, avoiding a ram_size load, a second
++    // compare and the otherwise-dead MEM2 probe on every dynamic access.
++    Value *offset = builder_.CreateSub(normalized, builder_.getInt32(GC_RAM_BASE));
++    mem1 = builder_.CreateICmpULE(
++        offset, builder_.getInt32(expected_ram_size_ - width));
++  } else {
++    mem1 = rangeCheck(normalized, GC_RAM_BASE, ram_size_, width);
++  }
+   BasicBlock *mem1Block = BasicBlock::Create(context_, "load_mem1", function_);
+   BasicBlock *checkMem2 =
+       BasicBlock::Create(context_, "load_check_mem2", function_);
+@@ -89,10 +98,14 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+ 
+   builder_.SetInsertPoint(checkMem2);
+-  Value *inMem2 = builder_.CreateAnd(
+-      builder_.CreateIsNotNull(mem2_),
+-      rangeCheck(normalized, WII_MEM2_BASE, mem2_size_, width));
+-  builder_.CreateCondBr(inMem2, mem2Block, slowBlock,
+-                        MDBuilder(context_).createBranchWeights(2000, 1));
++  if (fixed_memory_layout_ && expected_mem2_size_ == 0) {
++    builder_.CreateBr(slowBlock);
++  } else {
++    Value *inMem2 = builder_.CreateAnd(
++        builder_.CreateIsNotNull(mem2_),
++        rangeCheck(normalized, WII_MEM2_BASE, mem2_size_, width));
++    builder_.CreateCondBr(inMem2, mem2Block, slowBlock,
++                          MDBuilder(context_).createBranchWeights(2000, 1));
++  }
+ 
+   builder_.SetInsertPoint(mem2Block);
+   Value *mem2Offset =
+@@ -104,6 +117,10 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(slowBlock);
++  // FPRF only has to be committed before a host-visible service call. The hot
++  // MEM1/MEM2 paths are pure native memory accesses and must not pay this
++  // synchronization cost.
++  materializeFPRF();
+   Value *slow64 = externalRead(address, width);
+   Value *slowValue = builder_.CreateZExtOrTrunc(slow64, resultType);
+   BasicBlock *slowEnd = builder_.GetInsertBlock();
+@@ -164,9 +181,8 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+     endianStore(pointer, value, width);
+     return;
+   }
+-  materializeFPRF();
+   clearReservation(address);
+   Value *normalized = normalizeAddress(address);
+   BasicBlock *mem1Block = BasicBlock::Create(context_, "store_mem1", function_);
+   BasicBlock *checkMem2 =
+       BasicBlock::Create(context_, "store_check_mem2", function_);
+@@ -178,8 +204,16 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+   BasicBlock *slowBlock = BasicBlock::Create(context_, "store_slow", function_);
+   BasicBlock *join = BasicBlock::Create(context_, "store_join", function_);
+-  builder_.CreateCondBr(rangeCheck(normalized, GC_RAM_BASE, ram_size_, width),
+-                        mem1Block, checkMem2,
+-                        MDBuilder(context_).createBranchWeights(2000, 1));
++  Value *mem1 = nullptr;
++  if (fixed_memory_layout_ && expected_mem2_size_ == 0 &&
++      expected_ram_size_ >= width) {
++    Value *offset = builder_.CreateSub(normalized, builder_.getInt32(GC_RAM_BASE));
++    mem1 = builder_.CreateICmpULE(
++        offset, builder_.getInt32(expected_ram_size_ - width));
++  } else {
++    mem1 = rangeCheck(normalized, GC_RAM_BASE, ram_size_, width);
++  }
++  builder_.CreateCondBr(mem1, mem1Block, checkMem2,
++                        MDBuilder(context_).createBranchWeights(2000, 1));
+ 
+   builder_.SetInsertPoint(mem1Block);
+   Value *mem1Offset =
+@@ -193,10 +230,14 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+ 
+   builder_.SetInsertPoint(checkMem2);
+-  Value *inMem2 = builder_.CreateAnd(
+-      builder_.CreateIsNotNull(mem2_),
+-      rangeCheck(normalized, WII_MEM2_BASE, mem2_size_, width));
+-  builder_.CreateCondBr(inMem2, mem2Block, slowBlock,
+-                        MDBuilder(context_).createBranchWeights(2000, 1));
++  if (fixed_memory_layout_ && expected_mem2_size_ == 0) {
++    builder_.CreateBr(slowBlock);
++  } else {
++    Value *inMem2 = builder_.CreateAnd(
++        builder_.CreateIsNotNull(mem2_),
++        rangeCheck(normalized, WII_MEM2_BASE, mem2_size_, width));
++    builder_.CreateCondBr(inMem2, mem2Block, slowBlock,
++                          MDBuilder(context_).createBranchWeights(2000, 1));
++  }
+ 
+   builder_.SetInsertPoint(mem2Block);
+   Value *mem2Offset =
+@@ -207,6 +248,7 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(slowBlock);
++  materializeFPRF();
+   externalWrite(address, value, width);
+   builder_.CreateBr(join);
+   builder_.SetInsertPoint(join);

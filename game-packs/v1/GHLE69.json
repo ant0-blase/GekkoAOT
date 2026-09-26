@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "disc_id": "GHLE69",
+  "name": "Harry Potter and the Sorcerer's Stone (USA)",
+  "pack_version": 1,
+  "compatibility": {
+    "snapshot": "0.0.1",
+    "state": "in-game-major-issues",
+    "note": "Reaches gameplay/early 3D; rendering remains visibly glitched."
+  },
+  "runtime_features": [],
+  "planned_runtime_features": [],
+  "ui": {
+    "title": "Harry Potter and the Sorcerer's Stone",
+    "options": []
+  }
+}
