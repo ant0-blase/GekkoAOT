@@ -10,6 +10,21 @@ Future release entries are maintained by Release Please from Conventional Commit
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.2...v0.0.3) (2026-09-27)
+
+### Fixes
+
+- Fixed Windows portable builds failing before AOT compilation when the native module/cache path exceeded the legacy Win32 path length. Module and LLVM cache directory names now use compact deterministic keys while preserving full cache identity.
+
+### Documentation
+
+- Refreshed the project README and full-resolution runtime/gameplay screenshots.
+
+### Release workflow
+
+- Release publishing is explicit/manual so normal development commits do not create unintended version tags.
+
+
 ## [0.0.2](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.1...v0.0.2) (2026-09-26)
 
 ### Native runtime and NativeOS
