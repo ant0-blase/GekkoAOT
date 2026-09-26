@@ -192,23 +192,57 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
-      - name: Install LLVM 20.1.8 (Linux)
+      # GitHub's Ubuntu 24.04 image already ships Homebrew. The llvm@20
+      # bottle is LLVM 20.1.8 and includes the development CMake files we need,
+      # while avoiding the ~2 GB LLVM-20.1.8-Linux-X64.tar.xz download/extract.
+      - name: Install LLVM 20.1.8 development SDK (Linux)
         if: runner.os == 'Linux'
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "20.1.8"
-          directory: ${{ runner.temp }}/llvm
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
 
-      # The full Windows clang+llvm archive is several GB once unpacked.
-      # Cache the extracted development SDK so release runs do not repeatedly
-      # spend minutes in tar/xz extraction on the hosted Windows runner.
+          BREW=/home/linuxbrew/.linuxbrew/bin/brew
+          test -x "$BREW"
+          eval "$("$BREW" shellenv)"
+
+          brew install llvm@20 lld@20
+
+          LLVM_ROOT="$(brew --prefix llvm@20)"
+          LLD_ROOT="$(brew --prefix lld@20)"
+
+          test -x "$LLVM_ROOT/bin/clang"
+          test -x "$LLVM_ROOT/bin/clang++"
+          test -x "$LLVM_ROOT/bin/llvm-profdata"
+          test -x "$LLVM_ROOT/bin/llvm-config"
+          test -f "$LLVM_ROOT/lib/cmake/llvm/LLVMConfig.cmake"
+          test -x "$LLD_ROOT/bin/ld.lld"
+
+          LLVM_VERSION="$("$LLVM_ROOT/bin/llvm-config" --version)"
+          echo "LLVM version: $LLVM_VERSION"
+          [[ "$LLVM_VERSION" == "20.1.8" ]]
+
+          echo "LLVM_PATH=$LLVM_ROOT" >> "$GITHUB_ENV"
+          echo "LLD_PATH=$LLD_ROOT" >> "$GITHUB_ENV"
+          echo "$LLVM_ROOT/bin" >> "$GITHUB_PATH"
+          echo "$LLD_ROOT/bin" >> "$GITHUB_PATH"
+
+      # The Windows runner has LLVM 20.1.8 installed as a compiler toolchain,
+      # but GekkoAOT/DolRecomp needs LLVMConfig.cmake and the development libs,
+      # so keep the full upstream clang+llvm development archive.
+      #
+      # Extract .xz -> .tar -> SDK with 7-Zip instead of tar.exe directly.
+      # This avoids the pathological tar/xz extraction stall seen on hosted
+      # Windows runners. Cache the extracted SDK after the first successful run.
       - name: Restore LLVM 20.1.8 development SDK cache (Windows)
         id: llvm-windows-sdk-cache
         if: runner.os == 'Windows'
         uses: actions/cache/restore@v4
         with:
           path: C:\gekkoaot-llvm-sdk
-          key: gekkoaot-llvm-20.1.8-x86_64-pc-windows-msvc-v1
+          key: gekkoaot-llvm-20.1.8-x86_64-pc-windows-msvc-7zip-v3
 
       - name: Install LLVM 20.1.8 development SDK (Windows)
         if: runner.os == 'Windows'
@@ -223,13 +257,11 @@ jobs:
           $asset = "clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
           $expectedSha256 = "f229769f11d6a6edc8ada599c0cda964b7dee6ab1a08c6cf9dd7f513e85b107f"
 
-          # Keep the extraction path deliberately short. LLVM contains a large
-          # number of deeply nested headers/CMake files and Windows path/AV
-          # overhead is noticeably worse under the normal _temp hierarchy.
           $sdkRoot = "C:\gekkoaot-llvm-sdk"
           $sdk = Join-Path $sdkRoot "clang+llvm-$version-x86_64-pc-windows-msvc"
           $download = Join-Path $env:RUNNER_TEMP "llvm-sdk-download"
           $archive = Join-Path $download $asset
+          $tarArchive = Join-Path $download ($asset -replace '\.xz$', '')
 
           function Test-LlvmSdk([string]$root) {
             $config = Join-Path $root "lib\cmake\llvm\LLVMConfig.cmake"
@@ -248,6 +280,9 @@ jobs:
               Write-Host "Removing incomplete LLVM SDK cache tree..."
               Remove-Item -Recurse -Force $sdkRoot
             }
+            if (Test-Path $download) {
+              Remove-Item -Recurse -Force $download
+            }
             New-Item -ItemType Directory -Force -Path $sdkRoot, $download | Out-Null
 
             Write-Host "Downloading full LLVM development archive: $asset"
@@ -263,50 +298,46 @@ jobs:
               throw "LLVM archive was not downloaded: $archive"
             }
 
-            # Detect truncated/corrupt downloads before spending minutes
-            # unpacking them. The digest is for the official LLVM 20.1.8 asset.
             $actualSha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
             if ($actualSha256 -ne $expectedSha256) {
               throw "LLVM archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
             }
 
-            Write-Host "Extracting LLVM development SDK..."
-
-            # Run tar as a child process so PowerShell can emit a heartbeat.
-            # GitHub otherwise shows no output for several minutes and the job
-            # looks hung even while xz is actively decompressing.
-            $tar = (Get-Command tar.exe -ErrorAction Stop).Source
-            $arguments = @("-xf", $archive, "-C", $sdkRoot)
-            $process = Start-Process `
-              -FilePath $tar `
-              -ArgumentList $arguments `
-              -NoNewWindow `
-              -PassThru
-
-            $elapsed = 0
-            while (-not $process.HasExited) {
-              Start-Sleep -Seconds 20
-              $elapsed += 20
-              $process.Refresh()
-              if (-not $process.HasExited) {
-                $freeGiB = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
-                Write-Host "LLVM extraction still running (${elapsed}s, C: free ${freeGiB} GiB)..."
-              }
+            $sevenZipCommand = Get-Command 7z.exe -ErrorAction SilentlyContinue
+            if ($sevenZipCommand) {
+              $sevenZip = $sevenZipCommand.Source
+            } else {
+              $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+            }
+            if (-not (Test-Path $sevenZip)) {
+              throw "7-Zip was not found on the Windows runner"
             }
 
-            if ($process.ExitCode -ne 0) {
-              throw "Failed to extract LLVM development SDK (tar exit code $($process.ExitCode))"
+            Write-Host "Using 7-Zip: $sevenZip"
+            Write-Host "Decompressing LLVM XZ layer..."
+            & $sevenZip x $archive "-o$download" -y -bso1 -bsp1
+            if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip failed to decompress LLVM XZ layer (exit code $LASTEXITCODE)"
             }
+            if (-not (Test-Path $tarArchive)) {
+              throw "LLVM TAR payload was not produced: $tarArchive"
+            }
+
+            Remove-Item -Force $archive
+
+            Write-Host "Extracting LLVM TAR payload..."
+            & $sevenZip x $tarArchive "-o$sdkRoot" -y -bso1 -bsp1
+            if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip failed to extract LLVM TAR payload (exit code $LASTEXITCODE)"
+            }
+            Remove-Item -Force $tarArchive -ErrorAction SilentlyContinue
+
             if (-not (Test-LlvmSdk $sdk)) {
               Write-Host "LLVM SDK tree after extraction:"
               Get-ChildItem -Path $sdkRoot -Depth 3 -ErrorAction SilentlyContinue |
                 Select-Object FullName
               throw "LLVM development SDK extraction completed but the SDK is incomplete"
             }
-
-            # The archive is no longer useful after extraction and can consume
-            # close to a GiB of the hosted runner's temporary disk.
-            Remove-Item -Force $archive -ErrorAction SilentlyContinue
           }
 
           $llvmConfig = Join-Path $sdk "lib\cmake\llvm\LLVMConfig.cmake"
@@ -327,7 +358,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: C:\gekkoaot-llvm-sdk
-          key: gekkoaot-llvm-20.1.8-x86_64-pc-windows-msvc-v1
+          key: gekkoaot-llvm-20.1.8-x86_64-pc-windows-msvc-7zip-v3
 
       - name: Enable MSVC build environment
         if: runner.os == 'Windows'
