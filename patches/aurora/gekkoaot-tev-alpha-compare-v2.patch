@@ -44,3 +44,50 @@ diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
        fragmentFn += fmt::format("\n    {0}.a = {1};", outReg, op);
        alphaNormalized[stage.alphaOp.outReg] = stage.alphaOp.clamp;
      }
+diff --git a/tests/nbt3_shader_test.cpp b/tests/nbt3_shader_test.cpp
+--- a/tests/nbt3_shader_test.cpp
++++ b/tests/nbt3_shader_test.cpp
+@@ -76,3 +76,42 @@
+ }
+-
++
++TEST(GxShaderTest, TevAlphaGr16CompareUsesColorInputsBeforeColorWrite) {
++  ShaderConfig config{};
++  config.vtxStride = 12;
++  config.attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32, .offset = 0};
++  config.tevStageCount = 1;
++  auto& stage = config.tevStages[0];
++  stage.colorPass.a = GX_CC_C0;
++  stage.colorPass.b = GX_CC_C1;
++  stage.colorPass.c = GX_CC_ZERO;
++  stage.colorPass.d = GX_CC_ZERO;
++  stage.colorOp.outReg = GX_TEVREG0;
++  stage.alphaPass.a = GX_CA_ZERO;
++  stage.alphaPass.b = GX_CA_ZERO;
++  stage.alphaPass.c = GX_CA_ZERO;
++  stage.alphaPass.d = GX_CA_ZERO;
++  stage.alphaOp.op = GX_TEV_COMP_GR16_GT;
++
++  const std::string shader = build_shader_source(config, DstAlphaMode::None, UINT32_MAX);
++  const auto cmpA = shader.find("let tev_alpha_cmp_a0 = ");
++  const auto cmpB = shader.find("let tev_alpha_cmp_b0 = ");
++  const auto colorWrite = shader.find("tevreg0 = vec4f(", cmpB);
++  ASSERT_NE(cmpA, std::string::npos);
++  ASSERT_NE(cmpB, std::string::npos);
++  ASSERT_NE(colorWrite, std::string::npos);
++  EXPECT_LT(cmpA, cmpB);
++  EXPECT_LT(cmpB, colorWrite);
++  EXPECT_NE(shader.find("tevreg0.rgb", cmpA), std::string::npos);
++  EXPECT_NE(shader.find("tevreg1.rgb", cmpB), std::string::npos);
++  EXPECT_NE(shader.find("dot(tev_alpha_cmp_a0.rg * 255.0"), std::string::npos);
++  EXPECT_NE(shader.find("dot(tev_alpha_cmp_b0.rg * 255.0"), std::string::npos);
++  EXPECT_EQ(shader.find("0.0.rg"), std::string::npos);
++
++  // The A8 compare mode, by contrast, consumes the scalar alpha A/B inputs.
++  stage.alphaOp.op = GX_TEV_COMP_A8_GT;
++  const std::string a8Shader = build_shader_source(config, DstAlphaMode::None, UINT32_MAX);
++  EXPECT_EQ(a8Shader.find("tev_alpha_cmp_a0"), std::string::npos);
++  EXPECT_NE(a8Shader.find("round(0.0 * 255.0)"), std::string::npos);
++}
++
+ } // namespace

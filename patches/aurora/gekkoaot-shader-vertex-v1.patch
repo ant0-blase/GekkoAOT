@@ -87,7 +87,7 @@ index 0000000..fd93781
 +  stage.texMapId = GX_TEXMAP0;
 +  config.tcgs[0].src = source;
 +
-+  const std::string shader = build_shader_source(config);
++  const std::string shader = build_shader_source(config, DstAlphaMode::None, UINT32_MAX);
 +  const std::string_view declaration = source == GX_TG_BINRM ? "let in_binrm = " : "let in_tangent = ";
 +  const auto start = shader.find(declaration);
 +  if (start == std::string::npos) return {};
@@ -125,7 +125,7 @@ index 0000000..fd93781
 +  config.tcgs[0].src = GX_TG_TEX0;
 +  config.tcgs[0].mtx = GX_TEXMTX0;
 +
-+  const std::string shader = build_shader_source(config);
++  const std::string shader = build_shader_source(config, DstAlphaMode::None, UINT32_MAX);
 +  const auto identity = shader.find("var tc0_tmp = tc0.xyz;");
 +  const auto guard = shader.find("if (in_texmtxidx0 < 60u) {", identity);
 +  const auto lookup = shader.find("tc0_tmp = tc0 * ubuf.postex_mtx[in_texmtxidx0 / 3u];", guard);

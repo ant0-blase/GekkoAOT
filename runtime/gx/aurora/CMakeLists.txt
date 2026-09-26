@@ -51,7 +51,7 @@ endif()
 
 # GekkoAOT native XFB presentation override.
 #
-# Aurora 7f2801cd always presents its live EFB. Retail GX display copies latch
+# Pinned Aurora revision presents its live EFB. Retail GX display copies latch
 # an earlier EFB image into XFB and VI scans that image later, so GekkoAOT needs
 # a presentation-source override without forcing an early swapchain present.
 # Keep this adaptation pinned to the known present_source() body and fail the
@@ -93,6 +93,9 @@ if(EXISTS "${_gekkoaot_aurora_recording_hpp}" AND EXISTS "${_gekkoaot_aurora_rec
   file(READ "${_gekkoaot_aurora_recording_hpp}" _gekkoaot_recording_hpp_text)
   file(READ "${_gekkoaot_aurora_recording_cpp}" _gekkoaot_recording_cpp_text)
   if(NOT _gekkoaot_recording_cpp_text MATCHES "GEKKOAOT_XFB_ZERO_COPY_V10")
+    # Aurora 9c0bf66f still carries the default GX_TF_RGBA8 argument in the
+    # recording.hpp declaration.  Keep that declaration byte-for-byte compatible
+    # instead of requiring the later 3840bf9 spelling without the default.
     set(_gekkoaot_xfb_decl_anchor [=[void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8);]=])
     set(_gekkoaot_xfb_decl_replacement [=[void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
@@ -195,7 +198,7 @@ endif()
 
 
 
-# Native address-keyed zero-copy XFB support for Aurora 7f2801cd.
+# Native address-keyed zero-copy XFB support for the pinned Aurora revision.
 #
 # GXCopyDisp(clear=1) transfers ownership of the current EFB render target into
 # an address-keyed XFB slot.  The frame is submitted without WSI presentation,
@@ -250,6 +253,36 @@ if(EXISTS "${_gekkoaot_aurora_main}")
     # guarantees producer submissions complete before this scanout submission;
     # the current active EFB recorder remains untouched.
     set(_gekkoaot_present_helper [=[
+extern "C" float gekkoaot_native_gx_widescreen_target_aspect() noexcept;
+
+webgpu::Viewport gekkoaot_present_viewport(uint32_t surface_width, uint32_t surface_height,
+                                           uint32_t content_width, uint32_t content_height) noexcept {
+  const float target = gekkoaot_native_gx_widescreen_target_aspect();
+  if (!(target > 0.0f)) {
+    return webgpu::calculate_present_viewport(surface_width, surface_height, content_width, content_height);
+  }
+  if (surface_width == 0 || surface_height == 0) return {};
+
+  uint32_t viewport_width = surface_width;
+  uint32_t viewport_height = static_cast<uint32_t>(static_cast<float>(viewport_width) / target + 0.5f);
+  if (viewport_height > surface_height) {
+    viewport_height = surface_height;
+    viewport_width = static_cast<uint32_t>(static_cast<float>(viewport_height) * target + 0.5f);
+  }
+  if (viewport_width == 0) viewport_width = 1;
+  if (viewport_height == 0) viewport_height = 1;
+  if (viewport_width > surface_width) viewport_width = surface_width;
+  if (viewport_height > surface_height) viewport_height = surface_height;
+  return {
+      .left = static_cast<float>((surface_width - viewport_width) / 2),
+      .top = static_cast<float>((surface_height - viewport_height) / 2),
+      .width = static_cast<float>(viewport_width),
+      .height = static_cast<float>(viewport_height),
+      .znear = 0.0f,
+      .zfar = 1.0f,
+  };
+}
+
 void present_texture(const webgpu::TextureWithSampler& source) noexcept {
   ZoneScopedN("GekkoAOT VI XFB scanout");
 #ifdef AURORA_ENABLE_GX
@@ -300,7 +333,7 @@ void present_texture(const webgpu::TextureWithSampler& source) noexcept {
 
   constexpr wgpu::CommandEncoderDescriptor encoderDescriptor{.label = "GekkoAOT VI scanout encoder"};
   auto encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
-  const auto viewport = webgpu::calculate_present_viewport(
+  const auto viewport = gekkoaot_present_viewport(
       webgpu::g_graphicsConfig.surfaceConfiguration.width,
       webgpu::g_graphicsConfig.surfaceConfiguration.height,
       source.size.width, source.size.height);
@@ -493,7 +526,7 @@ void present_texture_blend(const webgpu::TextureWithSampler& previous,
   const auto bind_group = g_device.CreateBindGroup(&bind_desc);
   constexpr wgpu::CommandEncoderDescriptor encoder_desc{.label = "GekkoAOT v48 interpolation encoder"};
   auto encoder = g_device.CreateCommandEncoder(&encoder_desc);
-  const auto viewport = webgpu::calculate_present_viewport(
+  const auto viewport = gekkoaot_present_viewport(
       webgpu::g_graphicsConfig.surfaceConfiguration.width,
       webgpu::g_graphicsConfig.surfaceConfiguration.height,
       current.size.width, current.size.height);
@@ -543,6 +576,70 @@ void present_texture_blend(const webgpu::TextureWithSampler& previous,
   endif()
 endif()
 
+
+# GekkoAOT v158 selective orthographic widescreen correction.
+# Perspective draws are always Hor+ corrected. Orthographic UI draws are also
+# counter-scaled so final 4:3->window scanout does not flatten the HUD. The one
+# class that must remain at retail width is screen-feedback/post-process work:
+# Aurora already tracks textures produced by GXCopyTex in copyTextures, so use
+# that provenance instead of treating every orthographic pass the same.
+set(_gekkoaot_aurora_shader_info "${GEKKOAOT_AURORA_SOURCE}/lib/gx/shader_info.cpp")
+if(EXISTS "${_gekkoaot_aurora_shader_info}")
+  file(READ "${_gekkoaot_aurora_shader_info}" _gekkoaot_shader_info_text)
+  if(NOT _gekkoaot_shader_info_text MATCHES "GEKKOAOT_WIDESCREEN_PROJECTION_V128")
+    set(_gekkoaot_wide_decl_anchor [=[#include <tracy/Tracy.hpp>
+
+namespace aurora::gx {]=])
+    set(_gekkoaot_wide_decl_replacement [=[#include <tracy/Tracy.hpp>
+
+// GEKKOAOT_WIDESCREEN_PROJECTION_V128
+extern "C" float gekkoaot_native_gx_widescreen_x_scale() noexcept;
+
+namespace aurora::gx {]=])
+    set(_gekkoaot_wide_proj_anchor [=[  auto proj = g_gxState.proj;
+]=])
+    set(_gekkoaot_wide_proj_replacement [=[  auto proj = g_gxState.proj;
+  const float gekkoaotWideX = gekkoaot_native_gx_widescreen_x_scale();
+
+  // v158: keep normal 2D/UI at the same physical proportions as 4:3 while
+  // final scanout fills the widescreen window. The exception is an
+  // orthographic draw sampling a texture produced by GXCopyTex: that is
+  // screen-feedback/post-process data and must keep the full retail EFB width,
+  // otherwise the old 4:3 boundary becomes a black/stale vertical strip.
+  bool gekkoaotOrthoSamplesEfbCopy = false;
+  if (g_gxState.projType == GX_ORTHOGRAPHIC) {
+    for (u32 i = 0; i < MaxTextures; ++i) {
+      if (!info.sampledTextures.test(i))
+        continue;
+      const auto& obj = g_gxState.loadedTextures[i];
+      if (obj.data != nullptr && g_gxState.copyTextures.find(obj.data) != g_gxState.copyTextures.end()) {
+        gekkoaotOrthoSamplesEfbCopy = true;
+        break;
+      }
+    }
+  }
+
+  const bool gekkoaotApplyWideX =
+      g_gxState.projType == GX_PERSPECTIVE ||
+      (g_gxState.projType == GX_ORTHOGRAPHIC && !gekkoaotOrthoSamplesEfbCopy);
+  if (gekkoaotWideX != 1.0f && gekkoaotApplyWideX) {
+    proj.m0 = proj.m0 * Vec4{gekkoaotWideX, gekkoaotWideX, gekkoaotWideX, gekkoaotWideX};
+  }
+]=])
+    string(FIND "${_gekkoaot_shader_info_text}" "${_gekkoaot_wide_decl_anchor}" _gekkoaot_wide_decl_pos)
+    string(FIND "${_gekkoaot_shader_info_text}" "${_gekkoaot_wide_proj_anchor}" _gekkoaot_wide_proj_pos)
+    if(_gekkoaot_wide_decl_pos EQUAL -1 OR _gekkoaot_wide_proj_pos EQUAL -1)
+      message(FATAL_ERROR "Pinned Aurora shader_info.cpp changed: widescreen projection anchors missing")
+    endif()
+    string(REPLACE "${_gekkoaot_wide_decl_anchor}" "${_gekkoaot_wide_decl_replacement}"
+      _gekkoaot_shader_info_text "${_gekkoaot_shader_info_text}")
+    string(REPLACE "${_gekkoaot_wide_proj_anchor}" "${_gekkoaot_wide_proj_replacement}"
+      _gekkoaot_shader_info_text "${_gekkoaot_shader_info_text}")
+    file(WRITE "${_gekkoaot_aurora_shader_info}" "${_gekkoaot_shader_info_text}")
+    message(STATUS "gekkoaot: Aurora v158 selective-ortho widescreen overlay installed (UI corrected, EFB feedback preserved)")
+  endif()
+endif()
+
 # GekkoAOT owns DVD/nod and memory. Aurora owns GX/WebGPU + SDL presentation.
 set(AURORA_ENABLE_GX ON CACHE BOOL "" FORCE)
 set(AURORA_ENABLE_DVD OFF CACHE BOOL "" FORCE)
@@ -552,6 +649,15 @@ set(AURORA_ENABLE_RMLUI OFF CACHE BOOL "" FORCE)
 set(AURORA_DAWN_PROVIDER package CACHE STRING "" FORCE)
 set(AURORA_SDL3_PROVIDER auto CACHE STRING "" FORCE)
 add_subdirectory("${GEKKOAOT_AURORA_SOURCE}" aurora EXCLUDE_FROM_ALL)
+
+# Aurora's standalone test executables do not link GekkoAOT's bridge. Supply
+# the neutral 4:3 values expected by the projection/presentation overlays.
+foreach(_gekkoaot_aurora_test IN ITEMS gx_fifo_tests gx_shader_tests gx_texture_cache_tests
+                                      render_worker_tests gfx_recording_tests)
+  if(TARGET ${_gekkoaot_aurora_test})
+    target_sources(${_gekkoaot_aurora_test} PRIVATE aspect_test_stubs.cpp)
+  endif()
+endforeach()
 
 add_library(gekkoaot-native-gx SHARED bridge.cpp)
 # aurora::gx and aurora::core reference the VI helper implemented in

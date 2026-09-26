@@ -36,6 +36,14 @@ public:
   bool GPReadEnabled() const { return (control_ & kCtrlGpReadEnable) != 0; }
   bool GPLinkEnabled() const { return (control_ & kCtrlGpLinkEnable) != 0; }
 
+  // Runtime deadlock recovery hook. A normal CP breakpoint remains an exact
+  // hardware stop. The host may consume exactly one 32-byte burst only after
+  // it has independently established that the guest scheduler is idle for
+  // multiple VI frames and the breakpoint interrupt has already been handled.
+  bool BreakpointActiveForHost() const { return BreakpointActive(); }
+  bool BreakpointInterruptEnabled() const { return (control_ & kCtrlBpInt) != 0; }
+  bool StepPastHandledBreakpointOnce();
+
   std::uint16_t Control() const { return control_; }
   std::uint16_t Status() const { return ComputeStatus(); }
   std::uint32_t FifoBase() const { return fifo_base_; }

@@ -19,6 +19,7 @@
 #include "native/boot.h"
 #include "native/dol_loader.h"
 #include "native/module_loader.h"
+#include "native/native_vfs.h"
 #include "platform/input.h"
 #include "os/native_os.h"
 
@@ -288,12 +289,16 @@ private:
   void SyncNativeSIInterrupt();
   void SyncNativeVIInterrupt();
   void RefreshNativeInput(bool poll_si);
+  void ServiceIdleCpBreakpointRecovery(bool frame_boundary);
   bool TryTakeExternalInterrupt();
   bool TryTakeDecrementerInterrupt();
   void AdvanceCpuTimers(std::uint64_t cpu_cycles);
   void AdvancePerformanceCounters(std::uint64_t cpu_cycles, std::uint64_t tb_ticks);
   void RebuildPpcHaltIndex();
   bool DetectSdkPpcHalt(std::uint32_t pc, std::uint32_t* entry) const;
+  bool FetchLowMemoryInstruction(std::uint32_t address, std::uint32_t* instruction);
+  void InvalidateLowInstructionCacheLine(std::uint32_t address);
+  void InvalidateLowInstructionCache();
   bool ExecuteLowMemoryInstruction(std::uint32_t address, std::uint64_t* charged_cycles);
   void AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result, bool idle_wait = false);
   void PollLiveVideoConfig(std::uint64_t charged);
@@ -302,7 +307,7 @@ private:
                         std::uint32_t width = 0u, std::uint32_t stride_bytes = 0u,
                         std::uint32_t field_height = 0u);
   void NoteProducedFrame();
-  void ServiceHostFrameScheduler();
+  void ServiceHostFrameScheduler(std::chrono::steady_clock::time_point now);
   void ServicePerformanceMetrics(std::uint64_t hardware_cycles);
   bool CpuFifoTargetsGpu() const;
   bool CaptureWriteGatherToCpuFifo(std::uint64_t value, std::uint8_t size);
@@ -338,6 +343,18 @@ private:
   std::uint64_t fixed_exec_route_switches_ = 0;
   std::uint64_t global_indirect_dispatches_ = 0;
   std::uint64_t icbi_route_invalidations_ = 0;
+  // v143: small architectural I-cache model for RAM-resident exception
+  // vectors. 32-byte lines match Gekko cache-control granularity. The
+  // AOT body remains immutable; this only covers low-memory code which
+  // is generated/copied by IPL/SDK at runtime.
+  static constexpr std::uint32_t kLowInstructionCacheSpan = 0x2000u;
+  static constexpr std::uint32_t kLowInstructionCacheLineBytes = 32u;
+  static constexpr std::size_t kLowInstructionCacheLines =
+      kLowInstructionCacheSpan / kLowInstructionCacheLineBytes;
+  static constexpr std::size_t kLowInstructionCacheWords =
+      kLowInstructionCacheSpan / sizeof(std::uint32_t);
+  std::array<std::uint32_t, kLowInstructionCacheWords> low_instruction_cache_{};
+  std::array<bool, kLowInstructionCacheLines> low_instruction_cache_valid_{};
   std::uint64_t rel_mapping_refreshes_ = 0;
   std::uint64_t rel_address_translations_ = 0;
   std::uint64_t rel_address_misses_ = 0;
@@ -388,6 +405,19 @@ private:
   // than after every compiled slice; MMIO-triggered IRQs are still synchronized
   // immediately in ExternalRead/ExternalWrite.
   std::uint64_t timed_irq_sync_cycles_ = 0;
+
+  // v160: conservative runtime-only escape hatch for a CP/video-flip deadlock.
+  // Some titles deliberately park the main thread on a GX breakpoint until a
+  // later VI callback observes a draw-sync token. If the guest has no current
+  // thread for several full VI frames while CP is still stopped at the same
+  // already-handled breakpoint, let exactly one pending FIFO burst cross that
+  // fence. This is not used during normal execution and never fires while the
+  // breakpoint interrupt is still pending.
+  bool cp_idle_breakpoint_recovery_enabled_ = true;
+  std::uint32_t cp_idle_breakpoint_frames_ = 0;
+  std::uint32_t cp_idle_breakpoint_address_ = 0;
+  std::uint64_t cp_idle_breakpoint_recoveries_ = 0;
+
   // VI remains the guest-visible timing/IRQ authority. Presentation may be
   // decoupled and driven by completed GX display copies, with VI retained as a
   // compatibility watchdog/fallback.
@@ -407,6 +437,21 @@ private:
   // the sampled delta still spans the full elapsed host interval, so hardware
   // time does not drift or derive from guest execution speed.
   std::uint64_t hardware_clock_guest_since_sample_ = 0;
+  // v135: tells AdvanceRuntimeCycles whether TakeRealtimeHardwareCycles actually
+  // sampled the host monotonic clock. Presentation reuses that sample instead
+  // of issuing a second clock_gettime at every AOT/HLE boundary.
+  bool hardware_clock_sampled_last_call_ = false;
+  // v136: on x86 hosts exposing an invariant TSC with an exact CPUID.15H
+  // crystal ratio, use TSC deltas for the realtime hardware clock. This removes
+  // the remaining vDSO clock_gettime hotspot while retaining std::chrono as the
+  // portable/VM fallback. hardware_clock_last_ remains a synthetic steady-clock
+  // time_point so presentation and metrics share the same monotonic domain.
+  bool hardware_tsc_checked_ = false;
+  bool hardware_tsc_enabled_ = false;
+  std::uint64_t hardware_tsc_hz_ = 0;
+  std::uint64_t hardware_tsc_last_ = 0;
+  std::uint64_t hardware_tsc_cycle_remainder_ = 0;
+  std::uint64_t hardware_tsc_ns_remainder_ = 0;
 
   // Presentation is a separate host domain. The slider caps completed GX
   // frames only; it never changes VI, CPU, DSP or AI timing.
@@ -458,6 +503,7 @@ private:
   GekkoAOT::HW::MI::NativeMI mi_;
   GekkoAOT::HW::AI::NativeAI ai_;
   GekkoAOT::HW::DI::NativeDI di_;
+  NativeVfs native_vfs_;
   std::ifstream disc_image_;
   void* nod_disc_image_ = nullptr;
   bool disc_image_uses_nod_ = false;
@@ -468,6 +514,9 @@ private:
   std::uint64_t di_reads_ = 0;
   std::uint64_t di_read_bytes_ = 0;
   std::uint64_t di_read_failures_ = 0;
+  std::uint64_t vfs_reads_ = 0;
+  std::uint64_t vfs_read_bytes_ = 0;
+  std::uint64_t vfs_fallback_reads_ = 0;
   // v58: preserve DVDReadAsyncPrio ordering. Host media reads may finish
   // immediately, but the guest-visible DI command remains busy until a later
   // hardware-time slice raises TCINT. This matches the SDK's asynchronous
@@ -479,6 +528,11 @@ private:
   std::uint32_t di_async_dma_address_ = 0;
   std::uint64_t di_async_disc_offset_ = 0;
   std::uint64_t di_async_sequence_ = 0;
+  std::vector<std::uint8_t> di_async_staging_{};
+  std::uint64_t di_drive_head_offset_ = 0;
+  bool di_drive_head_valid_ = false;
+  std::uint64_t di_read_buffer_start_ = 0;
+  std::uint64_t di_read_buffer_end_ = 0;
   GekkoAOT::HW::EXI::NativeEXI exi_;
   GekkoAOT::HW::SI::NativeSI si_;
   std::array<GekkoAOT::Input::Pad, 4> native_pads_{};

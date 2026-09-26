@@ -24,6 +24,9 @@
 #include <system_error>
 #if defined(_MSC_VER)
 #include <intrin.h>
+#elif defined(__i386__) || defined(__x86_64__)
+#include <cpuid.h>
+#include <x86intrin.h>
 #endif
 
 namespace GekkoAOT::Native {
@@ -45,14 +48,77 @@ constexpr std::uint32_t kInitialHid0 = 0x0011c464u;
 constexpr std::uint16_t kSprDec = 22u;
 constexpr std::uint16_t kSprPvr = 287u;
 constexpr std::uint16_t kSprHid0 = 1008u;
+constexpr std::uint16_t kSprHid1 = 1009u;
+constexpr std::uint16_t kSprIbat0u = 528u;
+constexpr std::uint16_t kSprIbat0l = 529u;
+constexpr std::uint16_t kSprDbat0u = 536u;
+constexpr std::uint16_t kSprDbat0l = 537u;
+constexpr std::uint16_t kSprDbat1u = 538u;
+constexpr std::uint16_t kSprDbat1l = 539u;
 // HID0.ICFI is a command bit, not persistent state. Writing it requests an
 // instruction-cache invalidate and the bit reads back clear once accepted.
 constexpr std::uint32_t kHid0IcfiMask = 1u << 11;
+constexpr std::uint32_t kHid0IceMask = 1u << 15;
 constexpr std::uint32_t kTimerRatio = 12u;
 constexpr std::uint16_t kSprDmau = 922u;
 constexpr std::uint16_t kSprDmal = 923u;
 constexpr std::uint32_t kDmalTransfer = 0x00000002u;
 constexpr std::uint32_t kDmalLoad = 0x00000010u;
+
+struct FastTscInfo {
+  bool available = false;
+  std::uint64_t hz = 0;
+};
+
+FastTscInfo DetectFastInvariantTsc() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__i386__) || defined(__x86_64__)
+  unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+#if defined(_MSC_VER)
+  int regs[4]{};
+  __cpuid(regs, static_cast<int>(0x80000000u));
+  const unsigned max_ext = static_cast<unsigned>(regs[0]);
+  if (max_ext < 0x80000007u) return {};
+  __cpuid(regs, static_cast<int>(0x80000007u));
+  if ((static_cast<unsigned>(regs[3]) & (1u << 8)) == 0u) return {};
+  __cpuid(regs, 0);
+  const unsigned max_basic = static_cast<unsigned>(regs[0]);
+  if (max_basic < 0x15u) return {};
+  __cpuidex(regs, 0x15, 0);
+  eax = static_cast<unsigned>(regs[0]);
+  ebx = static_cast<unsigned>(regs[1]);
+  ecx = static_cast<unsigned>(regs[2]);
+#else
+  const unsigned max_ext = __get_cpuid_max(0x80000000u, nullptr);
+  if (max_ext < 0x80000007u ||
+      !__get_cpuid(0x80000007u, &eax, &ebx, &ecx, &edx) ||
+      (edx & (1u << 8)) == 0u)
+    return {};
+  const unsigned max_basic = __get_cpuid_max(0u, nullptr);
+  if (max_basic < 0x15u) return {};
+  __cpuid_count(0x15u, 0u, eax, ebx, ecx, edx);
+#endif
+  // CPUID.15H is the architectural conversion ratio from invariant TSC ticks
+  // to the crystal clock. Only use it when the crystal frequency is supplied:
+  // that path is exact enough to be a realtime clock. Otherwise retain
+  // std::chrono rather than guessing from nominal/base CPU MHz.
+  if (eax == 0u || ebx == 0u || ecx == 0u) return {};
+  const std::uint64_t hz =
+      (static_cast<std::uint64_t>(ecx) * static_cast<std::uint64_t>(ebx)) /
+      static_cast<std::uint64_t>(eax);
+  if (hz < 100000000ull || hz > 6000000000ull) return {};
+  return {true, hz};
+#else
+  return {};
+#endif
+}
+
+inline std::uint64_t ReadFastTsc() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__i386__) || defined(__x86_64__)
+  return static_cast<std::uint64_t>(__rdtsc());
+#else
+  return 0u;
+#endif
+}
 
 bool RuntimeEnvBool(const char* name, bool fallback) {
   const char* text = std::getenv(name);
@@ -78,6 +144,31 @@ std::int64_t NativeChainCycleBudget() {
   constexpr std::uint64_t kDefault = 262144u;
   constexpr std::uint64_t kMaximum = 4194304u;
   const char* text = std::getenv("GEKKOAOT_NATIVE_CHAIN_CYCLES");
+  if (!text || !*text) return static_cast<std::int64_t>(kDefault);
+  char* end = nullptr;
+  const unsigned long long value = std::strtoull(text, &end, 10);
+  if (!end || end == text || *end != '\0' || value > kMaximum)
+    return static_cast<std::int64_t>(kDefault);
+  return static_cast<std::int64_t>(value);
+}
+
+
+std::int64_t SafeNativeChainCycleBudget() {
+  // Compatibility/GDB mode used to disable native chaining completely. That
+  // guarantees a host boundary after every generated function, but profiles
+  // show the boundary machinery itself can consume most of one CPU thread.
+  // Keep the starvation fix while coalescing tiny calls. v136b raises the
+  // conservative GUI-safe horizon to 16384 guest cycles (~33.7 us at 486 MHz):
+  // still far below a frame/VI timescale, while reducing HostRuntime/module ABI
+  // crossings on draw-heavy titles. MMIO/HLE/exceptions remain immediate
+  // barriers through the host-event epochs in module_dispatch().
+  // v153: correctness-first default.  A value of zero returns to HostRuntime
+  // after every AOT dispatch so PI/VI/DEC and other asynchronous events are
+  // observed at a deterministic host boundary.  Users may opt back into a
+  // bounded chain through GEKKOAOT_SAFE_CHAIN_CYCLES.
+  constexpr std::uint64_t kDefault = 0u;
+  constexpr std::uint64_t kMaximum = 65536u;
+  const char* text = std::getenv("GEKKOAOT_SAFE_CHAIN_CYCLES");
   if (!text || !*text) return static_cast<std::int64_t>(kDefault);
   char* end = nullptr;
   const unsigned long long value = std::strtoull(text, &end, 10);
@@ -390,7 +481,8 @@ bool LooksLikeInvalidGameCubeRamAddress(const AddressSpace& memory,
     return offset >= memory.Mem2().size();
   }
 
-  // 24 MiB MEM1 ends at physical 0x01800000. 0x08000000 and above contains
+  // The compatibility backing covers the full 32 MiB GC physical RAM aperture
+  // while lowmem still reports retail 24 MiB. 0x08000000 and above contains
   // hardware apertures such as EFB/MMIO aliases, so only classify the gap below
   // that boundary as an out-of-range RAM pointer. Device handlers still get
   // first refusal before this diagnostic is used.
@@ -426,12 +518,13 @@ const char* RunStatusName(RunStatus status) {
 HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_) {
   compat_diagnostics_enabled_ = RuntimeEnvBool("GEKKOAOT_COMPAT_DIAGNOSTICS", false);
   std::fprintf(stderr,
-               "GEKKOAOT_MEMORY_BOUNDS_V86=1 mem1=%u end=%08x fakevmem=%08x+%u mem2=%u invalid-ea=fail-closed\n",
+               "GEKKOAOT_MEMORY_BOUNDS_V143=1 mem1-reported=%u mem1-backing=%u backing-end=%08x fakevmem=%08x+%u mem2=%u policy=dolphin-compatible-tail\n",
+               AddressSpace::ReportedMem1Size(),
                static_cast<unsigned>(memory_.Mem1().size()),
                0x80000000u + static_cast<unsigned>(memory_.Mem1().size()),
                AddressSpace::FakeVmemBase, AddressSpace::RetailFakeVmemSize,
                static_cast<unsigned>(memory_.Mem2().size()));
-  safe_host_boundaries_enabled_ = RuntimeEnvBool("GEKKOAOT_SAFE_HOST_BOUNDARIES", false);
+  safe_host_boundaries_enabled_ = RuntimeEnvBool("GEKKOAOT_SAFE_HOST_BOUNDARIES", true);
   compat_break_on_fault_ = RuntimeEnvBool("GEKKOAOT_COMPAT_BREAK_ON_FAULT", false);
 
   // v47: AOT execution itself is never throttled. The GameCube-visible clock
@@ -440,6 +533,8 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
   if (host_fps_limit_hz_ != 0u && host_fps_limit_hz_ < 30u) host_fps_limit_hz_ = 30u;
   frame_interpolation_enabled_ = RuntimeEnvBool("GEKKOAOT_FRAME_INTERPOLATION", true);
   perf_metrics_enabled_ = RuntimeEnvBool("GEKKOAOT_PERF_METRICS", true);
+  cp_idle_breakpoint_recovery_enabled_ =
+      RuntimeEnvBool("GEKKOAOT_CP_IDLE_BREAKPOINT_RECOVERY", true);
   if (const char* user_dir = std::getenv("GEKKOAOT_USER_DIR"); user_dir && *user_dir)
     live_video_config_path_ = std::filesystem::path(user_dir) / "config.ini";
   Reset();
@@ -450,6 +545,13 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
   }
   std::fprintf(stderr,
                "GEKKOAOT_CLOCK_DOMAINS_V49=1 cpu=aot-uncapped hardware=host-realtime vi=1x tb=1x dec=1x dsp=1x ai=1x catchup=full-under-250ms\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_BOOT_PARITY_V143=1 hid0=0011c464 hid1=80000000 hid2=e0000000 ibat0=80001fff/00000002 dbat0=80001fff/00000002 dbat1=c0001fff/0000002a\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_LOW_ICACHE_V143=1 scope=exception-vectors line=32 ice=hid0-bit15 icbi=line icfi=all data-cache-does-not-invalidate\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_CP_IDLE_BREAKPOINT_RECOVERY_V160=%u policy=guest-idle+same-bp+3-vi-frames step=one-32b-burst bp-registers=preserved\n",
+               cp_idle_breakpoint_recovery_enabled_ ? 1u : 0u);
   std::fprintf(stderr,
                "GEKKOAOT_HOST_FRAME_SCHEDULER_V48=1 target_hz=%u source=gx-copy guest_throttle=off interpolation=%u\n",
                host_fps_limit_hz_, frame_interpolation_enabled_ ? 1u : 0u);
@@ -472,10 +574,13 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_OS_THREAD_SANITY_V87=1 stack-magic=deadbabe active-links=validated priority=0-31 fail=skip-invalid\n");
   std::fprintf(stderr,
-               "GEKKOAOT_SAFE_HOST_BOUNDARIES_V79=%u source=%s policy=return-after-aot-dispatch hp-vi-gx-starvation-fix=1\n",
+               "GEKKOAOT_SAFE_HOST_BOUNDARIES_V136=%u source=%s policy=%s chain_cycles=%lld hp-vi-gx-starvation-fix=1\n",
                (compat_diagnostics_enabled_ || safe_host_boundaries_enabled_) ? 1u : 0u,
                compat_diagnostics_enabled_ ? "gdb-diagnostics" :
-               (safe_host_boundaries_enabled_ ? "runtime-env" : "fast-superchain"));
+               (safe_host_boundaries_enabled_ ? "runtime-env" : "fast-superchain"),
+               compat_diagnostics_enabled_ ? "single-dispatch" :
+               (safe_host_boundaries_enabled_ ? "bounded-superchain" : "fast-superchain"),
+               static_cast<long long>(cpu_.cycle_budget));
   std::fprintf(stderr,
                "GEKKOAOT_RUNTIME_FASTPATH_V65=1 clock-sampling=batched-125us metrics=125ms "
                "native-os-bootstrap=once context-fp=host-shadow hle-inline=1\n");
@@ -573,9 +678,11 @@ void HostRuntime::Reset() {
   // after each AOT dispatch is required for titles that rapidly hand work between
   // CPU, VI, GX and asynchronous devices: with the 262144-cycle horizon the guest
   // can outrun host event delivery and wait forever for an XFB/GX transition.
-  cpu_.cycle_budget = (compat_diagnostics_enabled_ || safe_host_boundaries_enabled_)
+  cpu_.cycle_budget = compat_diagnostics_enabled_
                           ? 0
-                          : NativeChainCycleBudget();
+                          : (safe_host_boundaries_enabled_
+                                 ? SafeNativeChainCycleBudget()
+                                 : NativeChainCycleBudget());
   fault_ = {};
   compat_break_fired_ = false;
   compat_breadcrumb_sequence_ = 0;
@@ -586,13 +693,34 @@ void HostRuntime::Reset() {
   spr_state_[kSprDec] = 0xffffffffu;
   spr_state_[kSprPvr] = kGekkoPvr;
   spr_state_[kSprHid0] = kInitialHid0;
+  // BS2/IPL architectural state used by Dolphin's direct-DOL bootstrap. Keep
+  // these mappings active even though normal MEM1 aliases have a host fast
+  // path: guest OS/MMU code inspects and temporarily relies on the real BATs.
+  spr_state_[kSprHid1] = 0x80000000u;
+  spr_state_[kSprIbat0u] = 0x80001fffu;
+  spr_state_[kSprIbat0l] = 0x00000002u;
+  spr_state_[kSprDbat0u] = 0x80001fffu;
+  spr_state_[kSprDbat0l] = 0x00000002u;
+  spr_state_[kSprDbat1u] = 0xc0001fffu;
+  spr_state_[kSprDbat1l] = 0x0000002au;
+  InvalidateLowInstructionCache();
   timebase_cycle_remainder_ = 0u;
   decrementer_cycle_remainder_ = 0u;
   decrementer_pending_ = false;
   timed_irq_sync_cycles_ = 0u;
+  cp_idle_breakpoint_frames_ = 0u;
+  cp_idle_breakpoint_address_ = 0u;
+  cp_idle_breakpoint_recoveries_ = 0u;
   hardware_clock_started_ = false;
   hardware_clock_remainder_ = 0u;
   hardware_clock_guest_since_sample_ = 0u;
+  hardware_clock_sampled_last_call_ = false;
+  hardware_tsc_checked_ = false;
+  hardware_tsc_enabled_ = false;
+  hardware_tsc_hz_ = 0u;
+  hardware_tsc_last_ = 0u;
+  hardware_tsc_cycle_remainder_ = 0u;
+  hardware_tsc_ns_remainder_ = 0u;
   host_present_pending_ = false;
   host_present_started_ = false;
   host_present_count_ = 0u;
@@ -640,6 +768,13 @@ void HostRuntime::Reset() {
   di_reads_ = 0;
   di_read_bytes_ = 0;
   di_read_failures_ = 0;
+  di_async_completion_pending_ = false;
+  di_async_cycles_remaining_ = 0u;
+  di_async_staging_.clear();
+  di_drive_head_offset_ = 0u;
+  di_drive_head_valid_ = false;
+  di_read_buffer_start_ = 0u;
+  di_read_buffer_end_ = 0u;
   exi_.Reset();
   si_.Reset();
   vi_.Reset();
@@ -715,6 +850,14 @@ GameCubeBootResult HostRuntime::InitializeGameCube(
   vi_.Reset(result.ntsc);
   hardware_clock_started_ = false;
   hardware_clock_remainder_ = 0u;
+  hardware_clock_guest_since_sample_ = 0u;
+  hardware_clock_sampled_last_call_ = false;
+  hardware_tsc_checked_ = false;
+  hardware_tsc_enabled_ = false;
+  hardware_tsc_hz_ = 0u;
+  hardware_tsc_last_ = 0u;
+  hardware_tsc_cycle_remainder_ = 0u;
+  hardware_tsc_ns_remainder_ = 0u;
   host_present_started_ = false;
   host_present_pending_ = false;
   gx_frame_ready_since_vi_ = false;
@@ -740,6 +883,7 @@ GameCubeBi2Result HostRuntime::LoadGameCubeBi2(const std::vector<std::uint8_t>& 
 }
 
 void HostRuntime::DetachDiscImage() {
+  native_vfs_.Reset();
 #ifdef GEKKOAOT_HAVE_NOD
   if (disc_image_uses_nod_ && nod_disc_image_)
     nod_free(static_cast<NodHandle*>(nod_disc_image_));
@@ -757,6 +901,11 @@ void HostRuntime::DetachDiscImage() {
   di_async_bytes_ = 0u;
   di_async_dma_address_ = 0u;
   di_async_disc_offset_ = 0u;
+  di_async_staging_.clear();
+  di_drive_head_offset_ = 0u;
+  di_drive_head_valid_ = false;
+  di_read_buffer_start_ = 0u;
+  di_read_buffer_end_ = 0u;
   di_.SetDeviceHooks({});
   di_.SetDiscPresent(false);
 }
@@ -766,6 +915,9 @@ bool HostRuntime::AttachDiscImage(const std::filesystem::path& image_path) {
   di_reads_ = 0;
   di_read_bytes_ = 0;
   di_read_failures_ = 0;
+  vfs_reads_ = 0;
+  vfs_read_bytes_ = 0;
+  vfs_fallback_reads_ = 0;
 
 #ifdef GEKKOAOT_HAVE_NOD
   const auto u8_path = image_path.u8string();
@@ -804,6 +956,20 @@ bool HostRuntime::AttachDiscImage(const std::filesystem::path& image_path) {
   nod_disc_image_ = handle;
   disc_image_uses_nod_ = true;
   disc_media_backend_ = "nod-direct";
+
+  if (RuntimeEnvBool("GEKKOAOT_NATIVE_VFS", true)) {
+    const char* root = std::getenv("GEKKOAOT_VFS_ROOT");
+    const char* overlay = std::getenv("GEKKOAOT_VFS_OVERLAY");
+    const bool mounted = native_vfs_.Mount(
+        handle, root && *root ? std::filesystem::path(root) : std::filesystem::path{},
+        overlay && *overlay ? std::filesystem::path(overlay) : std::filesystem::path{});
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_VFS_V154=%u mode=fst-file-translation sdk=guest-aot di=raw-fallback mechanical-latency=off-by-default entries=%zu\n",
+                 mounted ? 1u : 0u, mounted ? native_vfs_.EntryCount() : 0u);
+  } else {
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_VFS_V154=0 reason=disabled di=raw-only mechanical-latency=gc-default\n");
+  }
 #else
   // Lightweight fallback used by standalone unit tests and explicitly
   // GEKKOAOT_NATIVE_NOD=OFF developer builds. Production controller builds
@@ -843,6 +1009,23 @@ bool HostRuntime::ReadDiscImage(std::uint64_t offset, void* destination, std::ui
   if (offset > disc_image_size_ || size > disc_image_size_ - offset) return false;
   if (size == 0u) return true;
 
+  if (RuntimeEnvBool("GEKKOAOT_NATIVE_VFS", true) && native_vfs_.Ready()) {
+    const char* source = nullptr;
+    if (native_vfs_.ReadDiscRange(offset, destination, size, &source)) {
+      ++vfs_reads_;
+      vfs_read_bytes_ += size;
+      static unsigned vfs_logs = 0u;
+      if (vfs_logs++ < 96u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_NATIVE_VFS_V154=1 phase=read offset=%08llx bytes=%u source=%s reads=%llu\n",
+                     static_cast<unsigned long long>(offset), size,
+                     source ? source : "vfs",
+                     static_cast<unsigned long long>(vfs_reads_));
+      return true;
+    }
+    ++vfs_fallback_reads_;
+  }
+
 #ifdef GEKKOAOT_HAVE_NOD
   if (disc_image_uses_nod_) {
     auto* handle = static_cast<NodHandle*>(nod_disc_image_);
@@ -869,6 +1052,50 @@ bool HostRuntime::ReadDiscImage(std::uint64_t offset, void* destination, std::ui
   disc_image_.read(static_cast<char*>(destination), static_cast<std::streamsize>(size));
   return disc_image_.gcount() == static_cast<std::streamsize>(size);
 }
+
+namespace {
+std::uint64_t GameCubeDiLatencyCycles(std::uint64_t offset, std::uint32_t length,
+                                      std::uint64_t disc_size,
+                                      bool* head_valid, std::uint64_t* head_offset,
+                                      std::uint64_t* buffer_start, std::uint64_t* buffer_end) {
+  constexpr double kCpuHz = static_cast<double>(GekkoAOT::HW::VI::NativeVI::CpuClockHz);
+  constexpr double kCommandSeconds = 600.0 / 1'000'000.0;
+  constexpr double kBufferRate = 32.0 * 1024.0 * 1024.0;
+  constexpr double kInnerRate = 2.1 * 1024.0 * 1024.0;
+  constexpr double kOuterRate = 3.325 * 1024.0 * 1024.0;
+  constexpr std::uint64_t kReadAhead = 1024u * 1024u;
+
+  const std::uint64_t end = offset + length;
+  const bool buffered = *buffer_end > *buffer_start && offset >= *buffer_start && end <= *buffer_end;
+  double seconds = kCommandSeconds;
+  if (buffered) {
+    seconds += static_cast<double>(length) / kBufferRate;
+  } else {
+    if (*head_valid && offset != *head_offset) {
+      const std::uint64_t delta = offset > *head_offset ? offset - *head_offset : *head_offset - offset;
+      const double denom = static_cast<double>(std::max<std::uint64_t>(disc_size, 1u));
+      const double distance = std::min(1.0, static_cast<double>(delta) / denom * 12.0);
+      // Real GC seeks have a fixed mechanical component plus distance cost;
+      // add average rotational latency (half a 28.5 Hz revolution).
+      seconds += 0.035 + 0.040 * distance + (0.5 / 28.5);
+    }
+    const double ratio = disc_size > 1 ? std::clamp(static_cast<double>(offset) /
+                                                        static_cast<double>(disc_size - 1),
+                                                    0.0, 1.0)
+                                       : 0.0;
+    const double rate = kInnerRate + (kOuterRate - kInnerRate) * ratio;
+    seconds += static_cast<double>(length) / rate;
+    *head_valid = true;
+    *head_offset = end;
+    *buffer_start = offset;
+    *buffer_end = std::min<std::uint64_t>(disc_size, end + kReadAhead);
+  }
+  const auto cycles = static_cast<std::uint64_t>(seconds * kCpuHz);
+  return std::clamp<std::uint64_t>(cycles,
+      GekkoAOT::HW::VI::NativeVI::CpuClockHz / 2000u,  // >= 500 us
+      GekkoAOT::HW::VI::NativeVI::CpuClockHz / 2u);    // <= 500 ms
+}
+} // namespace
 
 GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
     void* user, const GekkoAOT::HW::DI::NativeDI::CommandRequest& request) {
@@ -913,8 +1140,18 @@ GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
       return response;
     }
 
-    void* target = self->memory_.Resolve(request.dma_address, transfer);
-    if (!target || !self->ReadDiscImage(offset, target, transfer)) {
+    // Dolphin-style ordering: media I/O may finish on the host now, but the
+    // guest DMA buffer must not become visible before the emulated drive
+    // reaches transfer completion. Stage the bytes host-side and publish them
+    // atomically immediately before TCINT.
+    if (!self->memory_.Resolve(request.dma_address, transfer)) {
+      ++self->di_read_failures_;
+      response.error_code = 0x00031100u;
+      return response;
+    }
+    self->di_async_staging_.resize(transfer);
+    if (!self->ReadDiscImage(offset, self->di_async_staging_.data(), transfer)) {
+      self->di_async_staging_.clear();
       ++self->di_read_failures_;
       response.error_code = 0x00031100u;
       return response;
@@ -923,19 +1160,29 @@ GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
     ++self->di_reads_;
     self->di_read_bytes_ += transfer;
 
-    // GEKKOAOT_NATIVE_DI_ASYNC_V58: the host-side media bytes are available
-    // now, but a retail DI transfer never raises TCINT from the same register
-    // write that asserted TSTART. Keep TSTART set and defer completion until a
-    // later hardware-time slice so DVDReadAsyncPrio can return and its command
-    // block/state machine is fully armed before the callback interrupt runs.
+    // Keep TSTART asserted until the drive-time model expires. The previous
+    // bytes*2 shortcut completed a 32 KiB read in ~135 us and let streaming
+    // state machines outrun retail hardware by orders of magnitude.
     self->di_async_completion_pending_ = true;
-    // Only guest-visible ordering is required here; nod already completed the
-    // blocking host I/O. Scale a tiny latency by transfer size so large FMV
-    // reads cannot collapse into a same-slice completion, while keeping loads
-    // much faster than a physical optical drive.
-    self->di_async_cycles_remaining_ =
-        std::clamp<std::uint64_t>(static_cast<std::uint64_t>(transfer) * 2u,
-                                  8192u, 1048576u);
+    const bool native_vfs_timing =
+        RuntimeEnvBool("GEKKOAOT_NATIVE_VFS", true) && self->native_vfs_.Ready() &&
+        !RuntimeEnvBool("GEKKOAOT_VFS_GC_TIMING", false);
+    if (native_vfs_timing) {
+      // NativeVFS is a host filesystem service, not an optical-drive timing
+      // model. Keep completion deferred until the next host hardware boundary
+      // so DVDReadAsyncPrio cannot callback reentrantly from the initiating
+      // MMIO write, but add no artificial seek/rotation/transfer delay.
+      self->di_async_cycles_remaining_ = 0u;
+    } else if (RuntimeEnvBool("GEKKOAOT_FAST_DISC", false)) {
+      self->di_async_cycles_remaining_ =
+          std::clamp<std::uint64_t>(static_cast<std::uint64_t>(transfer) * 2u,
+                                    8192u, 1048576u);
+    } else {
+      self->di_async_cycles_remaining_ = GameCubeDiLatencyCycles(
+          offset, transfer, self->disc_image_size_, &self->di_drive_head_valid_,
+          &self->di_drive_head_offset_, &self->di_read_buffer_start_,
+          &self->di_read_buffer_end_);
+    }
     self->di_async_bytes_ = transfer;
     self->di_async_dma_address_ = request.dma_address;
     self->di_async_disc_offset_ = offset;
@@ -945,10 +1192,12 @@ GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
     static unsigned schedule_logs = 0u;
     if (schedule_logs++ < 128u)
       std::fprintf(stderr,
-                   "GEKKOAOT_NATIVE_DI_ASYNC_V58=1 phase=schedule seq=%llu offset=%08llx dma=%08x bytes=%u delay_cycles=%llu\n",
+                   "GEKKOAOT_NATIVE_DI_PARITY_V143=1 phase=schedule seq=%llu offset=%08llx dma=%08x bytes=%u delay_cycles=%llu mode=%s visibility=completion\n",
                    static_cast<unsigned long long>(sequence),
                    static_cast<unsigned long long>(offset), request.dma_address, transfer,
-                   static_cast<unsigned long long>(self->di_async_cycles_remaining_));
+                   static_cast<unsigned long long>(self->di_async_cycles_remaining_),
+                   native_vfs_timing ? "native-vfs" :
+                       (RuntimeEnvBool("GEKKOAOT_FAST_DISC", false) ? "fast-optin" : "gc-drive"));
 
     response.result = 0; // pending: NativeDI keeps TSTART asserted
     response.bytes_transferred = transfer;
@@ -1490,10 +1739,55 @@ std::uint64_t HostRuntime::ExternalRead(CPUState* cpu, std::uint32_t address, st
     }
     const std::uint32_t physical = AddressSpace::ToPhysical(address);
     if (physical >= 0x08000000u && physical < 0x0c000000u) {
+      // CPU-visible EFB aperture, matching the Flipper/Dolphin address layout:
+      //   x = (addr & 0xfff) >> 2, y = (addr >> 12) & 0x3ff
+      //   bit 22 clear -> color, bit 22 set -> depth
+      //   bit 23 set   -> combined Z+color (still fail-closed)
+      // v162 added depth for GXPeekZ; v163 closes the normal 32-bit color read
+      // side for GXPeekARGB while keeping unknown aperture semantics explicit.
+      if (size == 4u && (physical & 0x00800000u) == 0u && self->native_gx_.Ready()) {
+        const std::uint16_t x =
+            static_cast<std::uint16_t>((physical & 0x00000fffu) >> 2u);
+        const std::uint16_t y =
+            static_cast<std::uint16_t>((physical >> 12u) & 0x000003ffu);
+
+        if ((physical & 0x00400000u) != 0u) {
+          std::uint32_t z = 0u;
+          if (self->native_gx_.PeekEfbZ(x, y, &z)) {
+            static unsigned efb_z_logs = 0u;
+            if (efb_z_logs++ < 32u)
+              std::fprintf(stderr,
+                           "GEKKOAOT_EFB_Z_PEEK_V162=1 ea=%08x physical=%08x x=%u y=%u z=%06x pc=%08x lr=%08x source=aurora-depth-snapshot\n",
+                           address, physical, unsigned(x), unsigned(y),
+                           z & 0x00ffffffu, cpu->pc, cpu->lr);
+            return z & 0x00ffffffu;
+          }
+        } else {
+          std::uint32_t argb = 0u;
+          if (self->native_gx_.PeekEfbArgb(x, y, &argb)) {
+            // PE_ALPHAREAD is CPU-visible state, so apply it here after the
+            // renderer has reproduced the current EFB pixel-format precision.
+            // 0=force 00, 1=force FF, 2=return the stored alpha.
+            const std::uint16_t alpha_read = self->pe_.AlphaReadMode();
+            if (alpha_read == 0u)
+              argb &= 0x00ffffffu;
+            else if (alpha_read == 1u)
+              argb |= 0xff000000u;
+            static unsigned efb_color_logs = 0u;
+            if (efb_color_logs++ < 32u)
+              std::fprintf(stderr,
+                           "GEKKOAOT_EFB_COLOR_PEEK_V163=1 ea=%08x physical=%08x x=%u y=%u argb=%08x alpha_read=%u pc=%08x lr=%08x source=aurora-color-snapshot\n",
+                           address, physical, unsigned(x), unsigned(y), argb,
+                           unsigned(alpha_read), cpu->pc, cpu->lr);
+            return argb;
+          }
+        }
+      }
+
       static unsigned efb_read_logs = 0;
       if (efb_read_logs++ < 32u)
         std::fprintf(stderr,
-                     "GEKKOAOT_EFB_APERTURE_V87=0 op=read ea=%08x physical=%08x size=%u pc=%08x lr=%08x reason=cpu-efb-access-not-implemented action=fault\n",
+                     "GEKKOAOT_EFB_APERTURE_V163=0 op=read ea=%08x physical=%08x size=%u pc=%08x lr=%08x reason=unsupported-cpu-efb-access action=fault\n",
                      address, physical, unsigned(size), cpu->pc, cpu->lr);
     }
     if (LooksLikeInvalidGameCubeRamAddress(self->memory_, address)) {
@@ -1643,23 +1937,49 @@ bool HostRuntime::QueueGpuFifoGather(std::uint64_t value, std::uint8_t size,
 void HostRuntime::ExternalWrite(CPUState* cpu, std::uint32_t address, std::uint64_t value,
                                 std::uint8_t size) {
   if (auto* self = Self(cpu)) {
-    if (self->AccessPagedVmem(address, &value, size, true)) return;
-    // See ExternalRead(): compiled OS interrupt handlers may carry physical
-    // MEM1 pointers out of the low-memory vector while address translation is
-    // being restored.  Keep those accesses in RAM instead of misclassifying
-    // them as MMIO writes.
-    if (WriteAddressSpaceValue(self->memory_, address, value, size)) return;
-
-    // The Gekko write-gather pipe is itself a 32-byte hardware buffer. Do not
-    // break the native superchain for every stb/sth/stw that merely fills that
-    // buffer: the CP/GPU cannot observe the write until a complete line
-    // is emitted. Other MMIO/LC writes remain immediate
-    // host-visible barriers.
-    if (self->lc_.Write(address, value, size)) {
-      BumpHostWriteEpoch(cpu);
-      return;
-    }
+    // v136b hot path: WGPIPE is a fixed MMIO aperture and cannot alias MEM1,
+    // MEM2, paged VMEM or locked cache. Most draw-heavy ExternalWrite calls
+    // land here, so handle it before generic address-space probes.
+    // Partial lines remain inside the native superchain; only a complete
+    // 32-byte gather line becomes a host-visible CP/GPU boundary.
     if (GekkoAOT::GX::HostBridge::IsWriteGatherPipe(address)) {
+      if (size == 4u && value == 0xc274d554u &&
+          std::getenv("GEKKOAOT_GX_DIAG_GLYPH_PC"))
+        std::fprintf(stderr, "GEKKOAOT_GX_DIAG_GLYPH_PC pc=%08x value=%08llx gather=%u pi_write=%08x\n",
+                     cpu->pc, static_cast<unsigned long long>(value),
+                     self->gpu_fifo_gather_size_, self->pi_.FifoWritePointer());
+      if (size == 4u && cpu->pc == 0x800228c0u &&
+          (value == 0xc274d554u || value == 0x80000000u) &&
+          std::getenv("GEKKOAOT_GX_DIAG_GLYPH_STATE")) {
+        static bool seen_normal = false, seen_zero = false;
+        bool& seen = value == 0xc274d554u ? seen_normal : seen_zero;
+        if (!seen) {
+          seen = true;
+          const std::uint32_t object = cpu->gpr[31];
+          const auto* saved_lr_bytes = self->memory_.Resolve(cpu->gpr[1] + 180u, 4u);
+          const std::uint32_t saved_lr = saved_lr_bytes
+              ? (std::uint32_t(saved_lr_bytes[0]) << 24u) |
+                    (std::uint32_t(saved_lr_bytes[1]) << 16u) |
+                    (std::uint32_t(saved_lr_bytes[2]) << 8u) | saved_lr_bytes[3]
+              : 0u;
+          std::fprintf(stderr, "GEKKOAOT_GX_DIAG_GLYPH_STATE pc=%08x x=%08llx object=%08x sp=%08x caller=%08x r20=%08x r23=%08x r29=%08x r30=%08x f26=%.9g f27=%.9g f30=%.9g f31=%.9g bytes=",
+                       cpu->pc, static_cast<unsigned long long>(value), object, cpu->gpr[1], saved_lr,
+                       cpu->gpr[20], cpu->gpr[23], cpu->gpr[29], cpu->gpr[30],
+                       cpu->fpr[26], cpu->fpr[27], cpu->fpr[30], cpu->fpr[31]);
+          const auto* object_bytes = self->memory_.Resolve(object, 112u);
+          if (object_bytes) for (unsigned i = 0; i < 112u; ++i)
+            std::fprintf(stderr, "%02x", object_bytes[i]);
+          std::fprintf(stderr, " caller_bytes=");
+          const auto* caller_bytes = self->memory_.Resolve(cpu->gpr[20], 64u);
+          if (caller_bytes) for (unsigned i = 0; i < 64u; ++i)
+            std::fprintf(stderr, "%02x", caller_bytes[i]);
+          std::fprintf(stderr, " caller_stack=");
+          const auto* caller_stack = self->memory_.Resolve(cpu->gpr[1] + 176u + 32u, 40u);
+          if (caller_stack) for (unsigned i = 0; i < 40u; ++i)
+            std::fprintf(stderr, "%02x", caller_stack[i]);
+          std::fprintf(stderr, "\n");
+        }
+      }
       // The CPU write-gather pipe always targets the currently selected PI CPU
       // FIFO.  During GXBeginDisplayList that FIFO is a temporary RAM buffer,
       // not the CP/GP render FIFO.  Record complete 32-byte gather bursts into
@@ -1691,6 +2011,16 @@ void HostRuntime::ExternalWrite(CPUState* cpu, std::uint32_t address, std::uint6
         return;
       }
     }
+    if (self->AccessPagedVmem(address, &value, size, true)) return;
+    // See ExternalRead(): compiled OS interrupt handlers may carry physical
+    // MEM1 pointers out of the low-memory vector while address translation is
+    // being restored.  Keep those accesses in RAM instead of misclassifying
+    // them as MMIO writes.
+    if (WriteAddressSpaceValue(self->memory_, address, value, size)) return;
+    if (self->lc_.Write(address, value, size)) {
+      BumpHostWriteEpoch(cpu);
+      return;
+    }
 
     BumpHostWriteEpoch(cpu);
     if (self->cp_.Write(address, value, size)) {
@@ -1716,6 +2046,7 @@ void HostRuntime::ExternalWrite(CPUState* cpu, std::uint32_t address, std::uint6
           (self->di_.DMAControl() & 1u) == 0u) {
         self->di_async_completion_pending_ = false;
         self->di_async_cycles_remaining_ = 0u;
+        self->di_async_staging_.clear();
         static unsigned cancel_logs = 0u;
         if (cancel_logs++ < 32u)
           std::fprintf(stderr,
@@ -1773,8 +2104,12 @@ void HostRuntime::ExternalWrite32(CPUState* cpu, std::uint32_t address, std::uin
 void* HostRuntime::ExternalPointer(CPUState* cpu, std::uint32_t address, std::uint32_t size) {
   auto* self = Self(cpu);
   if (!self) return nullptr;
-  if (void* pointer = self->lc_.Pointer(address, size)) return pointer;
-  return self->memory_.Resolve(address, size);
+  // v136: essentially every NativeOS/SDK pointer lives in MEM1/MEM2. Resolve
+  // normal RAM first so the hot path avoids probing the locked-cache aperture
+  // on every guest structure read. LC addresses do not alias AddressSpace, so
+  // this preserves the exact fallback semantics for 0xE0000000..0xE003FFFF.
+  if (void* pointer = self->memory_.Resolve(address, size)) return pointer;
+  return self->lc_.Pointer(address, size);
 }
 
 void HostRuntime::InstructionFallback(CPUState* cpu, std::uint32_t instruction,
@@ -1975,6 +2310,29 @@ void HostRuntime::RebuildNativeInterceptIndex() {
 
 bool HostRuntime::DispatchOsHle(GekkoAOT::NativeOS::Kind kind, std::uint32_t address) {
   ++hle_calls_;
+
+  // GEKKOAOT_NATIVE_OS_INTERRUPT_ENTRY_FENCE_V149:
+  // A statically lowered NativeOS leaf can be entered from inside a compiled
+  // native call chain without first returning to HostRuntime::Run(), so the
+  // normal dispatch-boundary asynchronous-interrupt probe is skipped.  That is
+  // observable for the three MSR[EE] helpers: OSDisableInterrupts in particular
+  // may clear EE before an already-pending external/DEC interrupt gets the
+  // architectural chance it would have had at the guest function-entry
+  // boundary.
+  //
+  // The direct-HLE state-sync path has already published PC as the intercepted
+  // guest entrypoint.  If an interrupt is pending, take it now and report the
+  // host call handled without executing the leaf.  SRR0 therefore points back
+  // at the SDK entry and RFI naturally retries it, matching the guest path and
+  // preserving the OSDisableInterrupts RAS semantics.  Apply the same fence to
+  // Enable/Restore because callers may enter either while EE is already set.
+  if (kind == GekkoAOT::NativeOS::Kind::DisableInterrupts ||
+      kind == GekkoAOT::NativeOS::Kind::EnableInterrupts ||
+      kind == GekkoAOT::NativeOS::Kind::RestoreInterrupts) {
+    if (TryTakeExternalInterrupt() || TryTakeDecrementerInterrupt())
+      return true;
+  }
+
   auto& native_os = GekkoAOT::NativeOS::Service::Get();
   if (GekkoAOT::NativeOS::Service::IsInlineFastKind(kind)) {
     if (native_os.DispatchInlineFast(kind, &cpu_)) return true;
@@ -2260,15 +2618,78 @@ void HostRuntime::SyncNativeVIInterrupt() {
   }
 }
 
+void HostRuntime::ServiceIdleCpBreakpointRecovery(bool frame_boundary) {
+  if (!frame_boundary || !cp_idle_breakpoint_recovery_enabled_) return;
+
+  // This path intentionally keys off the retail low-memory scheduler state,
+  // not a game address. __OSCurrentThread == nullptr with a non-empty active
+  // thread list means the SDK SelectThread idle loop owns the CPU.
+  std::uint32_t current_thread = 0u;
+  std::uint32_t active_head = 0u;
+  if (!memory_.Read32(0x800000e4u, &current_thread) ||
+      !memory_.Read32(0x800000dcu, &active_head) ||
+      current_thread != 0u || active_head == 0u ||
+      !cp_.BreakpointActiveForHost() || cp_.BreakpointInterruptEnabled() ||
+      cp_.FifoReadWriteDistance() < 32u) {
+    cp_idle_breakpoint_frames_ = 0u;
+    cp_idle_breakpoint_address_ = 0u;
+    return;
+  }
+
+  const std::uint32_t breakpoint = cp_.FifoBreakpoint();
+  if (cp_idle_breakpoint_address_ != breakpoint) {
+    cp_idle_breakpoint_address_ = breakpoint;
+    cp_idle_breakpoint_frames_ = 1u;
+    return;
+  }
+
+  if (cp_idle_breakpoint_frames_ < 0xffffffffu)
+    ++cp_idle_breakpoint_frames_;
+
+  // A legitimate framebuffer hold normally resolves on the next retrace.
+  // Three complete VI frames is therefore intentionally generous and keeps the
+  // recovery out of normal GX breakpoint traffic.
+  if (cp_idle_breakpoint_frames_ < 3u) return;
+
+  const std::uint32_t read_before = cp_.FifoReadPointer();
+  const std::uint32_t distance_before = cp_.FifoReadWriteDistance();
+  const std::uint16_t token_before = pe_.Token();
+
+  if (!cp_.StepPastHandledBreakpointOnce()) return;
+
+  SyncNativeGXInterrupts();
+  SyncNativeCPInterrupt();
+  ++cp_idle_breakpoint_recoveries_;
+
+  std::fprintf(stderr,
+               "GEKKOAOT_CP_IDLE_BREAKPOINT_RECOVERY_V160=1 phase=step count=%llu "
+               "bp=%08x read=%08x->%08x distance=%08x->%08x pe_token=%04x->%04x "
+               "current=0 active=%08x\n",
+               static_cast<unsigned long long>(cp_idle_breakpoint_recoveries_),
+               breakpoint, read_before, cp_.FifoReadPointer(), distance_before,
+               cp_.FifoReadWriteDistance(), unsigned(token_before), unsigned(pe_.Token()),
+               active_head);
+
+  // Do not repeatedly walk the FIFO in one deadlock. Once one burst has crossed
+  // the held fence, wait for the guest's VI/PE callbacks to observe the new
+  // token/state. If the guest later programs another breakpoint the address
+  // change starts a new, independently qualified recovery window.
+  cp_idle_breakpoint_frames_ = 0u;
+  cp_idle_breakpoint_address_ = 0u;
+}
+
 bool HostRuntime::TryTakeExternalInterrupt() {
   // External interrupts are level-sensitive at the PI boundary. The device/PI
   // cause remains asserted until guest software acknowledges it; this method
   // only performs the CPU-side exception entry when interrupts are enabled.
+  // Read the cause/mask pair once. InterruptPending() used to reload the same
+  // two fields, which is measurable because this probe sits on every dispatch.
   const std::uint32_t pi_cause = pi_.InterruptCauseValue();
   const std::uint32_t pi_mask = pi_.InterruptMaskValue();
+  const std::uint32_t pending = pi_cause & pi_mask;
+  if (pending == 0u) return false;
   const bool video_ready =
-      (pi_cause & pi_mask & GekkoAOT::HW::PI::NativePI::Video) != 0u;
-  if (!pi_.InterruptPending()) return false;
+      (pending & GekkoAOT::HW::PI::NativePI::Video) != 0u;
   if ((cpu_.msr & kPpcMsrEe) == 0u) {
     if (video_ready) {
       static bool video_ee_block_reported = false;
@@ -2580,8 +3001,10 @@ void HostRuntime::SprWrite(CPUState* cpu, std::uint16_t spr, std::uint32_t value
     // Reuse the v87 icbi coherency path so fixed-image AOT identity caches are
     // invalidated as well.
     self->spr_state_[kSprHid0] = value & ~kHid0IcfiMask;
-    if (invalidate_icache)
+    if (invalidate_icache) {
+      self->InvalidateLowInstructionCache();
       CacheControl(cpu, kCacheIcbi, 0u, address);
+    }
 
     static unsigned hid0_logs = 0u;
     if (hid0_logs++ < 64u)
@@ -2629,13 +3052,19 @@ void HostRuntime::CacheControl(CPUState* cpu, std::uint8_t operation,
   auto* self = Self(cpu);
   if (!self) return;
 
-  // Host RAM is coherent, so dcbst/dcbf/dcbi do not need a software D-cache.
+  // Host RAM itself is coherent, but NativeGX/Aurora keeps GPU-side snapshots
+  // of indexed arrays. dcbst/dcbf/dcbi are the guest's publication boundary
+  // for CPU-authored dynamic geometry, so forward them to the renderer.
+  if (operation == kCacheDcbst || operation == kCacheDcbf || operation == kCacheDcbi)
+    self->native_gx_.NotifyCacheControl(operation, address);
+
   // icbi is different for an AOT runtime: the guest is declaring that code at
   // this address may have changed. Drop fixed-executable identity caches so a
   // loader/overlay is re-identified from the authoritative guest bytes before
   // the next overlapping dispatch. Native code itself remains immutable; SMC
   // outside precompiled images therefore still fails closed elsewhere.
   if (operation == kCacheIcbi) {
+    self->InvalidateLowInstructionCacheLine(address);
     self->fixed_exec_route_cache_ = {};
     self->fixed_exec_active_descriptor_ = nullptr;
     ++self->icbi_route_invalidations_;
@@ -2648,6 +3077,48 @@ void HostRuntime::CacheControl(CPUState* cpu, std::uint8_t operation,
   }
 }
 
+void HostRuntime::InvalidateLowInstructionCache() {
+  low_instruction_cache_valid_.fill(false);
+}
+
+void HostRuntime::InvalidateLowInstructionCacheLine(std::uint32_t address) {
+  const std::uint32_t physical = AddressSpace::ToPhysical(address);
+  if (physical >= kLowInstructionCacheSpan) return;
+  const std::size_t line = physical / kLowInstructionCacheLineBytes;
+  if (line < low_instruction_cache_valid_.size())
+    low_instruction_cache_valid_[line] = false;
+}
+
+bool HostRuntime::FetchLowMemoryInstruction(std::uint32_t address,
+                                            std::uint32_t* instruction) {
+  if (!instruction) return false;
+  const std::uint32_t physical = AddressSpace::ToPhysical(address);
+  if (physical >= kLowInstructionCacheSpan || (physical & 3u) != 0u)
+    return memory_.Read32(address, instruction);
+
+  // When HID0.ICE is clear the core observes RAM directly. With ICE enabled,
+  // preserve a 32-byte line until icbi/ICFI, so DCStoreRange alone does not
+  // publish rewritten exception code to instruction fetch. This is required by
+  // IPL/Datel-style boot flows and mirrors the architectural distinction
+  // between D-cache publication and I-cache invalidation.
+  if ((spr_state_[kSprHid0] & kHid0IceMask) == 0u)
+    return memory_.Read32(address, instruction);
+
+  const std::uint32_t line_base = physical & ~(kLowInstructionCacheLineBytes - 1u);
+  const std::size_t line = line_base / kLowInstructionCacheLineBytes;
+  if (!low_instruction_cache_valid_[line]) {
+    const std::size_t first_word = line_base / sizeof(std::uint32_t);
+    for (std::uint32_t offset = 0; offset < kLowInstructionCacheLineBytes; offset += 4u) {
+      std::uint32_t value = 0;
+      if (!memory_.Read32(line_base + offset, &value)) return false;
+      low_instruction_cache_[first_word + offset / 4u] = value;
+    }
+    low_instruction_cache_valid_[line] = true;
+  }
+  *instruction = low_instruction_cache_[physical / sizeof(std::uint32_t)];
+  return true;
+}
+
 bool HostRuntime::ExecuteLowMemoryInstruction(std::uint32_t address,
                                               std::uint64_t* charged_cycles) {
   if (!charged_cycles) return false;
@@ -2655,7 +3126,7 @@ bool HostRuntime::ExecuteLowMemoryInstruction(std::uint32_t address,
   if (!IsLowExceptionVectorAddress(physical) || (physical & 3u) != 0u) return false;
 
   std::uint32_t instruction = 0;
-  if (!memory_.Read32(address, &instruction)) return false;
+  if (!FetchLowMemoryInstruction(address, &instruction)) return false;
 
   // Gekko manual 9.4.2: sync/eieio do not flush the write-gather pipe.
   // Only completing a 32-byte line publishes it. WPAR writes discard tails.
@@ -2851,8 +3322,8 @@ bool HostRuntime::ExecuteLowMemoryInstruction(std::uint32_t address,
   // The guest's sync/isync ordering is stronger than this single-threaded
   // low-vector executor strictly needs. Keep a host fence anyway so future
   // device/worker integration cannot reorder state across the architectural
-  // barriers. Guest I-cache invalidation itself is represented by HID0 state;
-  // RAM vector instructions are fetched afresh on every step.
+  // barriers. Low-memory instruction visibility is handled by the v143
+  // 32-byte I-cache model above; sync/isync do not themselves invalidate it.
   if (instruction == 0x7c0004acu || instruction == 0x4c00012cu) { // sync / isync
     std::atomic_thread_fence(std::memory_order_seq_cst);
     cpu_.pc = address + 4u;
@@ -2894,30 +3365,79 @@ std::uint64_t HostRuntime::TakeRealtimeHardwareCycles(std::uint64_t charged,
   using Clock = std::chrono::steady_clock;
   constexpr std::uint64_t kClockHz = GekkoAOT::HW::VI::NativeVI::CpuClockHz;
   constexpr std::uint64_t kNsPerSecond = 1000000000ull;
-  // ~125 us of guest work. This is far below one scanline/audio block, but
-  // avoids a vDSO clock_gettime call at every tiny HLE/context boundary.
+  // Keep scheduler/device service bounded while coalescing tiny AOT exits. The
+  // expensive clock source itself is replaced by invariant TSC when the host
+  // publishes an exact CPUID.15H ratio; non-x86 and uncertain VMs retain the
+  // portable steady_clock path.
   constexpr std::uint64_t kGuestPollQuantum =
       (GekkoAOT::HW::VI::NativeVI::CpuClockHz / 8000u) + 1u;
+  constexpr std::uint64_t kIdlePollQuantum =
+      (GekkoAOT::HW::VI::NativeVI::CpuClockHz / 16000u) + 1u;
   constexpr auto kPauseThreshold = std::chrono::milliseconds(250);
+  const std::uint64_t poll_quantum = force_sample ? kIdlePollQuantum : kGuestPollQuantum;
 
+  hardware_clock_sampled_last_call_ = false;
   if (charged > std::numeric_limits<std::uint64_t>::max() -
                     hardware_clock_guest_since_sample_)
-    hardware_clock_guest_since_sample_ = kGuestPollQuantum;
+    hardware_clock_guest_since_sample_ = poll_quantum;
   else
     hardware_clock_guest_since_sample_ += charged;
 
-  if (hardware_clock_started_ && !force_sample &&
-      hardware_clock_guest_since_sample_ < kGuestPollQuantum)
+  if (hardware_clock_started_ && hardware_clock_guest_since_sample_ < poll_quantum)
     return 0u;
   hardware_clock_guest_since_sample_ = 0u;
 
-  const auto now = Clock::now();
+  if (!hardware_tsc_checked_) {
+    hardware_tsc_checked_ = true;
+    const auto info = DetectFastInvariantTsc();
+    hardware_tsc_enabled_ = RuntimeEnvBool("GEKKOAOT_RUNTIME_TSC", true) && info.available;
+    hardware_tsc_hz_ = hardware_tsc_enabled_ ? info.hz : 0u;
+    std::fprintf(stderr,
+                 "GEKKOAOT_RUNTIME_CLOCK_V136=1 source=%s hz=%llu fallback=steady-clock env=GEKKOAOT_RUNTIME_TSC\n",
+                 hardware_tsc_enabled_ ? "invariant-tsc-cpuid15" : "steady-clock",
+                 static_cast<unsigned long long>(hardware_tsc_hz_));
+  }
+
+  hardware_clock_sampled_last_call_ = true;
   if (!hardware_clock_started_) {
     hardware_clock_started_ = true;
-    hardware_clock_last_ = now;
+    hardware_clock_last_ = Clock::now();
+    if (hardware_tsc_enabled_) hardware_tsc_last_ = ReadFastTsc();
     return 0u;
   }
 
+  if (hardware_tsc_enabled_) {
+    const std::uint64_t now_ticks = ReadFastTsc();
+    const std::uint64_t delta_ticks = now_ticks - hardware_tsc_last_;
+    hardware_tsc_last_ = now_ticks;
+    if (delta_ticks == 0u || hardware_tsc_hz_ == 0u) return 0u;
+
+    const std::uint64_t whole_seconds = delta_ticks / hardware_tsc_hz_;
+    const std::uint64_t tick_frac = delta_ticks % hardware_tsc_hz_;
+
+    // Keep hardware_clock_last_ in the same steady_clock domain used by the
+    // presentation scheduler, without another vDSO call. Carry the division
+    // remainder so long runs do not accumulate truncation drift.
+    const std::uint64_t ns_scaled =
+        tick_frac * kNsPerSecond + hardware_tsc_ns_remainder_;
+    const std::uint64_t elapsed_ns =
+        whole_seconds * kNsPerSecond + ns_scaled / hardware_tsc_hz_;
+    hardware_tsc_ns_remainder_ = ns_scaled % hardware_tsc_hz_;
+    hardware_clock_last_ += std::chrono::nanoseconds(elapsed_ns);
+
+    // Match the old pause policy: a debugger stop/window drag must not fast-
+    // forward VI/audio/DEC when execution resumes. The synthetic host time is
+    // still advanced above so host presentation never queues a catch-up burst.
+    if (whole_seconds != 0u || delta_ticks > hardware_tsc_hz_ / 4u)
+      return 0u;
+
+    const std::uint64_t cycle_scaled =
+        tick_frac * kClockHz + hardware_tsc_cycle_remainder_;
+    hardware_tsc_cycle_remainder_ = cycle_scaled % hardware_tsc_hz_;
+    return whole_seconds * kClockHz + cycle_scaled / hardware_tsc_hz_;
+  }
+
+  const auto now = Clock::now();
   auto elapsed = now - hardware_clock_last_;
   hardware_clock_last_ = now;
   if (elapsed < Clock::duration::zero()) return 0u;
@@ -2952,7 +3472,10 @@ void HostRuntime::QueueHostPresent(std::uint32_t xfb_top,
 void HostRuntime::NoteProducedFrame() {
   ++perf_guest_frames_total_;
   using Clock = std::chrono::steady_clock;
-  const auto now = Clock::now();
+  // AdvanceRuntimeCycles already sampled monotonic time for the hardware domain.
+  // Reuse it here; frame production is allowed to see the most recent sample
+  // (at most ~125 us old) instead of paying another vDSO call at 50/60 Hz.
+  const auto now = hardware_clock_started_ ? hardware_clock_last_ : Clock::now();
   if (produced_frame_seen_) {
     auto delta = std::chrono::duration_cast<std::chrono::nanoseconds>(now - produced_frame_last_);
     constexpr auto kMinPeriod = std::chrono::milliseconds(4);
@@ -2980,12 +3503,10 @@ void HostRuntime::NoteProducedFrame() {
   }
 }
 
-void HostRuntime::ServiceHostFrameScheduler() {
+void HostRuntime::ServiceHostFrameScheduler(std::chrono::steady_clock::time_point now) {
   if (!native_gx_.Ready()) return;
   if (!host_present_pending_ && !interpolation_pair_valid_) return;
 
-  using Clock = std::chrono::steady_clock;
-  const auto now = Clock::now();
   std::chrono::nanoseconds present_period{0};
   if (host_fps_limit_hz_ != 0u) {
     present_period = std::chrono::nanoseconds(
@@ -3116,22 +3637,35 @@ void HostRuntime::PollLiveVideoConfig(std::uint64_t charged) {
   std::ifstream file(live_video_config_path_);
   if (!file) return;
   std::string line;
+  std::string aspect_mode;
+  bool have_aspect = false;
+  bool have_fps = false;
+  std::uint32_t next_fps = host_fps_limit_hz_;
   while (std::getline(file, line)) {
-    constexpr std::string_view prefix = "fps_limit=";
-    if (!line.starts_with(prefix)) continue;
-    char* end = nullptr;
-    const auto value = std::strtoul(line.c_str() + prefix.size(), &end, 10);
-    if (!end || *end != '\0' || value < 30u || value > 360u) return;
-    const auto next = static_cast<std::uint32_t>(value);
-    if (next == host_fps_limit_hz_) return;
-    host_fps_limit_hz_ = next;
+    constexpr std::string_view fps_prefix = "fps_limit=";
+    constexpr std::string_view aspect_prefix = "aspect_ratio=";
+    if (line.starts_with(fps_prefix)) {
+      char* end = nullptr;
+      const auto value = std::strtoul(line.c_str() + fps_prefix.size(), &end, 10);
+      if (end && *end == '\0' && value >= 30u && value <= 360u) {
+        next_fps = static_cast<std::uint32_t>(value);
+        have_fps = true;
+      }
+    } else if (line.starts_with(aspect_prefix)) {
+      aspect_mode = line.substr(aspect_prefix.size());
+      have_aspect = true;
+    }
+  }
+
+  if (have_fps && next_fps != host_fps_limit_hz_) {
+    host_fps_limit_hz_ = next_fps;
     host_present_started_ = false;
     interpolation_pair_valid_ = false;
     std::fprintf(stderr,
                  "GEKKOAOT_PC_FPS_SLIDER_V48=1 target_hz=%u source=live-config domain=host-present interpolation=%u\n",
                  host_fps_limit_hz_, frame_interpolation_enabled_ ? 1u : 0u);
-    return;
   }
+  if (have_aspect) native_gx_.SetAspectMode(aspect_mode);
 }
 
 void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
@@ -3145,9 +3679,18 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
       TakeRealtimeHardwareCycles(charged, idle_wait);
   perf_hardware_cycles_total_ += hardware_cycles;
 
+  // v136 hot-path collapse: most AOT dispatch boundaries occur between host
+  // clock samples. No native device can advance without realtime hardware
+  // cycles, and producer/presentation/quit polling tolerates the same <=125 us
+  // sampling latency already used by the hardware clock. Returning here avoids
+  // repeated DSO calls, frame-ready probes, metrics branches and device checks
+  // on the overwhelmingly common zero-time boundary.
+  if (hardware_cycles == 0u) return;
+
   bool odd_field_boundary = false;
   bool even_field_boundary = false;
   bool frame_boundary = false;
+  const bool gx_ready = native_gx_.Ready();
 
   if (hardware_cycles != 0u) {
   if (di_async_completion_pending_) {
@@ -3164,6 +3707,7 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
                      di_async_dma_address_, di_async_bytes_);
       di_async_completion_pending_ = false;
       di_async_cycles_remaining_ = 0u;
+      di_async_staging_.clear();
     } else if (hardware_cycles >= di_async_cycles_remaining_) {
       const auto sequence = di_async_sequence_;
       const auto bytes = di_async_bytes_;
@@ -3171,13 +3715,25 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
       const auto offset = di_async_disc_offset_;
       di_async_completion_pending_ = false;
       di_async_cycles_remaining_ = 0u;
-      const bool completed = di_.CompletePendingFor(sequence, true, 0u, bytes, 0u);
-      if (completed) SyncNativeDIInterrupt();
+      bool published = false;
+      if (di_async_staging_.size() == bytes) {
+        if (auto* target = memory_.Resolve(dma, bytes)) {
+          std::memcpy(target, di_async_staging_.data(), bytes);
+          published = true;
+        }
+      }
+      di_async_staging_.clear();
+      const bool completed = published && di_.CompletePendingFor(sequence, true, 0u, bytes, 0u);
+      if (!published) {
+        ++di_read_failures_;
+        di_.CompletePendingFor(sequence, false, 0u, 0u, 0x00031100u);
+      }
+      SyncNativeDIInterrupt();
       static unsigned complete_logs = 0u;
       if (complete_logs++ < 128u)
         std::fprintf(stderr,
-                     "GEKKOAOT_NATIVE_DI_ASYNC_V58=1 phase=%s seq=%llu offset=%08llx dma=%08x bytes=%u status=%08x\n",
-                     completed ? "complete" : "stale-drop",
+                     "GEKKOAOT_NATIVE_DI_PARITY_V143=1 phase=%s seq=%llu offset=%08llx dma=%08x bytes=%u status=%08x visibility=completion\n",
+                     completed ? "complete" : (published ? "stale-drop" : "dma-fault"),
                      static_cast<unsigned long long>(sequence),
                      static_cast<unsigned long long>(offset), dma, bytes, di_.Status());
     } else {
@@ -3196,6 +3752,10 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
   even_field_boundary = vi_.ConsumeEvenFieldBoundary();
   frame_boundary = vi_.ConsumeFrameBoundary();
   if (frame_boundary) ++perf_vi_boundaries_total_;
+
+  // v160: only after a complete VI frame has elapsed can an already-handled
+  // CP breakpoint be classified as a scheduler/video-flip deadlock.
+  ServiceIdleCpBreakpointRecovery(frame_boundary);
 
   // Sample host input in its own GameCube hardware-time domain. Retail SI
   // polling is commonly around 120 Hz and, unlike presentation or the AOT CPU
@@ -3216,16 +3776,20 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
 
   } // hardware_cycles != 0
 
-  // Host presentation is allowed to follow the producer (GXCopyDisp) while VI
-  // continues to advance exactly as before for retrace, IRQ and guest timing.
-  // The renderer reports the exact latched XFB address, so we do not race VI's
-  // address registers when the copy completes before the next retrace.
-  if (gx_present_on_copy_ && native_gx_.Ready()) {
+  // Always consume the producer boundary, even when direct host presentation
+  // remains VI-driven. Frame interpolation and guest-frame cadence are sourced
+  // from completed GXCopyDisp frames, while gx_present_on_copy_ only decides
+  // whether that producer boundary also queues the direct scanout immediately.
+  // Previously the VI mode left the frame-ready latch unconsumed, so
+  // NoteProducedFrame() never armed the interpolation scheduler.
+  if (gx_ready) {
     std::uint32_t ready_xfb = 0;
     if (native_gx_.ConsumeFrameReady(&ready_xfb) && ready_xfb != 0u) {
       NoteProducedFrame();
-      QueueHostPresent(ready_xfb, ready_xfb);
-      gx_frame_ready_since_vi_ = true;
+      if (gx_present_on_copy_) {
+        QueueHostPresent(ready_xfb, ready_xfb);
+        gx_frame_ready_since_vi_ = true;
+      }
     }
   }
 
@@ -3233,7 +3797,7 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
   // Dolphin/retail semantics select TOP for the odd field and BOTTOM for the
   // even field.  If both origins are identical (typical progressive/single-XFB
   // setup), retain one present per full frame instead of presenting duplicates.
-  if (native_gx_.Ready() && !gx_present_on_copy_) {
+  if (gx_ready && !gx_present_on_copy_) {
     const std::uint32_t top = vi_.XfbAddressTop();
     const std::uint32_t bottom = vi_.XfbAddressBottom();
     const bool split_fields = top != 0u && bottom != 0u && top != bottom;
@@ -3269,7 +3833,7 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
   }
 
   if (frame_boundary) {
-    if (native_gx_.Ready() && gx_present_on_copy_ &&
+    if (gx_ready && gx_present_on_copy_ &&
         !gx_frame_ready_since_vi_ && gx_present_fallback_vi_) {
       QueueHostPresent(vi_.XfbAddressTop(), vi_.XfbAddressBottom(),
                        vi_.XfbWidthPixels(), vi_.XfbStrideBytes(),
@@ -3278,10 +3842,13 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
     gx_frame_ready_since_vi_ = false;
   }
 
-  // Presentation is serviced from host monotonic time and never feeds back
-  // into VI or guest execution. Multiple produced frames above the selected
-  // cap collapse to the newest completed XFB.
-  ServiceHostFrameScheduler();
+  // Presentation is serviced from the same monotonic sample used to advance
+  // hardware time. Previously ServiceHostFrameScheduler() called steady_clock
+  // on *every* AOT/HLE boundary, undoing TakeRealtimeHardwareCycles' sampling
+  // gate and dominating runtime profiles. A fresh sample arrives at up to 8 kHz
+  // (16 kHz while idle), far above the maximum 360 Hz presentation target.
+  if (hardware_clock_sampled_last_call_)
+    ServiceHostFrameScheduler(hardware_clock_last_);
   ServicePerformanceMetrics(hardware_cycles);
 
   if (hardware_cycles != 0u) {
@@ -3331,7 +3898,7 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
 
   } // hardware_cycles != 0
 
-  if (native_gx_.QuitRequested())
+  if (gx_ready && native_gx_.QuitRequested())
     result.status = RunStatus::HostRequestedExit;
 }
 
@@ -3554,6 +4121,36 @@ const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModule(
         return fixed_exec_route_cache_.descriptor;
   }
   fixed_exec_route_cache_ = {};
+
+  // v155: fixed executable identity is an instruction-cache epoch, not a
+  // property that needs to be rediscovered at every function boundary.  MKDD
+  // spends a lot of time bouncing through OSSaveContext/OSLoadContext and the
+  // thread scheduler during course transitions.  With safe host boundaries
+  // enabled every AOT dispatch returns here, and v87 re-hashed the current
+  // function (plus neighbours) every time it crossed a chunk boundary.
+  //
+  // Once an executable has been verified, keep routing all of its covered
+  // chunks to that descriptor until the guest executes ICBI.  CacheControl()
+  // already clears fixed_exec_active_descriptor_ and the route cache on ICBI,
+  // which is the architectural publication boundary a loader must use before
+  // executing newly written PowerPC instructions.  Startup/reset also begins
+  // with no active descriptor, so the full hash resolver below still proves
+  // the initial image and every post-ICBI replacement.
+  if (fixed_exec_active_descriptor_) {
+    for (std::size_t i = 0; i < candidate_count; ++i) {
+      const auto& candidate = candidates[i];
+      if (candidate.descriptor != fixed_exec_active_descriptor_) continue;
+      const auto range = candidate.descriptor->chunk_ranges[candidate.chunk];
+      fixed_exec_route_cache_ = {candidate.descriptor, range.start, range.end, true};
+      static unsigned active_epoch_logs = 0u;
+      if (active_epoch_logs++ < 64u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_FIXED_EXEC_ROUTER_V155=1 action=keep-active-icache-epoch pc=%08x chunk=%08x-%08x candidates=%zu invalidations=%llu\n",
+                     runtime_address, range.start, range.end, candidate_count,
+                     static_cast<unsigned long long>(icbi_route_invalidations_));
+      return candidate.descriptor;
+    }
+  }
 
   // First establish which images match the *current* guest chunk. Unlike v84,
   // do not immediately choose the first match: SDK/library code is often byte-
@@ -3865,6 +4462,12 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
   SyncNativeEXIInterrupt();
   SyncNativeSIInterrupt();
 
+  const std::uint32_t native_idle_sleep_us =
+      RuntimeEnvU32("GEKKOAOT_NATIVE_IDLE_SLEEP_US", 0u, 1000u);
+  std::fprintf(stderr,
+               "GEKKOAOT_RUNTIME_PERF_V140=1 clock=tsc-or-steady zero-cycle=fast-return external-pointer=ram-first wgpipe=early-fastpath irq-probe=single-load nativeos=o1-best+priority-coherent safe-chain=%lld spin-yield=off context-drop=off idle-sleep-us=%u\n",
+               static_cast<long long>(cpu_.cycle_budget), native_idle_sleep_us);
+
   while (dispatch_limit == 0 || result.dispatches < dispatch_limit) {
     if (cpu_.pc == 0u) {
       result.status = RunStatus::Completed;
@@ -3902,6 +4505,13 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
       constexpr std::uint64_t kNativeIdleMaxQuantum = 4096u;
       const std::uint64_t idle_quantum = std::max<std::uint64_t>(
           1u, std::min<std::uint64_t>(kNativeIdleMaxQuantum, vi_.TicksPerHalfLine()));
+      // v136b: do not park by default. On Linux a nominal 50-us sleep may
+      // overshoot enough to shave throughput/latency on titles that enter the
+      // SDK idle context between render bursts. The O(1) NativeOS scheduler,
+      // TSC clock and zero-cycle fast return retain most of v136's CPU savings
+      // without sleeping. Parking remains an explicit power-saving opt-in.
+      if (native_idle_sleep_us != 0u)
+        std::this_thread::sleep_for(std::chrono::microseconds(native_idle_sleep_us));
       // v46 virtualizes only the VI wait gate while NativeOS is genuinely
       // idle. The guest clock itself is wall-paced to 1.0x, so a faster host
       // cannot make game logic/audio randomly run faster. CPU timebase/DEC,
@@ -3972,6 +4582,13 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
                    dispatch_pc);
     }
 
+    if (dispatch_pc == 0x80022584u && cpu_.lr == 0x8002f410u &&
+        cpu_.gpr[20] == 0x803e1b50u && cpu_.gpr[30] == 0u &&
+        std::getenv("GEKKOAOT_GX_DIAG_GLYPH_ENTRY"))
+      std::fprintf(stderr,
+                   "GEKKOAOT_GX_DIAG_GLYPH_ENTRY f1=%.9g f2=%.9g f3=%.9g f4=%.9g r3=%08x r23=%08x fpscr=%08x\n",
+                   cpu_.fpr[1], cpu_.fpr[2], cpu_.fpr[3], cpu_.fpr[4],
+                   cpu_.gpr[3], cpu_.gpr[23], cpu_.fpscr);
     if (!descriptor->dispatch(&cpu_, dispatch_pc)) {
       // Runtime-loaded RELs live at OSLink-selected addresses that are not part
       // of main.dol. Translate that live PC to the secondary module's stable

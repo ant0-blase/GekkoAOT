@@ -54,8 +54,11 @@ int main() {
   CHECK(TranslatePage(memory, ea, segment | 0x80000000, table, false, PageAccess::Read).status == Status::DirectStore);
   CHECK(TranslatePage(memory, ea, segment, 0x10002, false, PageAccess::Read).status == Status::InvalidTable);
   CHECK(TranslatePage(memory, ea, segment, 0x10001, false, PageAccess::Read).status == Status::InvalidTable);
-  CHECK(TranslatePage(memory, ea, segment, 0x1800000, false, PageAccess::Read).status == Status::InvalidTable);
-  CHECK(memory.Mem1().size() == 24u * 1024 * 1024);
+  // The 24..32 MiB compatibility tail is physically backed like Dolphin's GC RAM aperture.
+  CHECK(TranslatePage(memory, ea, segment, 0x1800000, false, PageAccess::Read).status != Status::InvalidTable);
+  CHECK(TranslatePage(memory, ea, segment, 0x2000000, false, PageAccess::Read).status == Status::InvalidTable);
+  CHECK(memory.Mem1().size() == AddressSpace::CompatMem1BackingSize);
+  CHECK(AddressSpace::ReportedMem1Size() == 24u * 1024u * 1024u);
   auto runtime = std::make_unique<HostRuntime>();
   auto& cpu = runtime->Cpu();
   auto& ram = runtime->Memory();
@@ -118,6 +121,7 @@ int main() {
   CHECK(HardwareTestAccess::Execute(*runtime, 0x300));
   cpu.instruction_fallback(&cpu, 0x80640000, cpu.pc); // unsupported fallback must unwind AOT
   CHECK((cpu.exception & 0x80000000u) != 0);
-  CHECK(ram.Mem1().size() == 0x1800000);
+  CHECK(ram.Mem1().size() == AddressSpace::CompatMem1BackingSize);
+  CHECK(AddressSpace::ReportedMem1Size() == 0x1800000u);
   std::cout << "VM hashed pages/protection/history/bounds/DSI/RFI tests passed\n";
 }

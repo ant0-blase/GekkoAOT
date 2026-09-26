@@ -114,6 +114,25 @@ void TestReceivers() {
   CHECK(f.Word(kOutLow) == 0u);
 }
 
+
+void TestReadyPriorityMutationPreempts() {
+  Fixture f;
+
+  // Keep the current thread at priority 16 and place an equal-priority peer in
+  // the READY set.  Resuming an equal-priority thread must not preempt.
+  f.Word(kMain + 0x2d0u, 16u);
+  f.Word(kMain + 0x2d4u, 16u);
+  f.Call(Kind::CreateThread, kLow, 0x800b0000u, 0u, 0x80071000u, 0x1000u, 16u, 0u);
+  CHECK(f.cpu.gpr[3] == 1u);
+  f.Call(Kind::ResumeThread, kLow);
+  CHECK(f.Word(kCurrentThread) == kMain);
+
+  // Lowering the READY peer to priority 15 must refresh the host ready-cache
+  // immediately and trigger the same preemption as retail SelectThread(0).
+  f.Call(Kind::SetThreadPriority, kLow, 15u);
+  CHECK(f.Word(kCurrentThread) == kLow);
+}
+
 void TestSenders() {
   Fixture f;
   f.PrepareQueueAndThreads();
@@ -133,6 +152,7 @@ void TestSenders() {
 
 int main() {
   TestReceivers();
+  TestReadyPriorityMutationPreempts();
   TestSenders();
   std::cout << "OS message receiver/sender priority tests passed\n";
 }

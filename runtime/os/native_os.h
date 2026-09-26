@@ -69,6 +69,12 @@ enum class Kind : std::uint8_t {
   DisableInterrupts,
   EnableInterrupts,
   RestoreInterrupts,
+  // v144 additions are appended to keep all pre-v144 direct-token IDs stable.
+  LoadFpuContext,
+  SaveFpuContext,
+  FillFpuContext,
+  GetStackPointer,
+  SwitchStack,
   Count,
 };
 
@@ -99,6 +105,11 @@ inline const char* Name(Kind kind) {
   case Kind::InitContext: return "OSInitContext";
   case Kind::GetCurrentContext: return "OSGetCurrentContext";
   case Kind::SetCurrentContext: return "OSSetCurrentContext";
+  case Kind::LoadFpuContext: return "OSLoadFPUContext";
+  case Kind::SaveFpuContext: return "OSSaveFPUContext";
+  case Kind::FillFpuContext: return "OSFillFPUContext";
+  case Kind::GetStackPointer: return "OSGetStackPointer";
+  case Kind::SwitchStack: return "OSSwitchStack";
   case Kind::InitMutex: return "OSInitMutex";
   case Kind::LockMutex: return "OSLockMutex";
   case Kind::UnlockMutex: return "OSUnlockMutex";
@@ -137,6 +148,12 @@ class Service {
   static constexpr std::uint32_t kMsrRI = 0x00000002u;
   static constexpr std::uint32_t kMsrRfiMask = 0x87c0ffffu;
   static constexpr std::uint32_t kMsrPow = 0x00040000u;
+  // HostRuntime global-indirect service token used by generated AOT modules.
+  // NativeOS uses the same route for guest thread-switch callbacks so the
+  // callback may live in the main DOL, a fixed overlay, or a linked REL.
+  static constexpr std::uint32_t kGlobalIndirectProbe = 0xfffffff9u;
+  static constexpr std::uint32_t kSwitchCallbackReturnPc = 0xfffffff8u;
+  static constexpr std::uint8_t kGlobalIndirectPending = 0xfcu;
 
   // SelectThread() in Dolphin OS switches to a dedicated IdleContext when no
   // runnable OSThread exists, enables EE and spins until an interrupt makes a
@@ -208,6 +225,18 @@ class Service {
 
   std::vector<std::uint32_t> known_threads_;
   std::vector<std::uint32_t> ready_;
+  // v135: host-side priority mirror kept index-aligned with ready_. PeekNext
+  // validates only the selected candidate in guest RAM instead of re-reading
+  // every runnable OSThread on every scheduler poll.
+  std::vector<std::int32_t> ready_priorities_;
+  // v136: O(1) common-path scheduler selection. The ready vector remains the
+  // ABI-order-preserving source of truth, while this tiny cache remembers the
+  // current minimum-priority entry. It is invalidated only when the cached
+  // winner is removed or its priority becomes worse, so repeated PeekNext()
+  // calls no longer rescan the complete host run queue.
+  std::uint32_t ready_best_thread_ = 0;
+  std::int32_t ready_best_priority_ = 32;
+  bool ready_best_valid_ = false;
   struct FpShadow {
     std::uint32_t context = 0;
     std::array<double, 32> fpr{};
@@ -251,6 +280,12 @@ class Service {
   // restores the interrupted OSThread context.
   bool reschedule_pending_ = false;
   bool initialized_ = false;
+  // Retail OSThread owns a guest function pointer named SwitchThreadCallback.
+  // It is not a low-memory ABI global, so recover its r13-relative SDA slot
+  // lazily from the original SDK code instead of hard-coding a game address.
+  std::optional<std::int16_t> switch_callback_sda_offset_;
+  bool switch_callback_scan_done_ = false;
+  bool switch_callback_active_ = false;
 
   static std::uint16_t ReadBE16(const std::uint8_t* p) {
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) | p[1]);
@@ -345,6 +380,60 @@ class Service {
     std::copy_n(shadow->fpr.begin(), 32, state->fpr);
     std::copy_n(shadow->ps1.begin(), 32, state->ps1);
     state->fpscr = shadow->fpscr;
+    return true;
+  }
+
+  // The original SDK owns one physical Gekko FPU register file and lazily
+  // transfers it between OSContexts through the FP-unavailable exception.
+  // Native AOT code has no host hardware trap for MSR[FP], so an interrupt
+  // callback can otherwise execute FP/paired-single code directly on top of
+  // the interrupted thread's live registers.  That is especially damaging
+  // for render code: matrices and vertex transforms survive in FPR/PS lanes
+  // across VI/GX callbacks and become corrupted without an ownership barrier.
+  //
+  // These helpers reproduce the *observable* SDK context payload.  The host
+  // shadow remains the fast path for contexts whose lazy payload has never
+  // been materialized in guest RAM.
+  bool SaveFpuPayload(CPUState* state, std::uint32_t context, bool mark_saved) {
+    auto* out = Ptr(state, context, kCtxSize);
+    if (!out) return false;
+    for (unsigned i = 0; i < 32; ++i)
+      WriteBE64(out + kCtxFpr + i * 8, DoubleBits(state->fpr[i]));
+    WriteBE32(out + kCtxFpscr, state->fpscr);
+    for (unsigned i = 0; i < 32; ++i)
+      WriteBE64(out + kCtxPsf + i * 8, DoubleBits(state->ps1[i]));
+    if (mark_saved) {
+      auto context_state = ReadBE16(out + kCtxState);
+      WriteBE16(out + kCtxState, static_cast<std::uint16_t>(context_state | 1u));
+    }
+    SaveFpShadow(state, context);
+    return true;
+  }
+
+  bool LoadFpuPayload(CPUState* state, std::uint32_t context) {
+    auto* in = Ptr(state, context, kCtxSize);
+    if (!in) return false;
+    const auto context_state = ReadBE16(in + kCtxState);
+    if ((context_state & 1u) == 0) return true;
+    for (unsigned i = 0; i < 32; ++i)
+      state->fpr[i] = BitsDouble(ReadBE64(in + kCtxFpr + i * 8));
+    state->fpscr = ReadBE32(in + kCtxFpscr);
+    for (unsigned i = 0; i < 32; ++i)
+      state->ps1[i] = BitsDouble(ReadBE64(in + kCtxPsf + i * 8));
+    SaveFpShadow(state, context);
+    return true;
+  }
+
+  bool RestoreContextFpu(CPUState* state, std::uint32_t context) {
+    const auto* in = Ptr(state, context, kCtxSize);
+    if (!in) return false;
+    if ((ReadBE16(in + kCtxState) & 1u) != 0)
+      return LoadFpuPayload(state, context);
+    // A freshly-cleared exception context deliberately has no saved FPU
+    // payload.  In that case the Gekko would inherit the physical registers
+    // until/if it takes FP-unavailable; leave the current live values intact
+    // unless this context has previously acquired a host shadow.
+    RestoreFpShadow(state, context);
     return true;
   }
 
@@ -514,6 +603,23 @@ class Service {
 
   bool ApplyCurrentContext(CPUState* state, std::uint32_t context) {
     if (!state || !Ptr(state, context, kCtxSize)) return false;
+
+    std::uint32_t previous = 0;
+    if (!Read32(state, kCurrentContext, &previous)) return false;
+
+    // Native-AOT equivalent of the SDK's lazy FP-unavailable ownership
+    // boundary.  On hardware OSSetCurrentContext merely clears MSR[FP] and a
+    // later FP instruction traps, at which point the old owner's FPR/PS state
+    // is saved and the new context is loaded.  Recompiled host FP instructions
+    // cannot generate that Gekko trap, so perform the transfer eagerly at the
+    // same OSContext boundary.  Do NOT change 0x800000D8 here: guest-visible
+    // FPU ownership retains the retail lazy semantics; this is only the native
+    // register-file isolation required to make those semantics observable.
+    if (previous != 0u && previous != context)
+      SaveFpShadow(state, previous);
+
+    if (previous != context && !RestoreContextFpu(state, context)) return false;
+
     std::uint32_t owner = 0, saved_msr = 0;
     if (!Read32(state, kFpuContext, &owner) ||
         !Read32(state, context + kCtxSrr1, &saved_msr) ||
@@ -532,7 +638,183 @@ class Service {
     }
     Write32(state, context + kCtxSrr1, saved_msr);
     state->msr |= kMsrRI;
+
+    static unsigned fp_barrier_logs = 0u;
+    if (previous != context && fp_barrier_logs++ < 32u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_NATIVE_OS_FP_CONTEXT_BARRIER_V144=1 old=%08x new=%08x owner=%08x saved=%u shadow=%u\n",
+                   previous, context, owner,
+                   (ReadBE16(Ptr(state, context, kCtxSize) + kCtxState) & 1u) ? 1u : 0u,
+                   FindFpShadow(context) && FindFpShadow(context)->valid ? 1u : 0u);
     return true;
+  }
+
+  std::optional<std::int16_t> DiscoverSwitchCallbackSdaOffset(CPUState* state) {
+    if (switch_callback_scan_done_) return switch_callback_sda_offset_;
+    switch_callback_scan_done_ = true;
+    if (!state) return std::nullopt;
+
+    const auto select_pc = Entrypoint(Kind::SelectThread);
+    const auto get_current_pc = Entrypoint(Kind::GetCurrentThread);
+    if (!select_pc) return std::nullopt;
+
+    // In retail DOL SDKs __OSSwitchThread sits in the same OSThread object just
+    // before SelectThread.  Both it and SelectThread's idle path invoke the same
+    // SwitchThreadCallback through an r13-relative function-pointer load.  Scan
+    // only that local cluster and require the same SDA displacement twice. This
+    // makes the recovery revision/address independent while failing closed on a
+    // compiler layout we do not understand.
+    std::uint32_t begin = get_current_pc ? std::min(get_current_pc, select_pc) : select_pc;
+    begin = begin > 0x200u ? begin - 0x200u : 0u;
+    const std::uint32_t end = select_pc + 0x400u;
+    std::unordered_map<std::int16_t, unsigned> hits;
+
+    const auto read_word = [&](std::uint32_t pc, std::uint32_t* out) -> bool {
+      const auto* code = Ptr(state, pc, 4u);
+      if (!code || !out) return false;
+      *out = ReadBE32(code);
+      return true;
+    };
+    const auto decode_mtctr = [](std::uint32_t word, unsigned* rs) -> bool {
+      if ((word >> 26) != 31u || ((word >> 1) & 0x3ffu) != 467u) return false;
+      const auto spr = ((word >> 16) & 0x1fu) | (((word >> 11) & 0x1fu) << 5);
+      if (spr != 9u) return false; // CTR
+      if (rs) *rs = (word >> 21) & 0x1fu;
+      return true;
+    };
+    const auto decode_lwz_sda = [](std::uint32_t word, unsigned rt,
+                                   std::int16_t* displacement) -> bool {
+      if ((word >> 26) != 32u) return false; // lwz
+      if (((word >> 21) & 0x1fu) != rt || ((word >> 16) & 0x1fu) != 13u) return false;
+      if (displacement) *displacement = static_cast<std::int16_t>(word & 0xffffu);
+      return true;
+    };
+
+    for (std::uint32_t pc = begin; pc + 4u <= end; pc += 4u) {
+      std::uint32_t word = 0;
+      if (!read_word(pc, &word) || word != 0x4e800421u) continue; // bctrl
+
+      unsigned ctr_source = 0;
+      std::uint32_t mtctr_pc = 0;
+      for (unsigned back = 1; back <= 8 && pc >= begin + back * 4u; ++back) {
+        std::uint32_t candidate = 0;
+        const auto candidate_pc = pc - back * 4u;
+        if (read_word(candidate_pc, &candidate) && decode_mtctr(candidate, &ctr_source)) {
+          mtctr_pc = candidate_pc;
+          break;
+        }
+      }
+      if (!mtctr_pc) continue;
+
+      for (unsigned back = 1; back <= 10 && mtctr_pc >= begin + back * 4u; ++back) {
+        std::uint32_t candidate = 0;
+        std::int16_t displacement = 0;
+        if (!read_word(mtctr_pc - back * 4u, &candidate)) continue;
+        if (decode_lwz_sda(candidate, ctr_source, &displacement)) {
+          ++hits[displacement];
+          break;
+        }
+      }
+    }
+
+    std::optional<std::int16_t> best;
+    unsigned best_hits = 0;
+    bool tied = false;
+    for (const auto& [offset, count] : hits) {
+      if (count > best_hits) {
+        best = offset;
+        best_hits = count;
+        tied = false;
+      } else if (count == best_hits && count != 0u) {
+        tied = true;
+      }
+    }
+    if (!best || best_hits < 2u || tied) {
+      std::fprintf(stderr,
+                   "GEKKOAOT_NATIVE_OS_SWITCH_CALLBACK_V152=0 reason=sda-pattern-unresolved candidates=%zu best_hits=%u\n",
+                   hits.size(), best_hits);
+      return std::nullopt;
+    }
+
+    switch_callback_sda_offset_ = best;
+    const auto slot = state->gpr[13] + static_cast<std::int32_t>(*best);
+    std::uint32_t callback = 0;
+    Read32(state, slot, &callback);
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_OS_SWITCH_CALLBACK_V152=1 sda_offset=%d slot=%08x callback=%08x source=retail-osthread-indirect-call-pair\n",
+                 static_cast<int>(*best), slot, callback);
+    return switch_callback_sda_offset_;
+  }
+
+  bool InvokeSwitchThreadCallback(CPUState* state, std::uint32_t from,
+                                  std::uint32_t to) {
+    if (!state || switch_callback_active_) return state != nullptr;
+    const auto offset = DiscoverSwitchCallbackSdaOffset(state);
+    if (!offset) return true; // SDK revision without a proven callback slot.
+
+    const auto slot = state->gpr[13] + static_cast<std::int32_t>(*offset);
+    std::uint32_t callback = 0;
+    if (!Read32(state, slot, &callback) || callback == 0u) return true;
+    if ((callback & 3u) != 0u || !Ptr(state, callback, 4u)) {
+      static unsigned invalid_logs = 0u;
+      if (invalid_logs++ < 8u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_NATIVE_OS_SWITCH_CALLBACK_V152=0 reason=invalid-target target=%08x slot=%08x\n",
+                     callback, slot);
+      return false;
+    }
+    if (!state->host_call) return false;
+
+    const auto saved_pc = state->pc;
+    const auto saved_lr = state->lr;
+    const auto saved_external_addr = state->external_addr;
+    const auto saved_external_value = state->external_value;
+    const auto saved_external_rid = state->external_rid;
+    const auto restore_host_scratch = [&]() {
+      state->external_addr = saved_external_addr;
+      state->external_value = saved_external_value;
+      state->external_rid = saved_external_rid;
+      state->lr = saved_lr;
+      state->pc = saved_pc;
+    };
+
+    // OSSetCurrentThread invokes the callback *before* publishing the new
+    // __OSCurrentThread. Re-enter the already compiled guest callback through
+    // HostRuntime's global AOT router and use an unmapped LR as a private
+    // return sentinel. Re-dispatch after host/HLE boundaries until the callback
+    // actually returns; this is required for JKRThreadSwitch::callback, which
+    // calls into heap code and may cross ordinary module/HLE boundaries.
+    switch_callback_active_ = true;
+    state->gpr[3] = from;
+    state->gpr[4] = to;
+    state->lr = kSwitchCallbackReturnPc;
+    state->pc = callback;
+
+    bool completed = false;
+    for (unsigned step = 0; step < 4096u; ++step) {
+      if (state->pc == kSwitchCallbackReturnPc) {
+        completed = true;
+        break;
+      }
+      if (state->exception != 0u || state->pc == 0u) break;
+
+      const auto target = state->pc;
+      state->external_addr = target;
+      state->external_value = target;
+      state->external_rid = kGlobalIndirectPending;
+      if (!state->host_call(state, kGlobalIndirectProbe)) break;
+      if (state->pc == target && state->exception == 0u) break;
+    }
+    switch_callback_active_ = false;
+
+    static unsigned callback_logs = 0u;
+    if (callback_logs++ < 64u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_NATIVE_OS_SWITCH_CALLBACK_V152=%u from=%08x to=%08x target=%08x end_pc=%08x\n",
+                   completed ? 1u : 0u, from, to, callback, state->pc);
+
+    restore_host_scratch();
+    return completed;
   }
 
   bool EnterIdle(CPUState* state) {
@@ -544,6 +826,7 @@ class Service {
     // current OSContext for asynchronous exception save state, and EE enabled
     // while waiting for a hardware interrupt to make a thread runnable.
     std::fill_n(idle_context, kCtxSize, std::uint8_t{0});
+    if (!InvokeSwitchThreadCallback(state, current_thread_, 0u)) return false;
     if (!Write32(state, kCurrentThread, 0) ||
         !ApplyCurrentContext(state, kHostIdleContext))
       return false;
@@ -655,8 +938,62 @@ class Service {
     return false;
   }
 
+  void InvalidateReadyBest() {
+    ready_best_thread_ = 0;
+    ready_best_priority_ = 32;
+    ready_best_valid_ = false;
+  }
+  void RebuildReadyBest() {
+    if (ready_.empty()) {
+      InvalidateReadyBest();
+      return;
+    }
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < ready_priorities_.size(); ++i) {
+      if (ready_priorities_[i] < ready_priorities_[best]) best = i;
+    }
+    ready_best_thread_ = ready_[best];
+    ready_best_priority_ = ready_priorities_[best];
+    ready_best_valid_ = true;
+  }
   void RemoveReady(std::uint32_t thread) {
-    ready_.erase(std::remove(ready_.begin(), ready_.end(), thread), ready_.end());
+    bool removed_best = false;
+    for (std::size_t i = 0; i < ready_.size();) {
+      if (ready_[i] != thread) {
+        ++i;
+        continue;
+      }
+      removed_best |= ready_best_valid_ && ready_best_thread_ == thread;
+      ready_.erase(ready_.begin() + static_cast<std::ptrdiff_t>(i));
+      ready_priorities_.erase(ready_priorities_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    if (removed_best) InvalidateReadyBest();
+  }
+  void CacheReady(std::uint32_t thread, std::int32_t priority) {
+    for (std::size_t i = 0; i < ready_.size(); ++i) {
+      if (ready_[i] != thread) continue;
+      const auto old_priority = ready_priorities_[i];
+      if (old_priority == priority) return;
+      ready_priorities_[i] = priority;
+      if (ready_best_valid_ && ready_best_thread_ == thread) {
+        if (priority <= ready_best_priority_)
+          ready_best_priority_ = priority;
+        else
+          InvalidateReadyBest();
+      } else if (!ready_best_valid_ || priority < ready_best_priority_) {
+        ready_best_thread_ = thread;
+        ready_best_priority_ = priority;
+        ready_best_valid_ = true;
+      }
+      return;
+    }
+    ready_.push_back(thread);
+    ready_priorities_.push_back(priority);
+    if (!ready_best_valid_ || priority < ready_best_priority_) {
+      ready_best_thread_ = thread;
+      ready_best_priority_ = priority;
+      ready_best_valid_ = true;
+    }
   }
   bool AddReady(CPUState* state, std::uint32_t thread) {
     if (!thread || !Ptr(state, thread, kThreadSize)) return false;
@@ -670,8 +1007,7 @@ class Service {
       RemoveReady(thread);
       return false;
     }
-    if (std::find(ready_.begin(), ready_.end(), thread) == ready_.end())
-      ready_.push_back(thread);
+    CacheReady(thread, Priority(state, thread));
     return true;
   }
   // GEKKOAOT_NATIVE_OS_GUEST_READY_IMPORT_V19: import runnable guest threads
@@ -696,9 +1032,10 @@ class Service {
       const auto thread_state = snapshot->state;
       RememberThread(thread);
       if (thread != current_thread_ && thread_state == kThreadReady &&
-          snapshot->suspend <= 0 &&
-          std::find(ready_.begin(), ready_.end(), thread) == ready_.end())
-        ready_.push_back(thread);
+          snapshot->suspend <= 0)
+        CacheReady(thread, snapshot->priority);
+      else
+        RemoveReady(thread);
       return true;
     };
 
@@ -708,9 +1045,9 @@ class Service {
       active_head_cache_ = head;
       active_head_valid_ = true;
     }
+    std::array<std::uint32_t, 256> seen{};
+    unsigned seen_count = 0;
     if (have_head && head) {
-      std::array<std::uint32_t, 256> seen{};
-      unsigned seen_count = 0;
       auto cursor = head;
       std::uint32_t previous = 0;
       for (unsigned depth = 0; cursor && depth < seen.size(); ++depth) {
@@ -725,16 +1062,20 @@ class Service {
       }
     }
 
-    // Keep host-created/previously-seen threads authoritative too. This covers
-    // the short window before a title has linked a freshly-created thread into
-    // its active list and lets idle wakeups observe state changes immediately.
+    // Keep host-created/previously-seen threads authoritative too. Threads
+    // already visited through the ABI active list do not need a second full
+    // OSThread snapshot in the same reconciliation pass.
     for (const auto thread : known_threads_) {
-      if (thread == current_thread_) continue;
+      if (thread == current_thread_ ||
+          std::find(seen.begin(), seen.begin() + seen_count, thread) !=
+              seen.begin() + seen_count)
+        continue;
       ThreadReadySnapshot snapshot{};
       if (ReadReadySnapshot(state, thread, &snapshot) &&
-          snapshot.state == kThreadReady && snapshot.suspend <= 0 &&
-          std::find(ready_.begin(), ready_.end(), thread) == ready_.end())
-        ready_.push_back(thread);
+          snapshot.state == kThreadReady && snapshot.suspend <= 0)
+        CacheReady(thread, snapshot.priority);
+      else
+        RemoveReady(thread);
     }
   }
 
@@ -754,28 +1095,38 @@ class Service {
         if (ready_.size() != before) ++ready_compactions_;
         return;
       }
-      if (std::find(ready_.begin(), ready_.end(), thread) == ready_.end())
-        ready_.push_back(thread);
+      CacheReady(thread, snapshot.priority);
       return;
     }
   }
 
   void MaybeReconcileGuestReady(CPUState* state) {
     if (!state) return;
-    constexpr std::uint64_t kFullAuditPeriod = 32u;
+    // NativeOS HLE mirrors every ordinary SDK run-queue transition directly
+    // into ready_. Guest-memory auditing therefore protects unusual wrappers
+    // and hand-written OS manipulation; it does not need to execute on every
+    // cooperative scheduler query. v135 still performed at least one guest
+    // pointer walk per PeekNext(), which became the dominant runtime hotspot.
+    constexpr std::uint64_t kActiveAuditPeriod = 128u;
+    constexpr std::uint64_t kIdleAuditPeriod = 32u;
+    constexpr std::uint64_t kFullAuditPeriod = 4096u;
     ++ready_peek_calls_;
 
-    // The SDK inserts newly created OSThreads into the active list; a changed
-    // head is therefore an immediate structural invalidation. Between those
-    // events, NativeOS' HLE paths already mirror state transitions into ready_.
-    // Probe one known thread per PeekNext to observe guest-only wrappers, and
-    // still perform a full ABI-authoritative walk at a bounded cadence. This
-    // preserves scheduling semantics while removing the O(thread-count) walk
-    // from every host scheduler poll.
+    // The first scheduler query must import the SDK active list immediately.
+    if (!active_head_valid_) {
+      ReconcileGuestReady(state);
+      return;
+    }
+
+    const std::uint64_t audit_period = scheduler_idle_ ? kIdleAuditPeriod : kActiveAuditPeriod;
+    if ((ready_peek_calls_ % audit_period) != 0u) {
+      ++ready_reconcile_skips_;
+      return;
+    }
+
     std::uint32_t head = 0;
     const bool have_head = Read32(state, kActiveThreadHead, &head);
-    const bool structural_change = !have_head || !active_head_valid_ ||
-                                   head != active_head_cache_;
+    const bool structural_change = !have_head || head != active_head_cache_;
     const bool periodic = (ready_peek_calls_ % kFullAuditPeriod) == 0u;
     if (structural_change || periodic) {
       ReconcileGuestReady(state);
@@ -789,31 +1140,18 @@ class Service {
     if (!logged) {
       logged = true;
       std::fprintf(stderr,
-                   "GEKKOAOT_NATIVE_OS_READY_AUDIT_V86=1 full-period=%llu structural=head-change incremental=round-robin semantics=priority-preserved\n",
+                   "GEKKOAOT_NATIVE_OS_READY_AUDIT_V136=1 active-period=%llu idle-period=%llu full-period=%llu common-path=host-cache candidate-validation=amortized\n",
+                   static_cast<unsigned long long>(kActiveAuditPeriod),
+                   static_cast<unsigned long long>(kIdleAuditPeriod),
                    static_cast<unsigned long long>(kFullAuditPeriod));
     }
   }
 
   std::uint32_t PeekNext(CPUState* state) {
     MaybeReconcileGuestReady(state);
-    std::uint32_t best = 0;
-    std::int32_t best_priority = std::numeric_limits<std::int32_t>::max();
-    for (std::size_t i = 0; i < ready_.size();) {
-      const auto thread = ready_[i];
-      ThreadReadySnapshot snapshot{};
-      if (!ReadReadySnapshot(state, thread, &snapshot) || snapshot.suspend > 0 ||
-          snapshot.state != kThreadReady) {
-        ready_.erase(ready_.begin() + static_cast<std::ptrdiff_t>(i));
-        ++ready_compactions_;
-        continue;
-      }
-      if (!best || snapshot.priority < best_priority) {
-        best = thread;
-        best_priority = snapshot.priority;
-      }
-      ++i;
-    }
-    return best;
+    if (ready_.empty()) return 0u;
+    if (!ready_best_valid_) RebuildReadyBest();
+    return ready_best_thread_;
   }
   std::uint32_t PopNext(CPUState* state) {
     const auto next = PeekNext(state); if (next) RemoveReady(next); return next;
@@ -895,6 +1233,12 @@ class Service {
   bool SetCurrent(CPUState* state, std::uint32_t next) {
     if (!next || !Ptr(state, next, kThreadSize)) return false;
     const bool was_idle = scheduler_idle_;
+
+    // Retail OSSetCurrentThread invokes SwitchThreadCallback(old, next) before
+    // publishing __OSCurrentThread. MKDD's JKRThreadSwitch uses this callback to
+    // save/restore the per-thread JKRHeap; skipping it can make render/resource
+    // work execute under the wrong heap even though the OSContext itself is valid.
+    if (!InvokeSwitchThreadCallback(state, current_thread_, next)) return false;
 
     // Retail SelectThread publishes the chosen OSThread/current OSContext before
     // tail-calling OSLoadContext.  Keep the same ordering so low-memory queries
@@ -1240,11 +1584,21 @@ class Service {
 public:
   static Service& Get() { static Service service; return service; }
 
+  // v137 compatibility backstop for AOT-only wait loops. The normal scheduler
+  // uses the O(1) host ready cache and amortized audits; a runtime-detected
+  // tight guest spin may request one immediate guest-RAM reconciliation before
+  // continuing. This is rare and keeps the fast path unchanged.
+  void ForceReconcileGuestReady(CPUState* state) {
+    if (state) ReconcileGuestReady(state);
+  }
+
   void Reset() {
-    known_threads_.clear(); ready_.clear(); wait_queues_.clear(); pending_sends_.clear();
+    known_threads_.clear(); ready_.clear(); ready_priorities_.clear(); wait_queues_.clear(); pending_sends_.clear();
     pending_receives_.clear(); pending_cond_.clear(); entrypoints_.fill(0); alarms_.clear();
     fp_shadows_.clear();
     if (known_threads_.capacity() < 32) known_threads_.reserve(32);
+    if (ready_.capacity() < 32) ready_.reserve(32);
+    if (ready_priorities_.capacity() < 32) ready_priorities_.reserve(32);
     if (fp_shadows_.capacity() < 32) fp_shadows_.reserve(32);
     entrypoint_addresses_.clear(); entrypoint_pages_.fill(0);
     alarm_return_ = {}; current_thread_ = 0; scheduler_disable_ = 0; switches_ = 0;
@@ -1253,6 +1607,7 @@ public:
     ready_snapshot_reads_ = 0; ready_compactions_ = 0; ready_peek_calls_ = 0;
     thread_sanity_rejects_ = 0; active_link_faults_ = 0;
     active_head_cache_ = 0; ready_probe_cursor_ = 0; active_head_valid_ = false;
+    InvalidateReadyBest();
     scheduler_idle_ = false; reschedule_pending_ = false; initialized_ = false;
   }
 
@@ -1323,6 +1678,8 @@ public:
     case Kind::LoadContext:
     case Kind::ClearContext:
     case Kind::InitContext:
+    case Kind::GetStackPointer:
+    case Kind::SwitchStack:
     case Kind::DisableInterrupts:
     case Kind::EnableInterrupts:
     case Kind::RestoreInterrupts:
@@ -1401,6 +1758,15 @@ public:
       if (!InitializeContext(state, state->gpr[3], state->gpr[4], state->gpr[5]))
         return false;
       ReturnVoid(state);
+      return true;
+    }
+    case Kind::GetStackPointer:
+      ReturnU32(state, state->gpr[1]);
+      return true;
+    case Kind::SwitchStack: {
+      const auto old_sp = state->gpr[1];
+      state->gpr[1] = state->gpr[3];
+      ReturnU32(state, old_sp);
       return true;
     }
     case Kind::DisableInterrupts: {
@@ -1628,9 +1994,33 @@ public:
       Write32(state, thread + kThreadBase, static_cast<std::uint32_t>(priority));
       Write32(state, thread + kThreadPriority, static_cast<std::uint32_t>(priority));
 
-      // NativeOS keeps ready queues host-side, so changing the ABI-visible
-      // priority is enough for PeekNext(). Waiting queues, however, are SDK
-      // priority ordered; keep their host mirror in the same order too.
+      // v138: PeekNext() is O(1) and therefore no longer re-reads every READY
+      // OSThread priority from guest RAM.  OSSetThreadPriority must update the
+      // host ready mirror in the same transaction as the ABI-visible fields.
+      // Without this, a READY thread changed 16 -> 15 remains cached as 16 and
+      // the immediate MaybePreempt() below can incorrectly decline the switch.
+      // HPSS exposes exactly this SDK sequence during boot, but the rule is
+      // universal for every title using OSSetThreadPriority on a READY thread.
+      std::uint32_t suspend_raw = 0;
+      const bool have_suspend = Read32(state, thread + kThreadSuspend, &suspend_raw);
+      const auto thread_state = ThreadState(state, thread);
+      if (thread != current_thread_ && thread_state == kThreadReady &&
+          have_suspend && static_cast<std::int32_t>(suspend_raw) <= 0) {
+        CacheReady(thread, priority);
+        static bool ready_priority_v138_logged = false;
+        if (!ready_priority_v138_logged) {
+          ready_priority_v138_logged = true;
+          std::fprintf(stderr,
+                       "GEKKOAOT_NATIVE_OS_READY_PRIORITY_V138=1 policy=set-priority-atomic-ready-cache\n");
+        }
+      } else {
+        // The running thread is never a READY candidate; likewise discard a
+        // stale mirror entry for suspended/waiting/moribund threads.
+        RemoveReady(thread);
+      }
+
+      // Waiting queues are SDK priority ordered; keep their host mirror in the
+      // same order too.
       std::uint32_t queue = 0;
       if (Read32(state, thread + kThreadQueue, &queue) && queue) {
         auto it = wait_queues_.find(queue);
@@ -1693,6 +2083,32 @@ public:
       // with OSSetCurrentContext near the end of the handler. This is the first
       // safe point at which the deferred SDK reschedule may actually switch.
       if (ctx == current_thread_ && reschedule_pending_) MaybePreempt(state);
+      return true;
+    }
+    case Kind::LoadFpuContext: {
+      if (!LoadFpuPayload(state, state->gpr[3])) return false;
+      ReturnVoid(state);
+      return true;
+    }
+    case Kind::SaveFpuContext: {
+      if (!SaveFpuPayload(state, state->gpr[3], true)) return false;
+      ReturnVoid(state);
+      return true;
+    }
+    case Kind::FillFpuContext: {
+      // Retail OSFillFPUContext serializes the register file but does not set
+      // OS_CONTEXT_STATE_FPSAVED itself. Preserve that distinction.
+      if (!SaveFpuPayload(state, state->gpr[3], false)) return false;
+      ReturnVoid(state);
+      return true;
+    }
+    case Kind::GetStackPointer:
+      ReturnU32(state, state->gpr[1]);
+      return true;
+    case Kind::SwitchStack: {
+      const auto old_sp = state->gpr[1];
+      state->gpr[1] = state->gpr[3];
+      ReturnU32(state, old_sp);
       return true;
     }
     case Kind::InitMutex: {

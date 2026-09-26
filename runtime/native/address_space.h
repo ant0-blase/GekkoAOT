@@ -19,12 +19,18 @@ public:
   // MMU needs a host-backed compatibility window instead of treating it as
   // device MMIO.
   static constexpr std::uint32_t FakeVmemBase = 0x7e000000u;
+  // Retail software is told that MEM1 is 24 MiB, but the Gekko physical RAM
+  // aperture spans 0x00000000..0x01ffffff. Dolphin deliberately keeps the
+  // whole 32 MiB aperture host-backed while reporting 24 MiB through lowmem.
+  // A few retail titles speculatively touch the normally-unpopulated tail;
+  // making it addressable avoids turning those accesses into fake MMIO/faults.
   static constexpr std::uint32_t RetailMem1Size = 0x01800000u;
+  static constexpr std::uint32_t CompatMem1BackingSize = 0x02000000u;
   static constexpr std::uint32_t RetailMem2Size = 0x04000000u;
   static constexpr std::uint32_t RetailFakeVmemSize = 0x02000000u;
 
   explicit AddressSpace(bool enable_mem2 = false)
-      : mem1_(RetailMem1Size), mem2_(enable_mem2 ? RetailMem2Size : 0u),
+      : mem1_(CompatMem1BackingSize), mem2_(enable_mem2 ? RetailMem2Size : 0u),
         fake_vmem_(RetailFakeVmemSize) {}
 
   AddressSpace(std::size_t mem1_size, std::size_t mem2_size)
@@ -32,6 +38,7 @@ public:
 
   std::span<std::uint8_t> Mem1() { return mem1_; }
   std::span<const std::uint8_t> Mem1() const { return mem1_; }
+  static constexpr std::uint32_t ReportedMem1Size() { return RetailMem1Size; }
   std::span<std::uint8_t> Mem2() { return mem2_; }
   std::span<const std::uint8_t> Mem2() const { return mem2_; }
   std::span<std::uint8_t> FakeVmem() { return paged_vmem_ ? std::span<std::uint8_t>{} : fake_vmem_; }

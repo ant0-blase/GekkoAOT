@@ -29,7 +29,7 @@ index e618bc2..9aea047 100644
 +// column "context-capture".  Keep the compiler generic: the manifest owns the
 +// policy and DolRecomp merely turns that class into an ABI requirement.
 +struct StaticContextCaptureEntry {
-+  u32 address = 0;
++  u32 address = 0; bool fullFp = false;
 +};
 +
 +void AddMaskBit(u64 *mask, DolIRStateSlot slot) {
@@ -37,7 +37,7 @@ index e618bc2..9aea047 100644
 +  mask[value / 64u] |= 1ull << (value & 63u);
 +}
 +
-+void AddContextCaptureInputs(DolLLVMFunctionRange &range) {
++void AddContextCaptureInputs(DolLLVMFunctionRange &range, bool fullFp) {
 +  // Retail OSSaveContext preserves the stack/TOC, r3's staged return value,
 +  // nonvolatile integer state, control state and GQRs.  GekkoAOT's host FP
 +  // shadow also preserves the nonvolatile FP/paired-single bank.  These are
@@ -58,7 +58,7 @@ index e618bc2..9aea047 100644
 +  for (u32 reg = 1; reg < 8; ++reg)
 +    AddMaskBit(range.input_state,
 +               static_cast<DolIRStateSlot>(DOLIR_STATE_GQR0 + reg));
-+  for (u32 reg = 14; reg < 32; ++reg) {
++  for (u32 reg = fullFp ? 0u : 14u; reg < 32; ++reg) {
 +    AddMaskBit(range.input_state,
 +               static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + reg));
 +    AddMaskBit(range.input_state,
@@ -83,13 +83,13 @@ index e618bc2..9aea047 100644
 +    if (!(row >> addressText >> name))
 +      continue;
 +    row >> tokenText >> abiClass;
-+    if (abiClass != "context-capture")
-+      continue;
++    const bool fullFp = abiClass == "full-fp-context";
++    if (abiClass != "context-capture" && !fullFp) continue;
 +    char *end = nullptr;
 +    const unsigned long value = std::strtoul(addressText.c_str(), &end, 0);
 +    if (end == addressText.c_str() || *end != '\0' || value > 0xfffffffful)
 +      continue;
-+    result.push_back({static_cast<u32>(value)});
++    result.push_back({static_cast<u32>(value), fullFp});
 +  }
 +  return result;
 +}
@@ -106,7 +106,7 @@ index e618bc2..9aea047 100644
 +    }
 +    if (!range)
 +      continue;
-+    AddContextCaptureInputs(*range);
++    AddContextCaptureInputs(*range, entry.fullFp);
 +    ++applied;
 +  }
 +  return applied;

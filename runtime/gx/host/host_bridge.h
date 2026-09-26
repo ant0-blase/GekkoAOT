@@ -32,6 +32,16 @@ public:
   // ordered byte span instead of crossing the DSO boundary once per guest
   // store. Older plugins transparently fall back to byte writes.
   bool WriteBurst(const std::uint8_t* bytes, std::uint32_t size, std::uint32_t guest_pc);
+  // Optional v141 dynamic-vertex coherency ABI. Guest D-cache publication
+  // invalidates overlapping Aurora indexed-array snapshots.
+  void NotifyCacheControl(std::uint8_t operation, std::uint32_t address);
+  // Optional v162 CPU-visible EFB depth aperture. This mirrors Aurora's
+  // GXPeekZ contract: the first read may return 0 while scheduling the first
+  // asynchronous depth snapshot; subsequent reads use the newest completed one.
+  bool PeekEfbZ(std::uint16_t x, std::uint16_t y, std::uint32_t* z);
+  // Optional v163 CPU-visible EFB color aperture for GXPeekARGB. Same
+  // asynchronous snapshot contract as PeekEfbZ.
+  bool PeekEfbArgb(std::uint16_t x, std::uint16_t y, std::uint32_t* argb);
   void AdvanceCycles(std::uint64_t cycles);
   void PresentNow(std::uint32_t xfb_top, std::uint32_t xfb_bottom,
                   std::uint32_t width = 0u, std::uint32_t stride_bytes = 0u,
@@ -49,6 +59,8 @@ public:
   }
   bool FrameInterpolationReady() const;
   bool PresentInterpolated(float alpha);
+  // v128b optional ABI: 4:3 / live window-aspect changes without restarting.
+  void SetAspectMode(const std::string& mode);
   void SetCyclePresentEnabled(bool enabled) { cycle_present_enabled_ = enabled; }
   bool QuitRequested() const { return quit_requested_; }
 
@@ -89,6 +101,9 @@ private:
   using WriteFn = void (*)(std::uint64_t value, std::uint8_t size, std::uint32_t guest_pc);
   using WriteBurstFn = void (*)(const std::uint8_t* bytes, std::uint32_t size,
                                 std::uint32_t guest_pc);
+  using CacheControlFn = void (*)(std::uint8_t operation, std::uint32_t address);
+  using PeekEfbZFn = bool (*)(std::uint16_t x, std::uint16_t y, std::uint32_t* z);
+  using PeekEfbArgbFn = bool (*)(std::uint16_t x, std::uint16_t y, std::uint32_t* argb);
   using PresentFn = void (*)();
   using PresentXfbFn = void (*)(std::uint32_t top, std::uint32_t bottom);
   using PresentXfbExFn = void (*)(std::uint32_t top, std::uint32_t bottom,
@@ -97,6 +112,7 @@ private:
   using ConsumeFrameReadyFn = bool (*)(std::uint32_t* xfb_address);
   using PresentInterpolatedFn = bool (*)(float alpha);
   using InterpolationReadyFn = bool (*)();
+  using SetAspectModeFn = void (*)(std::uint32_t mode);
   using ShouldQuitFn = bool (*)();
   using ShutdownFn = void (*)();
   using SetPeCallbackFn = void (*)(PeEventFn callback, void* user);
@@ -115,12 +131,16 @@ private:
   InitFn init_ = nullptr;
   WriteFn write_ = nullptr;
   WriteBurstFn write_burst_ = nullptr;
+  CacheControlFn cache_control_ = nullptr;
+  PeekEfbZFn peek_efb_z_ = nullptr;
+  PeekEfbArgbFn peek_efb_argb_ = nullptr;
   PresentFn present_ = nullptr;
   PresentXfbFn present_xfb_ = nullptr;
   PresentXfbExFn present_xfb_ex_ = nullptr;
   ConsumeFrameReadyFn consume_frame_ready_ = nullptr;
   PresentInterpolatedFn present_interpolated_ = nullptr;
   InterpolationReadyFn interpolation_ready_ = nullptr;
+  SetAspectModeFn set_aspect_mode_ = nullptr;
   ShouldQuitFn should_quit_ = nullptr;
   ShutdownFn shutdown_ = nullptr;
   SetPeCallbackFn set_pe_callback_ = nullptr;

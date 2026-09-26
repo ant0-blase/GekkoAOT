@@ -61,12 +61,18 @@ int main() {
   CHECK(vi.XfbAddressTop() == 0x20000 && vi.XfbAddressBottom() == 0x30000);
 
   GekkoAOT::Native::AddressSpace memory;
-  CHECK(memory.Mem1().size() == 24u * 1024u * 1024u);
+  CHECK(memory.Mem1().size() == GekkoAOT::Native::AddressSpace::CompatMem1BackingSize);
+  CHECK(GekkoAOT::Native::AddressSpace::ReportedMem1Size() == 24u * 1024u * 1024u);
   CHECK(memory.Write32(0x817ffffc, 0x12345678));
   std::uint32_t word = 0;
   CHECK(memory.Read32(0xc17ffffc, &word) && word == 0x12345678);
-  CHECK(memory.Resolve(0x81800000, 1) == nullptr);
-  CHECK(memory.Resolve(0x817fffff, 2) == nullptr);
+  // Dolphin-compatible GC backing keeps the normally unpopulated 24..32 MiB
+  // physical aperture addressable while lowmem still reports retail 24 MiB.
+  CHECK(memory.Write32(0x81800000, 0xfeedbeef));
+  CHECK(memory.Read32(0xc1800000, &word) && word == 0xfeedbeef);
+  CHECK(memory.Resolve(0x81ffffff, 1) != nullptr);
+  CHECK(memory.Resolve(0x81ffffff, 2) == nullptr);
+  CHECK(memory.Resolve(0x82000000, 1) == nullptr);
   CHECK(memory.Resolve(0x7fffffff, 2) == nullptr);
   CHECK(memory.Resolve(0x7dffffff, 1) == nullptr);
   // The currently supported flat compatibility window is only a bounds test,

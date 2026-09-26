@@ -1,0 +1,59 @@
+diff --git a/lib/gfx/resources.hpp b/lib/gfx/resources.hpp
+--- a/lib/gfx/resources.hpp
++++ b/lib/gfx/resources.hpp
+@@ -5,7 +5,16 @@ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = true;
+ inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB
+-inline constexpr uint64_t VertexBufferSize = 5242880;   // 5 MiB
+-inline constexpr uint64_t IndexBufferSize = 2097152;    // 2 MiB
++#ifndef GEKKOAOT_AURORA_VERTEX_BUFFER_SIZE
++#define GEKKOAOT_AURORA_VERTEX_BUFFER_SIZE (32ull * 1024ull * 1024ull)
++#endif
++#ifndef GEKKOAOT_AURORA_INDEX_BUFFER_SIZE
++#define GEKKOAOT_AURORA_INDEX_BUFFER_SIZE (8ull * 1024ull * 1024ull)
++#endif
++// Retail games can keep substantially more geometry alive in one GX frame
++// than Aurora's original 5 MiB/2 MiB staging defaults. Keep a single staging
++// epoch (preserving EFB ordering) but give it bounded host-side headroom.
++inline constexpr uint64_t VertexBufferSize = GEKKOAOT_AURORA_VERTEX_BUFFER_SIZE;
++inline constexpr uint64_t IndexBufferSize = GEKKOAOT_AURORA_INDEX_BUFFER_SIZE;
+ // GekkoAOT keeps the GPU-visible storage arena fixed while allowing additional
+ // CPU staging segments to be allocated only for unusually storage-heavy frames.
+ #ifndef GEKKOAOT_AURORA_STORAGE_BUFFER_SIZE
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -1103,7 +1103,15 @@ Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
+   if (!check_recording("push_verts")) {
+     return {};
+   }
+-  return push(current_frame_packet().verts, data, length, alignment);
++  auto& verts = current_frame_packet().verts;
++  const size_t begin = verts.size();
++  const size_t aligned = alignment != 0 ? AURORA_ALIGN(begin, alignment) : begin;
++  if (length > VertexBufferSize || aligned > VertexBufferSize - length) {
++    Log.fatal("GEKKOAOT_AURORA_VERTEX_CAP_V1 current={} aligned={} incoming={} capacity={} frame={} draw={}",
++              begin, aligned, length, VertexBufferSize, current_frame_packet().frameId, g_recorder.drawCallCount);
++    return {};
++  }
++  return push(verts, data, length, alignment);
+ }
+ 
+ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+@@ -1111,7 +1119,15 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+   if (!check_recording("push_indices")) {
+     return {};
+   }
+-  return push(current_frame_packet().indices, data, length, alignment);
++  auto& indices = current_frame_packet().indices;
++  const size_t begin = indices.size();
++  const size_t aligned = alignment != 0 ? AURORA_ALIGN(begin, alignment) : begin;
++  if (length > IndexBufferSize || aligned > IndexBufferSize - length) {
++    Log.fatal("GEKKOAOT_AURORA_INDEX_CAP_V1 current={} aligned={} incoming={} capacity={} frame={} draw={}",
++              begin, aligned, length, IndexBufferSize, current_frame_packet().frameId, g_recorder.drawCallCount);
++    return {};
++  }
++  return push(indices, data, length, alignment);
+ }
+ 
+ Range push_uniform(const uint8_t* data, size_t length) {

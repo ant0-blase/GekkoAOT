@@ -41,7 +41,7 @@ std::string_view EnvText(const char* name, std::string_view fallback) {
   return value && *value ? std::string_view(value) : fallback;
 }
 
-constexpr std::array<OsKind, 46> kAllOsKinds = {
+constexpr std::array<OsKind, 51> kAllOsKinds = {
     OsKind::InitThreadQueue, OsKind::GetCurrentThread, OsKind::IsThreadTerminated,
     OsKind::DisableScheduler, OsKind::EnableScheduler, OsKind::SelectThread,
     OsKind::Reschedule, OsKind::YieldThread,
@@ -50,7 +50,8 @@ constexpr std::array<OsKind, 46> kAllOsKinds = {
     OsKind::SuspendThread, OsKind::SleepThread, OsKind::WakeupThread,
     OsKind::SetThreadPriority, OsKind::GetThreadPriority, OsKind::SaveContext, OsKind::LoadContext,
     OsKind::ClearContext, OsKind::InitContext, OsKind::GetCurrentContext,
-    OsKind::SetCurrentContext, OsKind::InitMutex, OsKind::LockMutex,
+    OsKind::SetCurrentContext, OsKind::LoadFpuContext, OsKind::SaveFpuContext,
+    OsKind::FillFpuContext, OsKind::GetStackPointer, OsKind::SwitchStack, OsKind::InitMutex, OsKind::LockMutex,
     OsKind::UnlockMutex, OsKind::TryLockMutex, OsKind::InitCond,
     OsKind::WaitCond, OsKind::SignalCond, OsKind::InitMessageQueue,
     OsKind::SendMessage, OsKind::ReceiveMessage, OsKind::JamMessage,
@@ -127,6 +128,9 @@ bool IsContextCaptureBoundary(OsKind kind) {
   case OsKind::SaveContext:
   case OsKind::LoadContext:
   case OsKind::SetCurrentContext:
+  case OsKind::LoadFpuContext:
+  case OsKind::SaveFpuContext:
+  case OsKind::FillFpuContext:
   case OsKind::LockMutex:
   case OsKind::UnlockMutex:
   case OsKind::TryLockMutex:
@@ -135,12 +139,29 @@ bool IsContextCaptureBoundary(OsKind kind) {
   case OsKind::SendMessage:
   case OsKind::ReceiveMessage:
   case OsKind::JamMessage:
+  // Interrupt helpers are a single architectural state boundary.  All three
+  // consume/update MSR[EE] through CPUState in the host implementation.  Keep
+  // DisableInterrupts in the same ABI class as Enable/Restore so direct-HLE
+  // cannot observe a stale MSR that is still resident in the AOT caller.
+  case OsKind::DisableInterrupts:
   case OsKind::EnableInterrupts:
   case OsKind::RestoreInterrupts:
     return true;
   default:
     return false;
   }
+}
+
+bool IsFullFpContextBoundary(OsKind kind) {
+  // NativeOS may capture or switch an OSContext from every context-capture
+  // boundary below, not only from the explicit OSSetCurrentContext/FPU APIs.
+  // SaveContext() maintains a complete host shadow of FPR0-FPR31, FPSCR and
+  // PS0-PS31 so that an asynchronous scheduler/IRQ transition can later resume
+  // the exact architectural register file.  Therefore volatile FPR0-FPR13 are
+  // inputs at *all* such boundaries.  Leaving them SSA-resident in the AOT
+  // caller makes NativeOS snapshot stale values and can corrupt render math
+  // (matrices, colors, vertex transforms) while guest-AOT remains correct.
+  return IsContextCaptureBoundary(kind);
 }
 
 bool IsOptionalForSchedulerClosure(OsKind kind) {
@@ -166,6 +187,11 @@ bool IsOptionalForSchedulerClosure(OsKind kind) {
   case OsKind::GetThreadPriority:
   case OsKind::IsThreadTerminated:
   case OsKind::GetCurrentContext:
+  case OsKind::LoadFpuContext:
+  case OsKind::SaveFpuContext:
+  case OsKind::FillFpuContext:
+  case OsKind::GetStackPointer:
+  case OsKind::SwitchStack:
   case OsKind::CreateThread:
   case OsKind::ExitThread:
   case OsKind::CancelThread:
@@ -215,6 +241,112 @@ bool IsAlarmGuestByDefault(OsKind kind) {
 bool IsInterruptHelper(OsKind kind) {
   return kind == OsKind::DisableInterrupts || kind == OsKind::EnableInterrupts ||
          kind == OsKind::RestoreInterrupts;
+}
+
+enum class NativeOsBisectMode : std::uint8_t {
+  InterruptDisable,
+  InterruptEnable,
+  InterruptRestore,
+  InterruptEnableRestore,
+  Interrupts,
+  Scheduler,
+  Sync,
+  All,
+};
+
+NativeOsBisectMode ParseNativeOsBisectMode(std::string_view value) {
+  if (value == "disable" || value == "interrupt-disable" ||
+      value == "disable-only")
+    return NativeOsBisectMode::InterruptDisable;
+  if (value == "enable" || value == "interrupt-enable" ||
+      value == "enable-only")
+    return NativeOsBisectMode::InterruptEnable;
+  if (value == "restore" || value == "interrupt-restore" ||
+      value == "restore-only")
+    return NativeOsBisectMode::InterruptRestore;
+  if (value == "enable+restore" || value == "interrupt-enable-restore")
+    return NativeOsBisectMode::InterruptEnableRestore;
+  if (value == "interrupts" || value == "interrupts-only")
+    return NativeOsBisectMode::Interrupts;
+  if (value == "scheduler" || value == "scheduler-core")
+    return NativeOsBisectMode::Scheduler;
+  if (value == "sync" || value == "scheduler+sync")
+    return NativeOsBisectMode::Sync;
+  return NativeOsBisectMode::All;
+}
+
+const char* NativeOsBisectModeName(NativeOsBisectMode mode) {
+  switch (mode) {
+  case NativeOsBisectMode::InterruptDisable: return "disable";
+  case NativeOsBisectMode::InterruptEnable: return "enable";
+  case NativeOsBisectMode::InterruptRestore: return "restore";
+  case NativeOsBisectMode::InterruptEnableRestore: return "enable+restore";
+  case NativeOsBisectMode::Interrupts: return "interrupts";
+  case NativeOsBisectMode::Scheduler: return "scheduler";
+  case NativeOsBisectMode::Sync: return "sync";
+  case NativeOsBisectMode::All: return "all";
+  }
+  return "all";
+}
+
+bool IsInterruptOnlyBisect(NativeOsBisectMode mode) {
+  switch (mode) {
+  case NativeOsBisectMode::InterruptDisable:
+  case NativeOsBisectMode::InterruptEnable:
+  case NativeOsBisectMode::InterruptRestore:
+  case NativeOsBisectMode::InterruptEnableRestore:
+  case NativeOsBisectMode::Interrupts:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool InterruptBisectAdmits(OsKind kind, NativeOsBisectMode mode) {
+  if (!IsInterruptHelper(kind)) return false;
+  switch (mode) {
+  case NativeOsBisectMode::InterruptDisable:
+    return kind == OsKind::DisableInterrupts;
+  case NativeOsBisectMode::InterruptEnable:
+    return kind == OsKind::EnableInterrupts;
+  case NativeOsBisectMode::InterruptRestore:
+    return kind == OsKind::RestoreInterrupts;
+  case NativeOsBisectMode::InterruptEnableRestore:
+    return kind == OsKind::EnableInterrupts || kind == OsKind::RestoreInterrupts;
+  default:
+    return true;
+  }
+}
+
+bool IsSyncKind(OsKind kind) {
+  switch (kind) {
+  case OsKind::InitMutex:
+  case OsKind::LockMutex:
+  case OsKind::UnlockMutex:
+  case OsKind::TryLockMutex:
+  case OsKind::InitCond:
+  case OsKind::WaitCond:
+  case OsKind::SignalCond:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool IsMessageKind(OsKind kind) {
+  return kind == OsKind::InitMessageQueue || kind == OsKind::SendMessage ||
+         kind == OsKind::ReceiveMessage || kind == OsKind::JamMessage;
+}
+
+bool NativeOsBisectAdmits(OsKind kind, NativeOsBisectMode mode) {
+  if (IsInterruptHelper(kind)) return InterruptBisectAdmits(kind, mode);
+  if (IsAlarmGuestByDefault(kind)) return mode == NativeOsBisectMode::All;
+  if (IsMessageKind(kind)) return mode == NativeOsBisectMode::All;
+  if (IsSyncKind(kind))
+    return mode == NativeOsBisectMode::Sync || mode == NativeOsBisectMode::All;
+  // Everything else in NativeOS is scheduler/thread/context state.
+  return mode == NativeOsBisectMode::Scheduler ||
+         mode == NativeOsBisectMode::Sync || mode == NativeOsBisectMode::All;
 }
 
 struct Range {
@@ -662,6 +794,57 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
     }
   }
 
+  // v144: OSContext's public FPU wrappers are tiny two-instruction assembly
+  // leaves and older ground-truth corpora did not name them.  Recover them
+  // only inside the already-proven OSContext cluster, immediately before a
+  // structurally resolved OSSetCurrentContext.  This is intentionally much
+  // narrower than a global `addi rN,r3,0; b ...` scan: retail SDKs place the
+  // wrappers next to __OSLoad/__OSSaveFPUContext and OSSetCurrentContext, and
+  // requiring an existing direct call-target prevents dead padding/data from
+  // becoming a native hook.
+  if (const auto set_it = os_candidates.find(OsKind::SetCurrentContext);
+      set_it != os_candidates.end()) {
+    constexpr std::uint32_t kMoveContextToR4 = 0x38830000u; // addi r4,r3,0
+    constexpr std::uint32_t kMoveContextToR5 = 0x38a30000u; // addi r5,r3,0
+    for (const auto set_pc : set_it->second) {
+      const auto cluster_begin = set_pc > 0x40u ? set_pc - 0x40u : 0u;
+      for (std::uint32_t pc = cluster_begin; pc + 8u <= set_pc; pc += 4u) {
+        if (discovered.find(pc) == discovered.end()) continue;
+        const auto* code = runtime.Memory().Resolve(pc, 8u);
+        if (!code) continue;
+        const auto first = GekkoAOTSdk::StructuralReadBE32(code);
+        const auto branch = GekkoAOTSdk::StructuralReadBE32(code + 4u);
+        if ((branch & 0xfc000003u) != 0x48000000u) continue; // b, not bl/ba
+
+        // Sign-extend the 26-bit relative branch displacement.  The internal
+        // FPU helpers live earlier in the same OSContext object.
+        std::int32_t displacement = static_cast<std::int32_t>(branch & 0x03fffffcu);
+        if (displacement & 0x02000000) displacement |= static_cast<std::int32_t>(0xfc000000u);
+        const auto target = static_cast<std::uint32_t>(pc + 4u + displacement);
+        if (target >= pc || set_pc - target > 0x800u) continue;
+
+        if (first == kMoveContextToR4) {
+          os_candidates[OsKind::LoadFpuContext].push_back(pc);
+          resolver.Seed(pc, "OSLoadFPUContext", 0.999, "oscontext-cluster-fpu-wrapper");
+          std::cerr << "GEKKOAOT_SDK_RESOLVE name=OSLoadFPUContext pc=0x"
+                    << std::hex << pc << std::dec
+                    << " confidence=0.999 source=oscontext-cluster-fpu-wrapper\n";
+        } else if (first == kMoveContextToR5) {
+          os_candidates[OsKind::SaveFpuContext].push_back(pc);
+          resolver.Seed(pc, "OSSaveFPUContext", 0.999, "oscontext-cluster-fpu-wrapper");
+          std::cerr << "GEKKOAOT_SDK_RESOLVE name=OSSaveFPUContext pc=0x"
+                    << std::hex << pc << std::dec
+                    << " confidence=0.999 source=oscontext-cluster-fpu-wrapper\n";
+        }
+      }
+    }
+    for (auto kind : {OsKind::LoadFpuContext, OsKind::SaveFpuContext}) {
+      auto& v = os_candidates[kind];
+      std::sort(v.begin(), v.end());
+      v.erase(std::unique(v.begin(), v.end()), v.end());
+    }
+  }
+
   // v74: OSGetThreadPriority is an ABI leaf, not merely an instruction-shape
   // identity. Its SDK contract is exactly `return thread->priority`, where
   // OSThread::priority lives at ABI offset 0x2d4. A normalized two-instruction
@@ -743,9 +926,19 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
     ++stats.simple_hooks;
   }
 
-  const bool native_os_enabled = EnvEnabled("GEKKOAOT_NATIVE_OS", true);
+  const bool native_os_enabled = EnvEnabled("GEKKOAOT_NATIVE_OS", false);
+  const auto native_os_bisect = ParseNativeOsBisectMode(
+      EnvText("GEKKOAOT_NATIVE_OS_BISECT", "all"));
+  std::cerr << "GEKKOAOT_NATIVE_OS_PARITY_V153=1 default=guest-aot active="
+            << (native_os_enabled ? "native-sdk" : "guest-aot-optout")
+            << " reference=dolsdk2001+dolsdk2004 native-port-semantics\n";
+  if (native_os_enabled)
+    std::cerr << "GEKKOAOT_NATIVE_OS_BISECT_V147=1 mode="
+              << NativeOsBisectModeName(native_os_bisect)
+              << " leaf=disable|enable|restore|enable+restore|interrupts"
+              << " cumulative=interrupts<scheduler<sync<all\n";
   std::vector<OsKind> missing;
-  if (native_os_enabled) {
+  if (native_os_enabled && !IsInterruptOnlyBisect(native_os_bisect)) {
     for (const auto kind : kAllOsKinds) {
       if (IsOptionalForSchedulerClosure(kind)) continue;
       const auto it = os_candidates.find(kind);
@@ -754,11 +947,37 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
   }
   stats.missing_scheduler = missing.size();
 
-  // The three interrupt helpers are mutation-simple and safe independently of
-  // the cooperative scheduler closure. Install them whenever they are proven.
-  if (native_os_enabled) {
+  // GEKKOAOT_NATIVE_OS_INTERRUPT_LEAVES_V150:
+  // Keep the three retail MSR[EE] leaves in guest-AOT by default.  They are
+  // tiny (OSDisable/OSEnable are five PPC instructions; OSRestore is nine),
+  // and OSDisableInterrupts is also a restartable atomic sequence used by
+  // OSLoadContext.  Replacing the body at a direct-HLE boundary changes more
+  // than the final EE bit: retail variants expose exact scratch-register/CR
+  // side effects and instruction-boundary/RAS semantics.  The translated AOT
+  // body already runs natively on the host and preserves those semantics at
+  // negligible cost, so NativeOS owns the higher-level scheduler/context/sync
+  // services while these architectural leaves remain compiled guest code.
+  //
+  // Keep an explicit opt-in plus the v147 interrupt-only bisectors for
+  // conformance work; neither is part of the correctness-first default.
+  const bool native_interrupt_leaves =
+      EnvEnabled("GEKKOAOT_NATIVE_OS_INTERRUPT_LEAVES", false);
+  const bool interrupt_leaf_diagnostic = IsInterruptOnlyBisect(native_os_bisect);
+  const bool install_interrupt_leaves =
+      native_os_enabled && (native_interrupt_leaves || interrupt_leaf_diagnostic);
+  if (native_os_enabled)
+    std::cerr << "GEKKOAOT_NATIVE_OS_INTERRUPT_LEAVES_V150="
+              << (install_interrupt_leaves ? 1 : 0)
+              << " policy="
+              << (interrupt_leaf_diagnostic ? "explicit-bisect"
+                                             : (native_interrupt_leaves ? "host-optin"
+                                                                        : "guest-aot-ras"))
+              << "\n";
+
+  if (install_interrupt_leaves) {
     for (const auto kind : {OsKind::DisableInterrupts, OsKind::EnableInterrupts,
                             OsKind::RestoreInterrupts}) {
+      if (!InterruptBisectAdmits(kind, native_os_bisect)) continue;
       const auto found = os_candidates.find(kind);
       if (found == os_candidates.end()) continue;
       for (const auto address : found->second) {
@@ -772,14 +991,18 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
     }
   }
 
-  if (native_os_enabled && missing.empty()) {
+  if (native_os_enabled && IsInterruptOnlyBisect(native_os_bisect)) {
+    std::cerr << "GEKKOAOT_NATIVE_OS_CLOSURE_AUTO_V8=1 policy=bisect-"
+              << NativeOsBisectModeName(native_os_bisect)
+              << " hooks=" << stats.os_hooks << " candidates=" << stats.os_candidates
+              << " scheduler=guest-aot sync=guest-aot messages=guest-aot\n";
+  } else if (native_os_enabled && missing.empty()) {
     const auto policy = EnvText("GEKKOAOT_NATIVE_OS_ADMISSION", "hot");
     const bool full = policy == "full";
-    const bool hot = full || policy == "hot" || policy == "scheduler-core+interrupts";
     for (const auto& [kind, addresses] : os_candidates) {
       if (IsInterruptHelper(kind)) continue; // already installed above
+      if (!NativeOsBisectAdmits(kind, native_os_bisect)) continue;
       if (!full && IsAlarmGuestByDefault(kind)) continue;
-      if (!hot && IsInterruptHelper(kind)) continue;
       for (const auto address : addresses) {
         runtime.RegisterOsHook(kind, address);
         manifest_hooks.emplace_back(address, GekkoAOT::NativeOS::Name(kind));
@@ -790,11 +1013,13 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
       }
     }
     std::cerr << "GEKKOAOT_NATIVE_OS_CLOSURE_AUTO_V8=1 policy=" << policy
+              << " bisect=" << NativeOsBisectModeName(native_os_bisect)
               << " hooks=" << stats.os_hooks << " candidates=" << stats.os_candidates
               << "\n";
     std::cerr << "GEKKOAOT_NATIVE_OS_CONTEXT_COMPAT_V70=1 direct-sdk-context=native-sdk-ppc"
               << " scheduler-context=native-sdk-ppc queue-authority=guest+host-mirror"
-              << " admission=" << (full ? "full" : "hot") << "\n";
+              << " admission=" << (full ? "full" : "hot")
+              << " bisect=" << NativeOsBisectModeName(native_os_bisect) << "\n";
   } else if (native_os_enabled) {
     std::cerr << "GEKKOAOT_NATIVE_OS_CLOSURE_AUTO_V8=0 action=guest-aot missing=";
     for (std::size_t i = 0; i < missing.size(); ++i) {
@@ -823,7 +1048,10 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
             << std::dec << ' ' << name;
         if (token != 0u)
           out << " 0x" << std::hex << std::setw(8) << std::setfill('0') << token << std::dec;
-        if (const auto kind = OsKindForName(name); kind && IsContextCaptureBoundary(*kind)) {
+        if (const auto kind = OsKindForName(name); kind && IsFullFpContextBoundary(*kind)) {
+          out << " full-fp-context";
+          ++context_capture;
+        } else if (const auto kind = OsKindForName(name); kind && IsContextCaptureBoundary(*kind)) {
           out << " context-capture";
           ++context_capture;
         }
@@ -831,7 +1059,7 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
       }
       std::cerr << "GEKKOAOT_NATIVE_OS_CONTEXT_ABI_V76=1 class=context-capture hooks="
                 << context_capture
-                << " state=nonvolatile-int+control+gqr+nonvolatile-fp\n";
+                << " state=nonvolatile-int+control+gqr+fp-classed(full-on-oscontext)\n";
       std::cerr << "GEKKOAOT_NATIVE_SDK_MANIFEST_V2=1 mode=write hooks="
                 << manifest_hooks.size() << " path=\"" << manifest_output.string()
                 << "\"\n";

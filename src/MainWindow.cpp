@@ -858,8 +858,12 @@ void MainWindow::loadSettings()
     m_graphicsBackend = s.value("graphics/backend", "Vulkan").toString();
     m_resolution = s.value("graphics/resolution", "1920x1080").toString();
     m_aspectMode = s.value("graphics/aspectMode", "4:3").toString();
-    if (m_aspectMode != "auto" && m_aspectMode != "4:3" &&
-        m_aspectMode != "16:9" && m_aspectMode != "stretch")
+    // v128b keeps only two modes. Migrate an old explicit widescreen choice to
+    // the new live window mode; Auto/original and unknown values become 4:3.
+    if (m_aspectMode == "16:9" || m_aspectMode == "16:10" ||
+        m_aspectMode == "21:9" || m_aspectMode == "32:9")
+        m_aspectMode = "stretch";
+    else if (m_aspectMode != "4:3" && m_aspectMode != "stretch")
         m_aspectMode = "4:3";
     // "auto" means native X11 on an X11 session and an XWayland child on a
     // Wayland session. Pure-Wayland sessions without DISPLAY fall back to a
@@ -1532,11 +1536,25 @@ void MainWindow::showGraphicsConfig()
     resolution->setCurrentIndex(comboIndexForData(resolution, m_resolution));
 
     auto* aspect = new QComboBox(&dialog);
-    aspect->addItem("Auto", "auto");
     aspect->addItem("4:3", "4:3");
-    aspect->addItem("16:9", "16:9");
-    aspect->addItem("Stretch to window", "stretch");
+    aspect->addItem("Stretched to Window", "stretch");
     aspect->setCurrentIndex(comboIndexForData(aspect, m_aspectMode));
+
+    // v128b: preview aspect changes in the running game. NativeGX polls the
+    // frontend config about four times per second. Cancel restores the value
+    // that was active when this dialog opened.
+    const QString originalAspectMode = m_aspectMode;
+    connect(aspect, &QComboBox::currentIndexChanged, &dialog, [this, aspect](int) {
+        if (!m_runtimeStarted)
+            return;
+        const QString next = aspect->currentData().toString();
+        if (next == m_aspectMode)
+            return;
+        m_aspectMode = next;
+        QString error;
+        if (!writeFrontendConfig(&error))
+            m_log->appendPlainText("[gekkoaot] live aspect update failed: " + error + "\n");
+    });
 
     auto* fpsLimit = new QSlider(Qt::Horizontal, &dialog);
     fpsLimit->setRange(30, 360);
@@ -1574,8 +1592,11 @@ void MainWindow::showGraphicsConfig()
         displaySessionDescription() +
             "\nFPS limit controls host presentation/interpolation only. AOT CPU execution stays "
             "uncapped while VI/timebase/DEC/DSP/AI remain on the realtime 1.0x hardware clock. "
-            "The HUD shows VPS, unique guest FPS, presented FPS, interpolated FPS and timer Speed; "
-            "backend and resolution changes apply on the next launch.",
+            "The HUD shows VPS, unique guest FPS, presented FPS, interpolated FPS and timer Speed. "
+            "4:3 preserves the original frame. Stretched to Window follows the window aspect live: "
+            "the GX projection is compensated for both perspective 3D and orthographic 2D, so resizing "
+            "the window adapts the image instead of simply fat-stretching it. "
+            "Backend and resolution changes apply on the next launch.",
         &dialog);
     hint->setWordWrap(true);
     outer->addWidget(hint);
@@ -1586,7 +1607,19 @@ void MainWindow::showGraphicsConfig()
     outer->addWidget(buttons);
 
     if (dialog.exec() != QDialog::Accepted)
+    {
+        if (m_aspectMode != originalAspectMode)
+        {
+            m_aspectMode = originalAspectMode;
+            if (m_runtimeStarted)
+            {
+                QString error;
+                if (!writeFrontendConfig(&error))
+                    m_log->appendPlainText("[gekkoaot] live aspect restore failed: " + error + "\n");
+            }
+        }
         return;
+    }
 
     m_graphicsBackend = backend->currentData().toString();
     m_resolution = resolution->currentData().toString();

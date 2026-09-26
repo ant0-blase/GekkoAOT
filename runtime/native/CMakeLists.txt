@@ -82,6 +82,7 @@ endif()
 
 add_library(gekkoaot_native_runtime STATIC
     module_loader.cpp
+    native_vfs.cpp
     runtime.cpp
     sdk_autoresolver.cpp
     ../gx/host/host_bridge.cpp
@@ -208,6 +209,16 @@ else()
     if(NOT APPLE)
         target_compile_options(gekkoaot_native_runtime PRIVATE -fno-plt)
         target_compile_options(gekkoaot-native-run PRIVATE -fno-plt)
+        # v136: the native host is a closed executable/static-runtime pair; no
+        # runtime symbol interposition is part of its ABI. Let GCC/Clang fold
+        # internal calls/state more aggressively before and during LTO.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(gekkoaot_native_runtime PRIVATE -fno-semantic-interposition)
+            target_compile_options(gekkoaot-native-run PRIVATE -fno-semantic-interposition)
+        endif()
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            target_compile_options(gekkoaot_native_runtime PRIVATE -fipa-pta)
+        endif()
     endif()
     if(NOT GEKKOAOT_NATIVE_PORTABLE AND NOT APPLE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|aarch64|arm64"))
         target_compile_options(gekkoaot_native_runtime PRIVATE -march=native -mtune=native)
@@ -266,6 +277,10 @@ if(BUILD_TESTING)
   add_executable(gekkoaot-test-os-message-priority ../../tests/hardware/test_os_message_priority.cpp)
   target_link_libraries(gekkoaot-test-os-message-priority PRIVATE gekkoaot_native_runtime)
   add_test(NAME hardware.os-message-priority COMMAND gekkoaot-test-os-message-priority)
+
+  add_executable(gekkoaot-test-os-context-fpu ../../tests/hardware/test_os_context_fpu.cpp)
+  target_link_libraries(gekkoaot-test-os-context-fpu PRIVATE gekkoaot_native_runtime)
+  add_test(NAME hardware.os-context-fpu COMMAND gekkoaot-test-os-context-fpu)
 
   add_executable(gekkoaot-test-si-poll ../../tests/hardware/test_si_poll.cpp)
   target_link_libraries(gekkoaot-test-si-poll PRIVATE gekkoaot_native_runtime)

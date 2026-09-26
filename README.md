@@ -540,7 +540,7 @@ The target is to minimize unnecessary CPU-emulation overhead in the normal execu
 ## Pinned dependencies
 
 - DolRecomp: `71ce7f97419b1bb1ba9a9596c41507f6629e0fb0`
-- Aurora: `7f2801cd0133c9333eadb4e2e6b24100c328d328`
+- Aurora: `3840bf9ae735191026e4d4edb0ce6f24d91f7eea`
 - encounter/nod: `v2.0.0-alpha.12`
 
 The controller clones only DolRecomp and Aurora into `.gekkoaot/src/` when they are not already present. nod is consumed as a CMake package by the native host.

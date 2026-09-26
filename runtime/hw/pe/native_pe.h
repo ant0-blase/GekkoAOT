@@ -30,6 +30,8 @@ public:
 
   std::uint16_t Control() const { return control_; }
   std::uint16_t Token() const { return token_; }
+  // PE_ALPHAREAD bits 0..1: 0=force 00, 1=force FF, 2=real alpha.
+  std::uint16_t AlphaReadMode() const { return config_[4] & 0x3u; }
 
 private:
   static constexpr std::uint32_t ToPhysical(std::uint32_t address) {

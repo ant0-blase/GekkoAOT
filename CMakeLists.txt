@@ -32,7 +32,17 @@ if(GEKKOAOT_DOLRECOMP_REV STREQUAL "40637c4683bd2820ac5b23607ee344720beb26df")
     message(STATUS "gekkoaot: migrating DolRecomp pin 40637c46 -> 71ce7f97")
     set(GEKKOAOT_DOLRECOMP_REV "${GEKKOAOT_DOLRECOMP_DEFAULT_REV}" CACHE STRING "Pinned DolRecomp revision" FORCE)
 endif()
-set(GEKKOAOT_AURORA_REV "7f2801cd0133c9333eadb4e2e6b24100c328d328" CACHE STRING "Pinned Aurora revision with retail FIFO command processor")
+set(GEKKOAOT_AURORA_DEFAULT_REV "9c0bf66f1ed3276b60ad1cd746e2fb48818a6298")
+set(GEKKOAOT_AURORA_REV "${GEKKOAOT_AURORA_DEFAULT_REV}" CACHE STRING "Pinned Aurora revision with retail FIFO command processor")
+
+# v131 regression bisect: stay on the modern Aurora renderer, but stop one
+# commit before 3840bf9 ("Fix GX EFB alpha handling").  Migrate only known
+# project defaults; explicit custom pins remain untouched.
+if(GEKKOAOT_AURORA_REV STREQUAL "7f2801cd0133c9333eadb4e2e6b24100c328d328" OR
+   GEKKOAOT_AURORA_REV STREQUAL "3840bf9ae735191026e4d4edb0ce6f24d91f7eea")
+    message(STATUS "gekkoaot: v131 near-head Aurora pin -> 9c0bf66f (pre-EFB-alpha-fix)")
+    set(GEKKOAOT_AURORA_REV "${GEKKOAOT_AURORA_DEFAULT_REV}" CACHE STRING "Pinned Aurora revision with retail FIFO command processor" FORCE)
+endif()
 set(GEKKOAOT_NOD_VERSION "v2.0.0-alpha.12" CACHE STRING "Pinned encounter/nod release")
 
 add_executable(gekkoaotctl tools/gekkoaotctl.cpp)

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -80,6 +81,20 @@ int Run(const std::string& command) {
 void Require(int rc, std::string_view what) { if(rc!=0) throw std::runtime_error(std::string(what)+" failed (exit "+std::to_string(rc)+")"); }
 std::string ReadLine(const fs::path& p) { std::ifstream in(p); std::string s; std::getline(in,s); return s; }
 void WriteText(const fs::path& p,std::string_view s) { fs::create_directories(p.parent_path()); std::ofstream o(p,std::ios::trunc); if(!o)throw std::runtime_error("cannot write "+p.string()); o<<s; }
+std::string ReadText(const fs::path& p) {
+  std::ifstream in(p,std::ios::binary);
+  if(!in) throw std::runtime_error("cannot read "+p.string());
+  return std::string(std::istreambuf_iterator<char>(in),std::istreambuf_iterator<char>());
+}
+void ReplaceOnceInFile(const fs::path& p,std::string_view needle,std::string_view replacement,std::string_view tag) {
+  auto text=ReadText(p);
+  const auto first=text.find(needle);
+  if(first==std::string::npos) throw std::runtime_error(std::string(tag)+": anchor not found in "+p.string());
+  if(text.find(needle,first+needle.size())!=std::string::npos)
+    throw std::runtime_error(std::string(tag)+": anchor is not unique in "+p.string());
+  text.replace(first,needle.size(),replacement);
+  WriteText(p,text);
+}
 std::string FileHash64(const fs::path& p) {
   std::ifstream in(p,std::ios::binary);
   if(!in) throw std::runtime_error("cannot hash "+p.string());
@@ -240,11 +255,18 @@ std::string Head(const fs::path& repo) {
   auto s=ReadLine(tmp); std::error_code ec; fs::remove(tmp,ec); return s;
 }
 void EnsureCheckout(const fs::path& dir,std::string_view url,std::string_view rev) {
-  if(fs::exists(dir/".git") && Head(dir)==rev) { std::cout<<"cache hit: "<<dir<<" @ "<<rev.substr(0,8)<<'\n'; return; }
+  const bool hasRepo=fs::exists(dir/".git");
+  if(hasRepo && Head(dir)==rev) { std::cout<<"cache hit: "<<dir<<" @ "<<rev.substr(0,8)<<'\n'; return; }
   fs::create_directories(dir.parent_path());
-  if(!fs::exists(dir/".git")) {
+  if(!hasRepo) {
     std::error_code ec; fs::remove_all(dir,ec);
     Require(Run("git clone --filter=blob:none --no-checkout "+QuoteText(url)+" "+Quote(dir)),"git clone");
+  } else {
+    // Source caches are owned by GekkoAOT and patched in-place after checkout.
+    // When the pin changes, discard those generated/local patch changes before
+    // checkout; otherwise git correctly refuses to overwrite the dirty tree.
+    Require(Run("git -C "+Quote(dir)+" reset --hard"),"git source cache reset before revision switch");
+    Require(Run("git -C "+Quote(dir)+" clean -ffd"),"git source cache clean before revision switch");
   }
   Require(Run("git -C "+Quote(dir)+" fetch --depth 1 origin "+QuoteText(rev)),"git fetch");
   Require(Run("git -C "+Quote(dir)+" checkout --detach "+QuoteText(rev)),"git checkout");
@@ -451,6 +473,26 @@ void EnsureSources(Pipeline& p) {
     std::cout << "GEKKOAOT_DOLRECOMP_NATIVE_BUDGET_V1=1 "
                  "policy=compile-time-quantum\n";
 
+    // v159: a configured runtime chain budget of zero is the strongest host-
+    // boundary mode.  DolRecomp emits guards before charging a loop-header
+    // block, so a literal zero budget can side-exit forever at the same guest
+    // PC (notably SDK SelectThread idle loops) without executing OSEnableInterrupts.
+    // Clamp only the generated guard threshold to one guest cycle: zero keeps
+    // its no-chaining intent while guaranteeing one block of forward progress.
+    const auto zero_budget_progress_patch =
+        p.root / "patches/dolrecomp/gekkoaot-zero-budget-progress-v18.patch";
+    if (!fs::exists(zero_budget_progress_patch))
+      throw std::runtime_error("missing DolRecomp zero-budget progress patch: "+
+                               zero_budget_progress_patch.string());
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply --check "+
+                Quote(zero_budget_progress_patch)),
+            "DolRecomp zero-budget progress patch check");
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply "+
+                Quote(zero_budget_progress_patch)),
+            "DolRecomp zero-budget progress patch");
+    std::cout << "GEKKOAOT_DOLRECOMP_ZERO_BUDGET_PROGRESS_V18=1 "
+                 "zero=one-block-progress host-boundary=retained scheduler-idle=safe\n";
+
     // v3.3 hot-path compiler specialization: small native leaf calls are
     // eligible for cross-partition inlining and can elide redundant call-edge
     // budget guards, while fixed GameCube memory layouts use a single constant
@@ -636,6 +678,44 @@ void EnsureSources(Pipeline& p) {
                 Quote(memory_capability_patch)), "DolRecomp memory capability patch");
     std::cout << "GEKKOAOT_DOLRECOMP_MEMORY_CAPABILITY_V15=1 "
                  "policy=native-module-exports-restart-capability\n";
+
+    // v129: a computed CTR transfer (bctr/bctrl) has no statically known
+    // destination ABI.  Keeping its containing function on the Native ABI
+    // path can leave pass-through PPC registers resident only in LLVM SSA,
+    // while the global indirect dispatcher starts the dynamic target from
+    // CPUState.  Fence just those functions back to the architectural-state
+    // path; ordinary BLR/BCLR returns stay Native ABI.
+    const auto computed_ctr_abi_fence_patch =
+        p.root / "patches/dolrecomp/gekkoaot-computed-ctr-abi-fence-v16.patch";
+    if (!fs::exists(computed_ctr_abi_fence_patch))
+      throw std::runtime_error("missing DolRecomp computed-CTR ABI fence patch: "+
+                               computed_ctr_abi_fence_patch.string());
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply --check "+
+                Quote(computed_ctr_abi_fence_patch)),
+            "DolRecomp computed-CTR ABI fence patch check");
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply "+
+                Quote(computed_ctr_abi_fence_patch)),
+            "DolRecomp computed-CTR ABI fence patch");
+    std::cout << "GEKKOAOT_DOLRECOMP_COMPUTED_CTR_ABI_FENCE_V16=1 "
+                 "policy=bcctr-architectural-state-boundary\n";
+
+    // v151: keep the retail OSDisable/Enable/RestoreInterrupts bodies in guest
+    // AOT, but make both directions of MSR[EE] changes visible to the standalone
+    // dispatcher. NativeOS host leaves already created such a dispatch boundary
+    // implicitly; without it some titles can leave PI/VI pending indefinitely.
+    const auto msr_ee_fence_patch =
+        p.root / "patches/dolrecomp/gekkoaot-msr-ee-transition-fence-v17.patch";
+    if (!fs::exists(msr_ee_fence_patch))
+      throw std::runtime_error("missing DolRecomp MSR[EE] transition fence patch: "+
+                               msr_ee_fence_patch.string());
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply --check "+
+                Quote(msr_ee_fence_patch)),
+            "DolRecomp MSR[EE] transition fence patch check");
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply "+
+                Quote(msr_ee_fence_patch)),
+            "DolRecomp MSR[EE] transition fence patch");
+    std::cout << "GEKKOAOT_DOLRECOMP_MSR_EE_FENCE_V17=1 "
+                 "policy=side-exit-on-ee-transition guest-interrupt-leaves=ppc-aot\n";
   }
   // GekkoAOT owns the GameCube-facing runtime and FIFO decoder. Aurora is the
   // renderer/presentation backend only; no ModernGekko or Dolphin execution
@@ -673,14 +753,116 @@ void EnsureSources(Pipeline& p) {
   if (!fs::exists(aurora_storage_patch))
     throw std::runtime_error("missing Aurora storage-staging patch: "+
                              aurora_storage_patch.string());
-  Require(Run("git -C "+Quote(p.aurora_src)+" apply --check "+
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --recount --check "+
               Quote(aurora_storage_patch)),
           "Aurora storage-staging patch check");
-  Require(Run("git -C "+Quote(p.aurora_src)+" apply "+
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --recount "+
               Quote(aurora_storage_patch)),
           "Aurora storage-staging patch");
   std::cout << "GEKKOAOT_AURORA_STORAGE_STAGING_V4=1 segment_bytes=67108864 gpu_bytes=67108864 "
                "overflow=pass-boundary-segmented-staging offsets=restart-at-zero single-draw=fail-closed\n";
+
+  // v141: restore retail CP/XF matrix-index coherency. Dolphin keeps CP MATINDEX
+  // A/B and XF MatrixIndexA/B as one logical state; Aurora 9c decodes only the
+  // PN selector from CP 0x30 and ignores CP 0x40. That leaves texture/transform
+  // selectors stale when games alternate CP and XF programming paths.
+  const auto aurora_regs_v141 = p.aurora_src / "lib/gx/regs.cpp";
+  ReplaceOnceInFile(aurora_regs_v141,
+R"GEKKO(// Matrix index A (0x30)
+void cp_mtx_index(u8, u32 value) noexcept {
+  g_gxState.currentPnMtx = reg_get(value, 6, 0) / 3;
+  g_gxState.xfRegValid.reset(0x18);
+}
+)GEKKO",
+R"GEKKO(// Matrix index A (0x30), mirrors XF 0x18.
+void cp_mtx_index(u8, u32 value) noexcept {
+  g_gxState.currentPnMtx = reg_get(value, 6, 0) / 3;
+  g_gxState.xfRegValid.reset(0x18);
+  for (u32 i = 0; i < 4; ++i) {
+    const auto texMtx = static_cast<GXTexMtx>(reg_get(value, 6, 6 + i * 6));
+    if (g_gxState.tcgs[i].mtx != texMtx) {
+      g_gxState.tcgs[i].mtx = texMtx;
+      g_gxState.dirty |= DirtyPipeline;
+    }
+  }
+}
+
+// Matrix index B (0x40), mirrors XF 0x19.
+void cp_mtx_index_b(u8, u32 value) noexcept {
+  g_gxState.xfRegValid.reset(0x19);
+  for (u32 i = 0; i < 4 && (i + 4) < MaxTexCoord; ++i) {
+    const auto texMtx = static_cast<GXTexMtx>(reg_get(value, 6, i * 6));
+    if (g_gxState.tcgs[i + 4].mtx != texMtx) {
+      g_gxState.tcgs[i + 4].mtx = texMtx;
+      g_gxState.dirty |= DirtyPipeline;
+    }
+  }
+}
+)GEKKO", "Aurora CP/XF matrix-index decode v141");
+
+  ReplaceOnceInFile(aurora_regs_v141,
+R"GEKKO(  regs[0x30] = {cp_mtx_index, DirtyImmediates};
+  regs[0x40] = {}; // Matrix index B; mirrors XF 0x19
+)GEKKO",
+R"GEKKO(  regs[0x30] = {cp_mtx_index, DirtyImmediates};
+  regs[0x40] = {cp_mtx_index_b};
+)GEKKO", "Aurora CP matrix-index table v141");
+
+  ReplaceOnceInFile(aurora_regs_v141,
+R"GEKKO(// Matrix index B (0x19)
+void xf_mtx_index_b(u8, u32 value) noexcept {
+  for (u32 i = 0; i < 4 && (i + 4) < MaxTexCoord; i++) {
+    g_gxState.tcgs[i + 4].mtx = static_cast<GXTexMtx>(reg_get(value, 6, i * 6));
+  }
+}
+)GEKKO",
+R"GEKKO(// Matrix index B (0x19)
+void xf_mtx_index_b(u8, u32 value) noexcept {
+  // A later CP 0x40 must not be deduplicated against state from before this XF
+  // write. XF 0x18 already performs the symmetric CP 0x30 invalidation.
+  g_gxState.cpRegValid.reset(0x40);
+  for (u32 i = 0; i < 4 && (i + 4) < MaxTexCoord; i++) {
+    g_gxState.tcgs[i + 4].mtx = static_cast<GXTexMtx>(reg_get(value, 6, i * 6));
+  }
+}
+)GEKKO", "Aurora XF-B/CP-B shadow coherency v141");
+
+  // Retail GX commands must not disappear because a host pipeline is still
+  // compiling. Block only on a first-use GX pipeline cache miss; already-built
+  // pipelines remain the same O(1) lookup path.
+  const auto aurora_pipeline_cache_v141 = p.aurora_src / "lib/gfx/pipeline_cache.cpp";
+  ReplaceOnceInFile(aurora_pipeline_cache_v141,
+R"GEKKO(PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
+  remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
+  return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal);
+}
+)GEKKO",
+R"GEKKO(PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
+  remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
+  // GekkoAOT v141: a retail GX draw is ordered work, not optional UI work.
+  // Wait only when this exact pipeline has not been compiled yet.
+  return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Blocking);
+}
+)GEKKO", "Aurora no-dropped-first-use GX pipeline v141");
+
+  std::cout << "GEKKOAOT_AURORA_MATRIX_COHERENCY_V141=1 "
+               "cp30=pn+tex0-3 cp40=tex4-7 xf19-invalidates-cp40=1 dirty=precise model=dolphin-style\\n";
+  std::cout << "GEKKOAOT_AURORA_GX_PIPELINE_V141=1 "
+               "first-use=blocking cached=fast policy=no-retail-draw-drop\\n";
+
+  const auto aurora_vertex_index_capacity_patch =
+      p.root / "patches/aurora/gekkoaot-vertex-index-capacity-v1.patch";
+  if (!fs::exists(aurora_vertex_index_capacity_patch))
+    throw std::runtime_error("missing Aurora vertex/index capacity patch: "+
+                             aurora_vertex_index_capacity_patch.string());
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --check "+
+              Quote(aurora_vertex_index_capacity_patch)),
+          "Aurora vertex/index capacity patch check");
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply "+
+              Quote(aurora_vertex_index_capacity_patch)),
+          "Aurora vertex/index capacity patch");
+  std::cout << "GEKKOAOT_AURORA_VERTEX_INDEX_CAPACITY_V1=1 vertex_mib=32 index_mib=8 "
+               "policy=single-frame-bounded-headroom\n";
 
   // Aurora is a renderer embedded in GekkoAOT, not the owner of the process-wide
   // SDL lifetime. Its upstream window shutdown calls SDL_Quit(), which also
@@ -741,6 +923,339 @@ void EnsureSources(Pipeline& p) {
           "Aurora shader-vertex patch");
   std::cout << "GEKKOAOT_AURORA_SHADER_VERTEX_V1=1 nbt3=independent-indexed-vectors texmtx-identity=handled\n";
 
+  // v142: GameCube vertex matrix indices are six-bit values. Dolphin masks
+  // both PNMTXIDX and TEXMTXIDX with 0x3f while translating the FIFO vertex
+  // stream. Aurora 9c consumed the full host byte instead, so stale/high bits
+  // in a recycled skinning buffer could select a completely different matrix
+  // (or index outside the packed 10 PN + 10 texture-matrix uniform array).
+  // Keep Aurora's packed-matrix representation, but apply the hardware mask
+  // before converting the raw XF-row selector to a packed matrix index.
+  const auto aurora_matrix_index_shader_v142 = p.aurora_src / "lib/gx/shader.cpp";
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(  case GX_VA_PNMTXIDX:
+    return fmt::format("(raw_fetch_u8_1(&{}, {}) / 3u)", buf, offs);
+  case GX_VA_TEX0MTXIDX:
+  case GX_VA_TEX1MTXIDX:
+  case GX_VA_TEX2MTXIDX:
+  case GX_VA_TEX3MTXIDX:
+  case GX_VA_TEX4MTXIDX:
+  case GX_VA_TEX5MTXIDX:
+  case GX_VA_TEX6MTXIDX:
+  case GX_VA_TEX7MTXIDX:
+    return fmt::format("raw_fetch_u8_1(&{}, {})", buf, offs);
+)GEKKO",
+R"GEKKO(  case GX_VA_PNMTXIDX:
+    // Flipper consumes only the low six bits of the direct matrix-index byte.
+    // Aurora stores three XF rows as one Mat3x4, hence /3 after masking.
+    return fmt::format("((raw_fetch_u8_1(&{}, {}) & 0x3fu) / 3u)", buf, offs);
+  case GX_VA_TEX0MTXIDX:
+  case GX_VA_TEX1MTXIDX:
+  case GX_VA_TEX2MTXIDX:
+  case GX_VA_TEX3MTXIDX:
+  case GX_VA_TEX4MTXIDX:
+  case GX_VA_TEX5MTXIDX:
+  case GX_VA_TEX6MTXIDX:
+  case GX_VA_TEX7MTXIDX:
+    return fmt::format("(raw_fetch_u8_1(&{}, {}) & 0x3fu)", buf, offs);
+)GEKKO", "Aurora six-bit per-vertex matrix indices v142");
+  std::cout << "GEKKOAOT_AURORA_VERTEX_MATRIX_INDEX_V142=1 "
+               "pn=mask6+packed-row-div3 tex=mask6 identity=60 reference=dolphin-vertex-loader\n";
+
+  // v143: model the XF transform bank as row-addressed Flipper memory rather
+  // than 10 packed SDK matrices. The hardware exposes 0x000..0x0ff as 64
+  // vec4 transform rows shared by position and texture transforms, and
+  // 0x400..0x45f as 32 vec3 normal rows. Per-vertex PNMTXIDX is a six-bit row
+  // selector; Dolphin reconstructs a matrix from rows idx, idx+1 and idx+2.
+  // This also makes partial/indexed XF loads coherent instead of requiring a
+  // perfectly aligned 12/9-word whole-matrix update.
+  const auto aurora_gx_h_v143 = p.aurora_src / "lib/gx/gx.hpp";
+  ReplaceOnceInFile(aurora_gx_h_v143,
+R"GEKKO(constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
+constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
+)GEKKO",
+R"GEKKO(constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
+constexpr u32 MaxXfPosRows = 64;
+constexpr u32 MaxXfPosUniformRows = 66; // idx 63 + two robust zero rows
+constexpr u32 MaxXfNrmRows = 32;
+constexpr u32 MaxXfNrmUniformRows = 34; // idx 31 + two robust zero rows
+constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
+)GEKKO", "Aurora XF row constants v143");
+
+  ReplaceOnceInFile(aurora_gx_h_v143,
+R"GEKKO(constexpr u32 MaxUniformSize = 3840;
+)GEKKO",
+R"GEKKO(constexpr u32 MaxUniformSize = 4096;
+)GEKKO", "Aurora XF expanded uniform capacity v143");
+
+  ReplaceOnceInFile(aurora_gx_h_v143,
+R"GEKKO(  // Decoded state
+  std::array<PnMtx, MaxPnMtx> pnMtx;
+  u32 currentPnMtx;
+)GEKKO",
+R"GEKKO(  // Decoded state
+  // Legacy packed matrices are retained for SDK-facing helpers/tests, but
+  // retail FIFO rendering uses the raw row-addressed XF banks below.
+  std::array<PnMtx, MaxPnMtx> pnMtx;
+  std::array<Vec4<float>, MaxXfPosRows> xfPosRows{};
+  std::array<Vec4<float>, MaxXfNrmRows> xfNrmRows{};
+  u32 currentPnMtx;
+)GEKKO", "Aurora XF raw row state v143");
+
+  // CP/XF MatrixIndexA stores a raw six-bit row selector. v141/v142 divided
+  // it by three only because Aurora previously addressed packed Mat3x4 slots.
+  ReplaceOnceInFile(aurora_regs_v141,
+R"GEKKO(void cp_mtx_index(u8, u32 value) noexcept {
+  g_gxState.currentPnMtx = reg_get(value, 6, 0) / 3;
+  g_gxState.xfRegValid.reset(0x18);
+)GEKKO",
+R"GEKKO(void cp_mtx_index(u8, u32 value) noexcept {
+  g_gxState.currentPnMtx = reg_get(value, 6, 0) & 0x3f;
+  g_gxState.xfRegValid.reset(0x18);
+)GEKKO", "Aurora CP raw PN row selector v143");
+
+  ReplaceOnceInFile(aurora_regs_v141,
+R"GEKKO(void xf_mtx_index_a(u8, u32 value) noexcept {
+  g_gxState.currentPnMtx = reg_get(value, 6, 0) / 3;
+)GEKKO",
+R"GEKKO(void xf_mtx_index_a(u8, u32 value) noexcept {
+  g_gxState.currentPnMtx = reg_get(value, 6, 0) & 0x3f;
+)GEKKO", "Aurora XF raw PN row selector v143");
+
+  ReplaceOnceInFile(aurora_regs_v141,
+R"GEKKO(  if (addr < 0x78) {
+    // Position matrices (0x0000-0x0077)
+    u32 mtxIdx = addr / 12;
+    u32 startOffset = addr % 12;
+    CHECK(mtxIdx < MaxPnMtx, "XF: PosMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
+    CHECK(startOffset == 0 && len == 12, "XF: PosMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
+    f32* flat = reinterpret_cast<f32*>(&g_gxState.pnMtx[mtxIdx].pos);
+    bool changed = false;
+    for (u32 i = 0; i < len; i++) {
+      changed |= store_xf_f32(flat[i], read_bits<u32>(data + i * 4, e));
+    }
+    if (changed) {
+      g_gxState.dirty |= DirtyUniform;
+    }
+    return true;
+  }
+  if (addr < 0x0F0) {
+    // Texture matrices (0x078-0x0EF)
+    u32 texBase = addr - 0x078;
+    u32 mtxIdx = texBase / 12;
+    u32 startOffset = texBase % 12;
+    CHECK(mtxIdx < MaxTexMtx, "XF TexMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
+    CHECK(startOffset == 0 && (len == 8 || len == 12), "XF TexMtx sub-copy unsupported: offs={}, len={}", startOffset,
+          len);
+
+    f32* flat = reinterpret_cast<f32*>(&g_gxState.texMtxs[mtxIdx]);
+    bool changed = false;
+    for (u32 i = 0; i < len; i++) {
+      changed |= store_xf_f32(flat[i], read_bits<u32>(data + i * 4, e));
+    }
+    if (changed) {
+      g_gxState.dirty |= DirtyUniform;
+    }
+    return true;
+  }
+)GEKKO",
+R"GEKKO(  if (addr < 0x100 && len <= 0x100 - addr) {
+    // Flipper XF transform memory is one row-addressed bank shared by
+    // position and regular texture matrices (0x0000-0x00ff). Accept arbitrary
+    // aligned or partial loads instead of assuming SDK whole-matrix commands.
+    bool changed = false;
+    for (u32 i = 0; i < len; ++i) {
+      const u32 word = addr + i;
+      const u32 row = word / 4;
+      const u32 col = word % 4;
+      changed |= store_xf_f32(g_gxState.xfPosRows[row][col],
+                              read_bits<u32>(data + i * 4, e));
+    }
+    if (changed) g_gxState.dirty |= DirtyUniform;
+    return true;
+  }
+)GEKKO", "Aurora raw XF position/texture rows v143");
+
+  ReplaceOnceInFile(aurora_regs_v141,
+R"GEKKO(  if (addr >= 0x400 && addr < 0x45A) {
+    // Normal matrices (0x400-0x459)
+    u32 nrmBase = addr - 0x400;
+    u32 mtxIdx = nrmBase / 9;
+    u32 startOffset = nrmBase % 9;
+    CHECK(mtxIdx < MaxPnMtx, "XF: NrmMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
+    CHECK(startOffset == 0 && len == 9, "XF: NrmMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
+    f32* flat = reinterpret_cast<f32*>(&g_gxState.pnMtx[mtxIdx].nrm);
+    bool changed = false;
+    for (u32 i = 0; i < len; i++) {
+      // 3x3 source packed into 3x4 storage
+      u32 row = i / 3;
+      u32 col = i % 3;
+      changed |= store_xf_f32(flat[row * 4 + col], read_bits<u32>(data + i * 4, e));
+    }
+    if (changed) {
+      g_gxState.dirty |= DirtyUniform;
+    }
+    return true;
+  }
+)GEKKO",
+R"GEKKO(  if (addr >= 0x400 && addr < 0x460 && len <= 0x460 - addr) {
+    // Normal XF memory is 32 row-addressed vec3 rows. The PN selector uses
+    // its low five bits for normals, matching Flipper/Dolphin.
+    bool changed = false;
+    for (u32 i = 0; i < len; ++i) {
+      const u32 word = (addr - 0x400) + i;
+      const u32 row = word / 3;
+      const u32 col = word % 3;
+      changed |= store_xf_f32(g_gxState.xfNrmRows[row][col],
+                              read_bits<u32>(data + i * 4, e));
+    }
+    if (changed) g_gxState.dirty |= DirtyUniform;
+    return true;
+  }
+)GEKKO", "Aurora raw XF normal rows v143");
+
+  const auto aurora_shader_info_v143 = p.aurora_src / "lib/gx/shader_info.cpp";
+  ReplaceOnceInFile(aurora_shader_info_v143,
+R"GEKKO(  // 10 position matrices, 10 texture matrices, 10 normal matrices.
+  info.uniformSize += sizeof(Mat3x4<float>) * 30;
+)GEKKO",
+R"GEKKO(  // Raw Flipper XF row banks: 64 transform rows (+2 zero safety rows)
+  // and 32 normal rows (+2 zero safety rows).
+  info.uniformSize += sizeof(Vec4<float>) * (MaxXfPosUniformRows + MaxXfNrmUniformRows);
+)GEKKO", "Aurora XF raw uniform sizing v143");
+
+  ReplaceOnceInFile(aurora_shader_info_v143,
+R"GEKKO(  for (int i = 0; i < MaxPnMtx; i++) {
+    buf.append(g_gxState.pnMtx[i].pos);
+  }
+
+  for (int i = 0; i < MaxTexMtx; i++) {
+    buf.append(g_gxState.texMtxs[i]);
+  }
+
+  for (int i = 0; i < MaxPnMtx; i++) {
+    buf.append(g_gxState.pnMtx[i].nrm);
+  }
+)GEKKO",
+R"GEKKO(  for (const auto& row : g_gxState.xfPosRows) buf.append(row);
+  for (u32 i = MaxXfPosRows; i < MaxXfPosUniformRows; ++i) buf.append(Vec4<float>{});
+  for (const auto& row : g_gxState.xfNrmRows) buf.append(row);
+  for (u32 i = MaxXfNrmRows; i < MaxXfNrmUniformRows; ++i) buf.append(Vec4<float>{});
+)GEKKO", "Aurora XF raw uniform upload v143");
+
+  // v142's six-bit mask remains correct, but /3 is not: PNMTXIDX addresses a
+  // raw XF row. Texture matrix indices are raw rows as well.
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(    // Flipper consumes only the low six bits of the direct matrix-index byte.
+    // Aurora stores three XF rows as one Mat3x4, hence /3 after masking.
+    return fmt::format("((raw_fetch_u8_1(&{}, {}) & 0x3fu) / 3u)", buf, offs);
+)GEKKO",
+R"GEKKO(    // Flipper consumes the low six bits as a raw XF row selector.
+    return fmt::format("(raw_fetch_u8_1(&{}, {}) & 0x3fu)", buf, offs);
+)GEKKO", "Aurora raw per-vertex PN row selector v143");
+
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(  uniBufAttrs += "\n    proj: mat4x4f,";
+  uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", MaxPnMtx + MaxTexMtx);
+  uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", MaxPnMtx);
+)GEKKO",
+R"GEKKO(  uniBufAttrs += "\n    proj: mat4x4f,";
+  uniBufAttrs += fmt::format("\n    xf_pos_rows: array<vec4f, {}>,", MaxXfPosUniformRows);
+  uniBufAttrs += fmt::format("\n    xf_nrm_rows: array<vec4f, {}>,", MaxXfNrmUniformRows);
+  texBindings += R"WGSL(
+fn gekkoaot_xf_pos(v: vec4f, idx_raw: u32) -> vec3f {
+    let i = idx_raw & 0x3fu;
+    return vec3f(dot(v, ubuf.xf_pos_rows[i]),
+                 dot(v, ubuf.xf_pos_rows[i + 1u]),
+                 dot(v, ubuf.xf_pos_rows[i + 2u]));
+}
+fn gekkoaot_xf_nrm(v: vec4f, idx_raw: u32) -> vec3f {
+    let i = idx_raw & 31u;
+    return vec3f(dot(v, ubuf.xf_nrm_rows[i]),
+                 dot(v, ubuf.xf_nrm_rows[i + 1u]),
+                 dot(v, ubuf.xf_nrm_rows[i + 2u]));
+}
+)WGSL";
+)GEKKO", "Aurora raw XF shader uniforms/helpers v143");
+
+  // Position paths: points, expanded lines and ordinary triangles.
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(          "\n    let mv_pos = vec4f(in_pos, 1.0) * ubuf.postex_mtx[in_pnmtxidx];",
+)GEKKO",
+R"GEKKO(          "\n    let mv_pos = gekkoaot_xf_pos(vec4f(in_pos, 1.0), in_pnmtxidx);",
+)GEKKO", "Aurora XF point position v143");
+
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(          "\n    let mv_pos_a = vec4f(pos_a, 1.0) * ubuf.postex_mtx[pnmtxidx_a];"
+          "\n    let mv_pos_b = vec4f(pos_b, 1.0) * ubuf.postex_mtx[pnmtxidx_b];"
+)GEKKO",
+R"GEKKO(          "\n    let mv_pos_a = gekkoaot_xf_pos(vec4f(pos_a, 1.0), pnmtxidx_a);"
+          "\n    let mv_pos_b = gekkoaot_xf_pos(vec4f(pos_b, 1.0), pnmtxidx_b);"
+)GEKKO", "Aurora XF line position v143");
+
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(    vtxXfrAttrsPre += fmt::format(
+        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
+        "\n    out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;",
+        vtx_attr(config, GX_VA_POS));
+)GEKKO",
+R"GEKKO(    vtxXfrAttrsPre += fmt::format(
+        "\n    let mv_pos = gekkoaot_xf_pos(vec4f({}, 1.0), in_pnmtxidx);"
+        "\n    out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;",
+        vtx_attr(config, GX_VA_POS));
+)GEKKO", "Aurora XF triangle position v143");
+
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(  vtxXfrAttrsPre += fmt::format(
+      "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+      "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
+      vtx_attr(config, GX_VA_NRM));
+)GEKKO",
+R"GEKKO(  vtxXfrAttrsPre += fmt::format(
+      "\n    let nrm_tmp = gekkoaot_xf_nrm(vec4f({}, 0.0), in_pnmtxidx);"
+      "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
+      vtx_attr(config, GX_VA_NRM));
+)GEKKO", "Aurora XF vertex normal v143");
+
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(          "\n    let bump_tan{0} = vec4f(in_tangent, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+          "\n    let bump_bin{0} = vec4f(in_binrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+)GEKKO",
+R"GEKKO(          "\n    let bump_tan{0} = gekkoaot_xf_nrm(vec4f(in_tangent, 0.0), in_pnmtxidx);"
+          "\n    let bump_bin{0} = gekkoaot_xf_nrm(vec4f(in_binrm, 0.0), in_pnmtxidx);"
+)GEKKO", "Aurora XF bump normals v143");
+
+  // Regular texture transforms select rows from the same 64-row XF bank.
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(        // GX_IDENTITY (60) bypasses the texture matrix. It would otherwise
+        // address postex_mtx[20], one element past the 10 PN + 10 tex matrices.
+        vtxXfrAttrs += fmt::format(
+            "\n    var tc{0}_tmp = tc{0}.xyz;"
+            "\n    if (in_texmtxidx{0} < {1}u) {{"
+            "\n        tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];"
+            "\n    }}",
+            i, static_cast<u32>(GX_IDENTITY));
+)GEKKO",
+R"GEKKO(        // GX_IDENTITY (60) bypasses the texture matrix; every other
+        // direct index selects a raw row in the shared XF transform bank.
+        vtxXfrAttrs += fmt::format(
+            "\n    var tc{0}_tmp = tc{0}.xyz;"
+            "\n    if (in_texmtxidx{0} < {1}u) {{"
+            "\n        tc{0}_tmp = gekkoaot_xf_pos(tc{0}, in_texmtxidx{0});"
+            "\n    }}",
+            i, static_cast<u32>(GX_IDENTITY));
+)GEKKO", "Aurora XF dynamic texture matrix v143");
+
+  ReplaceOnceInFile(aurora_matrix_index_shader_v142,
+R"GEKKO(        u32 texMtxIdx = (tcg.mtx) / 3;
+        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
+)GEKKO",
+R"GEKKO(        const u32 texMtxRow = static_cast<u32>(tcg.mtx) & 0x3fu;
+        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = gekkoaot_xf_pos(tc{0}, {1}u);", i, texMtxRow);
+)GEKKO", "Aurora XF fixed texture matrix v143");
+
+  std::cout << "GEKKOAOT_AURORA_XF_PARITY_V143=1 "
+               "transform-rows=64 normal-rows=32 pn=row-index texture=shared-bank partial-loads=1 reference=dolphin-xfmem\\n";
+
   const auto aurora_tev_alpha_compare_patch =
       p.root / "patches/aurora/gekkoaot-tev-alpha-compare-v2.patch";
   if (!fs::exists(aurora_tev_alpha_compare_patch))
@@ -753,6 +1268,277 @@ void EnsureSources(Pipeline& p) {
               Quote(aurora_tev_alpha_compare_patch)),
           "Aurora TEV alpha-compare patch");
   std::cout << "GEKKOAOT_AURORA_TEV_ALPHA_COMPARE_V2B=1 compare=prestage-color-ab a8=alpha-ab wgsl=type-safe rebased=post-shader-vertex\n";
+
+  const auto aurora_efb_depth_copy_patch =
+      p.root / "patches/aurora/gekkoaot-efb-depth-copy-v1.patch";
+  if (!fs::exists(aurora_efb_depth_copy_patch))
+    throw std::runtime_error("missing Aurora EFB depth-copy patch: "+
+                             aurora_efb_depth_copy_patch.string());
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --check "+
+              Quote(aurora_efb_depth_copy_patch)),
+          "Aurora EFB depth-copy patch check");
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply "+
+              Quote(aurora_efb_depth_copy_patch)),
+          "Aurora EFB depth-copy patch");
+  std::cout << "GEKKOAOT_AURORA_EFB_DEPTH_COPY_V1=1 "
+               "formats=z4+z8+z8m+z8l+z16+z16r+z16l+z24x8 raw-z16r=0x3b\n";
+
+  const auto aurora_ztexture_patch =
+      p.root / "patches/aurora/gekkoaot-ztexture-v1.patch";
+  if (!fs::exists(aurora_ztexture_patch))
+    throw std::runtime_error("missing Aurora Z-texture patch: "+
+                             aurora_ztexture_patch.string());
+  // shader.cpp and texture_convert.cpp are already changed by earlier Aurora
+  // patches. Apply every independent Z-texture hunk with git, then patch those
+  // two files through exact unique anchors. This avoids nested-patch line drift.
+  const std::string ztexture_excludes =
+      " --exclude=lib/gx/shader.cpp --exclude=lib/gfx/texture_convert.cpp ";
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --recount --check"+ztexture_excludes+
+              Quote(aurora_ztexture_patch)),
+          "Aurora Z-texture independent patch check");
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --recount"+ztexture_excludes+
+              Quote(aurora_ztexture_patch)),
+          "Aurora Z-texture independent patch");
+
+  const auto aurora_shader = p.aurora_src / "lib/gx/shader.cpp";
+  ReplaceOnceInFile(aurora_shader,
+R"GEKKO(  std::string vtxXfrAttrsPre;
+  std::string vtxXfrAttrs;
+  size_t vtxOutIdx = 0;
+
+  // Load points for line/point expansion
+)GEKKO",
+R"GEKKO(  std::string vtxXfrAttrsPre;
+  std::string vtxXfrAttrs;
+  size_t vtxOutIdx = 0;
+  const bool zTextureEnabled = config.zTexOp != GX_ZT_DISABLE && config.tevStageCount != 0 &&
+                               config.tevStages[config.tevStageCount - 1].texMapId != GX_TEXMAP_NULL &&
+                               config.tevStages[config.tevStageCount - 1].texCoordId != GX_TEXCOORD_NULL;
+  if (zTextureEnabled) {
+    uniBufAttrs += "\n    ztex_bias: vec4u,";
+  }
+
+  // Load points for line/point expansion
+)GEKKO", "Aurora Z-texture shader state");
+
+  ReplaceOnceInFile(aurora_shader,
+R"GEKKO(    const bool needsTextureSample = uses_texture_sample(stage);
+    if (!needsTevTexCoord && !needsTextureSample) {
+)GEKKO",
+R"GEKKO(    const bool zTextureSource = zTextureEnabled && i + 1 == config.tevStageCount;
+    const bool needsTextureSample = uses_texture_sample(stage) || zTextureSource;
+    if (!needsTevTexCoord && !needsTextureSample) {
+)GEKKO", "Aurora Z-texture last-TEV sample");
+
+  ReplaceOnceInFile(aurora_shader,
+R"GEKKO(  auto shaderSource =
+)GEKKO",
+R"GEKKO(  // GekkoAOT: compose Z-texture fragment depth with Aurora's current
+  // normal-attachment and dual-source destination-alpha output paths.
+  if (zTextureEnabled) {
+    const u32 lastStageIdx = config.tevStageCount - 1;
+    std::string zTexValue;
+    switch (config.zTexType) {
+    case 0:
+      zTexValue = fmt::format("u32(round(clamp(sampled{0}.a, 0.0, 1.0) * 255.0))", lastStageIdx);
+      break;
+    case 1:
+      zTexValue = fmt::format(
+          "(u32(round(clamp(sampled{0}.r, 0.0, 1.0) * 255.0)) | "
+          "(u32(round(clamp(sampled{0}.a, 0.0, 1.0) * 255.0)) << 8u))", lastStageIdx);
+      break;
+    case 2:
+    default:
+      zTexValue = fmt::format(
+          "((u32(round(clamp(sampled{0}.r, 0.0, 1.0) * 255.0)) << 16u) | "
+          "(u32(round(clamp(sampled{0}.g, 0.0, 1.0) * 255.0)) << 8u) | "
+          "u32(round(clamp(sampled{0}.b, 0.0, 1.0) * 255.0)))", lastStageIdx);
+      break;
+    }
+    const std::string currentGuestDepth = UseReversedZ ? "(1.0 - in.pos.z)" : "in.pos.z";
+    const std::string addCurrent = config.zTexOp == GX_ZT_ADD
+                                       ? fmt::format(" + u32(round(clamp({}, 0.0, 1.0) * 16777215.0))", currentGuestDepth)
+                                       : std::string{};
+    const std::string hostDepth = UseReversedZ ? "1.0 - (f32(gx_z) / 16777215.0)"
+                                                : "f32(gx_z) / 16777215.0";
+    const std::string zDepthCode = fmt::format(
+        "\n    let gx_z = ({} + ubuf.ztex_bias.x{}) & 0x00FFFFFFu;"
+        "\n    let gx_depth = clamp({}, 0.0, 1.0);",
+        zTexValue, addCurrent, hostDepth);
+
+    if (dstAlphaMode == DstAlphaMode::DualSource) {
+      fragmentOutput =
+          "\nstruct FragmentOutput {\n"
+          "    @location(0) @blend_src(0) color: vec4f,\n"
+          "    @location(0) @blend_src(1) blend: vec4f,\n"
+          "    @builtin(frag_depth) depth: f32,\n"
+          "};\n";
+      fragmentOutputType = "FragmentOutput"sv;
+      fragmentReturn = zDepthCode +
+          "\n    var out: FragmentOutput;"
+          "\n    out.color = vec4f(prev.rgb, 1.0);"
+          "\n    out.blend = prev;"
+          "\n    out.depth = gx_depth;"
+          "\n    return out;";
+    } else if (normalAttachment != UINT32_MAX) {
+      fragmentOutput = fmt::format(
+          "\nstruct FragmentOutput {{\n"
+          "    @location(0) color: vec4f,\n"
+          "    @location({}) normal: vec4f,\n"
+          "    @builtin(frag_depth) depth: f32,\n"
+          "}};\n",
+          normalAttachment);
+      fragmentOutputType = "FragmentOutput"sv;
+      fragmentReturn = zDepthCode + "\n    var out: FragmentOutput;\n    out.color = prev;";
+      if (useNormalTarget) {
+        fragmentReturn +=
+            "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
+            "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
+            "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));";
+      } else {
+        fragmentReturn += "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);";
+      }
+      fragmentReturn += "\n    out.depth = gx_depth;\n    return out;";
+    } else {
+      fragmentOutput =
+          "\nstruct FragmentOutput {\n"
+          "    @location(0) color: vec4f,\n"
+          "    @builtin(frag_depth) depth: f32,\n"
+          "};\n";
+      fragmentOutputType = "FragmentOutput"sv;
+      fragmentReturn = zDepthCode +
+          "\n    var out: FragmentOutput;"
+          "\n    out.color = prev;"
+          "\n    out.depth = gx_depth;"
+          "\n    return out;";
+    }
+  }
+
+  auto shaderSource =
+)GEKKO", "Aurora Z-texture fragment output latest");
+
+  const auto aurora_texture_convert = p.aurora_src / "lib/gfx/texture_convert.cpp";
+  ReplaceOnceInFile(aurora_texture_convert,
+R"GEKKO(  case GX_TF_I8:
+    converted = DecodeTiled<TextureDecoderI8>(width, height, mips, data);
+)GEKKO",
+R"GEKKO(  case GX_TF_I8:
+  case GX_TF_Z8:
+    converted = DecodeTiled<TextureDecoderI8>(width, height, mips, data);
+)GEKKO", "Aurora Z8 load conversion");
+  ReplaceOnceInFile(aurora_texture_convert,
+R"GEKKO(  case GX_TF_IA8:
+    converted = DecodeTiled<TextureDecoderIA8>(width, height, mips, data);
+)GEKKO",
+R"GEKKO(  case GX_TF_IA8:
+  case GX_TF_Z16:
+    converted = DecodeTiled<TextureDecoderIA8>(width, height, mips, data);
+)GEKKO", "Aurora Z16 load conversion");
+  ReplaceOnceInFile(aurora_texture_convert,
+R"GEKKO(  case GX_TF_RGBA8:
+    converted = BuildRGBA8FromGCN(width, height, mips, data);
+)GEKKO",
+R"GEKKO(  case GX_TF_RGBA8:
+  case GX_TF_Z24X8:
+    converted = BuildRGBA8FromGCN(width, height, mips, data);
+)GEKKO", "Aurora Z24X8 load conversion");
+
+  std::cout << "GEKKOAOT_AURORA_ZTEXTURE_V1D=1 "
+               "bp=f4+f5 source=last-tev formats=z8+z16+z24x8 "
+               "ops=add+replace depth=fragment-output apply=aurora-latest-composed-output\n";
+  std::cout << "GEKKOAOT_AURORA_ZTEXTURE_WGSL_NEWLINE_V127G=1 escape=real-newline parser=wgsl-safe\n";
+
+  const auto aurora_draw_range_diag_patch =
+      p.root / "patches/aurora/gekkoaot-draw-range-diagnostics-v1.patch";
+  if (!fs::exists(aurora_draw_range_diag_patch))
+    throw std::runtime_error("missing Aurora draw-range diagnostics patch: "+
+                             aurora_draw_range_diag_patch.string());
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --recount --check "+
+              Quote(aurora_draw_range_diag_patch)),
+          "Aurora draw-range diagnostics patch check");
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --recount "+
+              Quote(aurora_draw_range_diag_patch)),
+          "Aurora draw-range diagnostics patch");
+  std::cout << "GEKKOAOT_AURORA_DRAW_RANGE_DIAGNOSTICS_V1=1 env=GEKKOAOT_GX_DIAG_DRAW_RANGES\n";
+
+  // v163: Aurora upstream already has an asynchronous CPU depth-peek snapshot
+  // for GXPeekZ. Add the matching color snapshot so the GameCube CPU-visible
+  // EFB color aperture can stay native too (Sunshine uses GXPeekARGB). The
+  // bridge reads the newest completed logical-frame snapshot and requests the
+  // next one, avoiding a synchronous GPU readback on every guest load.
+  const auto aurora_color_peek_patch =
+      p.root / "patches/aurora/gekkoaot-color-peek-v163.patch";
+  if (!fs::exists(aurora_color_peek_patch))
+    throw std::runtime_error("missing Aurora EFB color-peek patch: "+
+                             aurora_color_peek_patch.string());
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --unidiff-zero --recount --check "+
+              Quote(aurora_color_peek_patch)),
+          "Aurora EFB color-peek patch check");
+  Require(Run("git -C "+Quote(p.aurora_src)+" apply --unidiff-zero --recount "+
+              Quote(aurora_color_peek_patch)),
+          "Aurora EFB color-peek patch");
+  std::cout << "GEKKOAOT_AURORA_EFB_COLOR_PEEK_V163=1 policy=async-logical-frame-snapshot format=argb8\n";
+
+  // v133: preserve the complete modern Aurora renderer and change only the
+  // selection of its new GXSetDstAlpha dual-source path.  Aurora already has
+  // a correctness fallback for hardware without dual-source blending: an
+  // alpha-only prepass followed by the normal color pass.  Default to that
+  // fallback on GekkoAOT while retaining an env-controlled A/B switch.
+  const auto aurora_pipeline = p.aurora_src / "lib/gx/pipeline.cpp";
+  ReplaceOnceInFile(aurora_pipeline,
+R"GEKKO(#include <tracy/Tracy.hpp>
+
+namespace aurora::gx {
+)GEKKO",
+R"GEKKO(#include <tracy/Tracy.hpp>
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
+namespace aurora::gx {
+namespace {
+bool gekkoaot_allow_dual_source() noexcept {
+  const char* value = std::getenv("GEKKOAOT_AURORA_DUAL_SOURCE");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+std::atomic_bool g_gekkoaotDualSourceLog{false};
+} // namespace
+)GEKKO", "Aurora dual-source diagnostics helpers");
+  ReplaceOnceInFile(aurora_pipeline,
+R"GEKKO(    } else if (webgpu::g_dualSourceBlendingSupported && layout.colorAttachmentCount == 1) {
+      options.dstAlphaMode = DstAlphaMode::DualSource;
+    } else {
+      // Write alpha before RGB, no depth write
+)GEKKO",
+R"GEKKO(    } else if (webgpu::g_dualSourceBlendingSupported && gekkoaot_allow_dual_source() &&
+               layout.colorAttachmentCount == 1) {
+      if (!g_gekkoaotDualSourceLog.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "GEKKOAOT_AURORA_DUAL_SOURCE_V133=1 hit=1 path=dual-source\n");
+      }
+      options.dstAlphaMode = DstAlphaMode::DualSource;
+    } else {
+      if (webgpu::g_dualSourceBlendingSupported && layout.colorAttachmentCount == 1 &&
+          !g_gekkoaotDualSourceLog.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "GEKKOAOT_AURORA_DUAL_SOURCE_V133=0 hit=1 path=alpha-prepass\n");
+      }
+      // Write alpha before RGB, no depth write
+)GEKKO", "Aurora dual-source GXSetDstAlpha selector");
+  std::cout << "GEKKOAOT_AURORA_DUAL_SOURCE_GUARD_V133=1 "
+               "default=alpha-prepass optin=GEKKOAOT_AURORA_DUAL_SOURCE=1 "
+               "pin=9c0bf66f renderer=unchanged\n";
+
+  // Aurora 9c0bf66f already computes GX raster lighting from channel controls,
+  // material/ambient sources and the active light mask before TEV.  A blanket
+  // post-TEV RGB boost modifies textured and alpha/EFB passes as well, even if
+  // the shader also samples a lit raster channel.  Keep upstream's lighting and
+  // destination-alpha outputs intact instead of changing the final TEV color.
+  std::cout << "GEKKOAOT_AURORA_LIGHT_V128=1 policy=upstream-gx-channel-lighting "
+               "post-tev-boost=off shadow=aurora-9c0bf66f-native\n";
+  std::cout << "GEKKOAOT_AURORA_V131_BISECT=1 pin=9c0bf66f pre-3840-efb-alpha-fix modern-renderer=1\n";
 }
 fs::path BuildDolRecomp(Pipeline& p,std::string_view backend) {
   std::cout << "GEKKOAOT_SUBSTAGE=dolrecomp-build\n" << std::flush;
@@ -951,7 +1737,7 @@ fs::path CompileModuleVariant(Pipeline& p,const fs::path& dolrecomp,std::string_
   if(adaptive_hash!="none")
     tuning += "-adaptive-"+adaptive_hash+"-fullssa2-structural9-hostnative10";
   if(llvm_backend)
-    tuning += "-sharedpoll75-ctxabi76-globalindirect87-memrestart95-vmcap97";
+    tuning += "-sharedpoll75-ctxabi76-globalindirect87-memrestart95-vmcap97-ctrabi129-msree151";
   const auto artifact=p.cache/"modules"/p.game_id/(std::string("v")+GEKKOAOT_VERSION+"-"+
       std::string(backend)+"-"+std::string(policy_tag)+"-"+tuning+"-"+profile_hash+"-"+
       intercept_hash+"-"+std::string(GEKKOAOT_DOLRECOMP_REV).substr(0,8)+"-"+
@@ -966,7 +1752,7 @@ fs::path CompileModuleVariant(Pipeline& p,const fs::path& dolrecomp,std::string_
   if(llvm_backend) {
     const auto native_abi=Env("GEKKOAOT_NATIVE_ABI","unrestricted");
     const auto llvm_cache = p.cache/"dolrecomp-llvm"/(
-        std::string("cache19-context-capture-v76-")+intercept_hash+"-"+tuning+"-"+profile_hash+"-"+
+        std::string("cache21-msree151-ctrabi129-")+intercept_hash+"-"+tuning+"-"+profile_hash+"-"+
         std::string(GEKKOAOT_DOLRECOMP_REV).substr(0,8)+"-"+native_abi+
         "-state-in-memory-host-exact");
     fs::create_directories(llvm_cache);
@@ -1058,11 +1844,17 @@ fs::path EnsureSdkManifest(Pipeline& p,const fs::path&,std::string_view) {
   // policy, which meant an old 5-hook manifest could survive resolver fixes
   // forever.  Include the DOL plus an explicit resolver ABI in the cache key;
   // bump the ABI whenever admission/matching semantics change.
-  constexpr std::string_view kSdkResolverAbi = "22";
+  // v153 correctness default: SDK OS code stays in guest PPC->AOT unless
+  // GEKKOAOT_NATIVE_OS=1 explicitly opts into the host NativeOS replacement.
+  // Bump whenever resolver admission/matching or the effective NativeOS default
+  // changes so stale manifests cannot survive.
+  constexpr std::string_view kSdkResolverAbi = "30";
   const auto dol_hash = FileHash64(p.disc/"sys/main.dol");
   const std::string policy = std::string("auto=")+Env("GEKKOAOT_NATIVE_SDK_AUTO","1")+
-      ";os="+Env("GEKKOAOT_NATIVE_OS","1")+
+      ";os="+Env("GEKKOAOT_NATIVE_OS","0")+
       ";admission="+Env("GEKKOAOT_NATIVE_OS_ADMISSION","hot")+
+      ";bisect="+Env("GEKKOAOT_NATIVE_OS_BISECT","all")+
+      ";interrupt-leaves="+Env("GEKKOAOT_NATIVE_OS_INTERRUPT_LEAVES","0")+
       ";resolver="+std::string(kSdkResolverAbi)+
       ";dol="+dol_hash;
   const auto policy_hash=TextHash64(policy);
@@ -1100,7 +1892,7 @@ fs::path PgoDirectory(const Pipeline& p) {
   // LLVM instrumentation identities are tied to the generated CFG. Keep old
   // profiles available, but isolate profiles produced by this hot-path ABI so
   // stale counters cannot be silently reused after compiler CFG changes.
-  const auto compat=Env("GEKKOAOT_PGO_COMPAT_ID","perf25-context-capture-v76");
+  const auto compat=Env("GEKKOAOT_PGO_COMPAT_ID","perf29-guest-msr-ee-fence-v151");
   return p.cache/"pgo"/p.game_id/compat;
 }
 fs::path PgoMergedProfile(const Pipeline& p) { return PgoDirectory(p)/"merged.profdata"; }
@@ -1311,7 +2103,7 @@ fs::path CompileModule(Pipeline& p,const fs::path& dolrecomp,std::string_view ba
     return CompileModuleVariant(p,dolrecomp,backend,"perf21-adaptive-pgo-use",manifest,
                                 plan,force);
   }
-  return CompileModuleVariant(p,dolrecomp,backend,"perf22-context-capture-v76",manifest,
+  return CompileModuleVariant(p,dolrecomp,backend,"perf29-guest-msr-ee-fence-v151",manifest,
                               NormalCompilePlan(),force);
 }
 

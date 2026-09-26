@@ -263,6 +263,27 @@ void NativeCP::DrainSynchronousGpu() {
   }
 }
 
+bool NativeCP::StepPastHandledBreakpointOnce() {
+  // Do not weaken ordinary GX breakpoint semantics. This hook is only legal
+  // after the guest CP interrupt handler has disabled BPInt while leaving the
+  // breakpoint itself armed, and only when the runtime has separately observed
+  // a multi-frame all-thread idle deadlock.
+  if (!GPReadEnabled() || !BreakpointActive() || BreakpointInterruptEnabled() ||
+      fifo_rw_distance_ < 32u)
+    return false;
+
+  if (read_burst_ && !read_burst_(read_burst_user_, fifo_read_pointer_))
+    return false;
+
+  const std::uint32_t before = fifo_read_pointer_;
+  AdvancePointer(&fifo_read_pointer_);
+  fifo_rw_distance_ -= 32u;
+  if (fifo_read_pointer_ == fifo_write_pointer_)
+    fifo_rw_distance_ = 0u;
+
+  return fifo_read_pointer_ != before;
+}
+
 bool NativeCP::NotifyGatherWrite(std::uint32_t bytes) {
   gather_bytes_ += bytes;
   bool changed = false;

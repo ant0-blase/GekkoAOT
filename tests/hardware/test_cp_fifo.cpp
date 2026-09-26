@@ -29,6 +29,17 @@ int main() {
   CHECK(cp.FifoReadWriteDistance() == 64);
   CHECK(cp.InterruptPending());
   CHECK((cp.Status() & 0x10) != 0);
+
+  // Runtime-only deadlock recovery must not cross a breakpoint until the guest
+  // handler has acknowledged the breakpoint interrupt (BPInt cleared).
+  CHECK(!cp.StepPastHandledBreakpointOnce());
+  write(2, 0x13); // keep BP armed, clear BPInt; GP remains stopped
+  CHECK(cp.BreakpointActiveForHost());
+  CHECK(!cp.InterruptPending());
+  CHECK(cp.StepPastHandledBreakpointOnce());
+  CHECK(cp.FifoReadPointer() == 0x1060);
+  CHECK(cp.FifoReadWriteDistance() == 32);
+
   write(2, 0x11); // release breakpoint and drain through wrap
   CHECK(cp.FifoReadPointer() == 0x1000);
   CHECK(cp.FifoReadWriteDistance() == 0);

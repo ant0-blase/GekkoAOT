@@ -125,7 +125,21 @@ void BuildController::run(const BuildRequest& request)
     // default of 120 Hz. Match that known-good scheduling profile in v79.
     const int runtimeFpsLimit = matchGdb ? 120 : request.fpsLimit;
     env.insert("GEKKOAOT_HOST_FPS_LIMIT", QString::number(runtimeFpsLimit));
-    env.insert("GEKKOAOT_SAFE_HOST_BOUNDARIES", matchGdb ? "1" : "0");
+    // v153 correctness defaults: keep the SDK OS in guest PPC->AOT and force a
+    // HostRuntime boundary after every generated dispatch.  Explicit shell/game
+    // overrides still win, so NativeOS / chaining remain available for testing.
+    if (!env.contains("GEKKOAOT_NATIVE_OS"))
+        env.insert("GEKKOAOT_NATIVE_OS", "0");
+    if (!env.contains("GEKKOAOT_SAFE_HOST_BOUNDARIES"))
+        env.insert("GEKKOAOT_SAFE_HOST_BOUNDARIES", "1");
+    if (!env.contains("GEKKOAOT_SAFE_CHAIN_CYCLES"))
+        env.insert("GEKKOAOT_SAFE_CHAIN_CYCLES", "0");
+    // v154: the normal DVD path is a host-native FST/VFS service. Raw DI
+    // remains available as a compatibility fallback for direct hardware access.
+    if (!env.contains("GEKKOAOT_NATIVE_VFS"))
+        env.insert("GEKKOAOT_NATIVE_VFS", "1");
+    if (!env.contains("GEKKOAOT_VFS_GC_TIMING"))
+        env.insert("GEKKOAOT_VFS_GC_TIMING", "0");
     env.insert("GEKKOAOT_GUI_MATCH_GDB_ACTIVE", matchGdb ? "1" : "0");
     env.insert("GEKKOAOT_PERF_METRICS", "1");
     if (!env.contains("GEKKOAOT_FRAME_INTERPOLATION"))
@@ -143,9 +157,9 @@ void BuildController::run(const BuildRequest& request)
         env.insert(it.key(), it.value());
 
     if (matchGdb) {
-        emit outputReady("GEKKOAOT_GUI_MATCH_GDB_V79=1 host_fps=120 native_chain=0 gx_window=standalone diagnostics=off\n");
+        emit outputReady("GEKKOAOT_GUI_MATCH_GDB_V140=1 host_fps=120 native_chain=bounded gx_window=standalone diagnostics=off spin-yield=off\n");
     } else {
-        emit outputReady(QString("GEKKOAOT_GUI_MATCH_GDB_V79=0 host_fps=%1 native_chain=fast gx_window=embedded\n")
+        emit outputReady(QString("GEKKOAOT_GUI_MATCH_GDB_V140=0 host_fps=%1 native_chain=fast gx_window=embedded spin-yield=off\n")
                              .arg(request.fpsLimit));
     }
 

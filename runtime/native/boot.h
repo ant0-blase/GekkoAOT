@@ -67,7 +67,11 @@ inline bool LooksLikeGameId(std::span<const std::uint8_t> bytes) {
   if (bytes.size() < 6) return false;
   for (std::size_t i = 0; i < 6; ++i) {
     const unsigned c = bytes[i];
-    if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
+    // Retail IDs are normally uppercase, but Datel products are known to use
+    // a lowercase developer byte (for example GNHE5d). The disc header is
+    // otherwise validated by magic, so accept ASCII alphanumerics here.
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9'))) return false;
   }
   return true;
 }
@@ -121,13 +125,13 @@ inline GameCubeBootResult InitializeGameCubeBoot(
 
   // Mirror the GameCube BS2 HLE state without pulling in Dolphin's boot core.
   RequireWrite(memory.Write32(0x80000020u, kBootedFromBootrom), "boot source");
-  RequireWrite(memory.Write32(0x80000028u, static_cast<std::uint32_t>(memory.Mem1().size())),
+  RequireWrite(memory.Write32(0x80000028u, AddressSpace::ReportedMem1Size()),
                "physical memory size");
   RequireWrite(memory.Write32(0x8000002cu, kLatestDevkit), "console type");
   RequireWrite(memory.Write32(0x800000ccu, ntsc ? 0u : 1u), "VI mode");
   RequireWrite(memory.Write32(0x800000d0u, kAramSize), "ARAM size");
   RequireWrite(memory.Write32(0x800000ecu, kMem1CachedEnd), "debug monitor address");
-  RequireWrite(memory.Write32(0x800000f0u, static_cast<std::uint32_t>(memory.Mem1().size())),
+  RequireWrite(memory.Write32(0x800000f0u, AddressSpace::ReportedMem1Size()),
                "simulated memory size");
   RequireWrite(memory.Write32(0x800000f4u, 0u), "BI2 pointer");
   RequireWrite(memory.Write32(0x800000f8u, kBusClockHz), "bus clock");
@@ -154,8 +158,8 @@ inline GameCubeFstResult InitializeGameCubeFst(
   const std::uint32_t entries = ReadBe32(fst, 8u);
   if (!entries || std::uint64_t(entries) * 12ull > fst.size())
     throw std::runtime_error("fst.bin has an invalid entry count");
-  if (fst.size() > memory.Mem1().size())
-    throw std::runtime_error("fst.bin does not fit in MEM1");
+  if (fst.size() > AddressSpace::ReportedMem1Size())
+    throw std::runtime_error("fst.bin does not fit in retail MEM1");
 
   // The GC apploader places the FST at the top of MEM1 and lowers ArenaHi to
   // the start of that allocation.  Keep the same contract when we bypass the

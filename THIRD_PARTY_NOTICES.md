@@ -14,7 +14,7 @@ License: GNU General Public License v3.0. GekkoAOT's top-level `LICENSE` contain
 
 Upstream: `https://github.com/encounter/aurora`
 
-Pinned revision in v0.0.1: `7f2801cd0133c9333eadb4e2e6b24100c328d328`
+Pinned revision in v0.0.1: `3840bf9ae735191026e4d4edb0ce6f24d91f7eea`
 
 License: MIT.
 

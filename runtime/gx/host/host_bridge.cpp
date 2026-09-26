@@ -95,6 +95,12 @@ bool HostBridge::Open(const std::filesystem::path& path, Native::AddressSpace& m
   write_ = reinterpret_cast<WriteFn>(FindSymbol("gekkoaot_native_gx_write"));
   write_burst_ = reinterpret_cast<WriteBurstFn>(
       FindSymbol("gekkoaot_native_gx_write_burst"));
+  cache_control_ = reinterpret_cast<CacheControlFn>(
+      FindSymbol("gekkoaot_native_gx_cache_control"));
+  peek_efb_z_ = reinterpret_cast<PeekEfbZFn>(
+      FindSymbol("gekkoaot_native_gx_peek_z"));
+  peek_efb_argb_ = reinterpret_cast<PeekEfbArgbFn>(
+      FindSymbol("gekkoaot_native_gx_peek_argb"));
   present_ = reinterpret_cast<PresentFn>(FindSymbol("gekkoaot_native_gx_present"));
   present_xfb_ = reinterpret_cast<PresentXfbFn>(FindSymbol("gekkoaot_native_gx_present_xfb"));
   present_xfb_ex_ = reinterpret_cast<PresentXfbExFn>(
@@ -107,6 +113,8 @@ bool HostBridge::Open(const std::filesystem::path& path, Native::AddressSpace& m
       FindSymbol("gekkoaot_native_gx_present_interpolated"));
   interpolation_ready_ = reinterpret_cast<InterpolationReadyFn>(
       FindSymbol("gekkoaot_native_gx_frame_interpolation_ready"));
+  set_aspect_mode_ = reinterpret_cast<SetAspectModeFn>(
+      FindSymbol("gekkoaot_native_gx_set_aspect_mode"));
   should_quit_ = reinterpret_cast<ShouldQuitFn>(FindSymbol("gekkoaot_native_gx_should_quit"));
   shutdown_ = reinterpret_cast<ShutdownFn>(FindSymbol("gekkoaot_native_gx_shutdown"));
   set_pe_callback_ = reinterpret_cast<SetPeCallbackFn>(
@@ -158,12 +166,16 @@ void HostBridge::Close() {
   init_ = nullptr;
   write_ = nullptr;
   write_burst_ = nullptr;
+  cache_control_ = nullptr;
+  peek_efb_z_ = nullptr;
+  peek_efb_argb_ = nullptr;
   present_ = nullptr;
   present_xfb_ = nullptr;
   present_xfb_ex_ = nullptr;
   consume_frame_ready_ = nullptr;
   present_interpolated_ = nullptr;
   interpolation_ready_ = nullptr;
+  set_aspect_mode_ = nullptr;
   should_quit_ = nullptr;
   shutdown_ = nullptr;
   set_pe_callback_ = nullptr;
@@ -285,6 +297,21 @@ bool HostBridge::WriteBurst(const std::uint8_t* bytes, std::uint32_t size,
   return true;
 }
 
+void HostBridge::NotifyCacheControl(std::uint8_t operation, std::uint32_t address) {
+  if (!ready_ || !cache_control_) return;
+  cache_control_(operation, address);
+}
+
+bool HostBridge::PeekEfbZ(std::uint16_t x, std::uint16_t y, std::uint32_t* z) {
+  if (!ready_ || !peek_efb_z_ || !z) return false;
+  return peek_efb_z_(x, y, z);
+}
+
+bool HostBridge::PeekEfbArgb(std::uint16_t x, std::uint16_t y, std::uint32_t* argb) {
+  if (!ready_ || !peek_efb_argb_ || !argb) return false;
+  return peek_efb_argb_(x, y, argb);
+}
+
 void HostBridge::Present() {
   if (!ready_ || !present_) return;
   present_();
@@ -316,6 +343,15 @@ bool HostBridge::PresentInterpolated(float alpha) {
   const bool presented = present_interpolated_(std::clamp(alpha, 0.0f, 1.0f));
   if (should_quit_ && should_quit_()) quit_requested_ = true;
   return presented;
+}
+
+void HostBridge::SetAspectMode(const std::string& mode) {
+  if (!ready_ || !set_aspect_mode_) return;
+  // v128b exposes only exact 4:3 and live Stretched-to-Window. Accept the old
+  // fixed-wide strings as stretch so existing settings migrate harmlessly.
+  const bool stretch = mode == "stretch" || mode == "16:9" || mode == "16:10" ||
+                       mode == "21:9" || mode == "32:9";
+  set_aspect_mode_(stretch ? 1u : 0u);
 }
 
 void HostBridge::AdvanceCycles(std::uint64_t cycles) {

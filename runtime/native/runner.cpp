@@ -148,6 +148,9 @@ std::optional<GekkoAOT::NativeOS::Kind> ParseOsKind(std::string_view name) {
   GEKKOAOT_OS_KIND(SaveContext); GEKKOAOT_OS_KIND(LoadContext);
   GEKKOAOT_OS_KIND(ClearContext); GEKKOAOT_OS_KIND(InitContext);
   GEKKOAOT_OS_KIND(GetCurrentContext); GEKKOAOT_OS_KIND(SetCurrentContext);
+  GEKKOAOT_OS_KIND(LoadFpuContext); GEKKOAOT_OS_KIND(SaveFpuContext);
+  GEKKOAOT_OS_KIND(FillFpuContext); GEKKOAOT_OS_KIND(GetStackPointer);
+  GEKKOAOT_OS_KIND(SwitchStack);
   GEKKOAOT_OS_KIND(InitMutex); GEKKOAOT_OS_KIND(LockMutex);
   GEKKOAOT_OS_KIND(UnlockMutex); GEKKOAOT_OS_KIND(TryLockMutex);
   GEKKOAOT_OS_KIND(InitCond); GEKKOAOT_OS_KIND(WaitCond); GEKKOAOT_OS_KIND(SignalCond);
