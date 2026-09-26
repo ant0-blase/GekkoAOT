@@ -472,42 +472,35 @@ jobs:
           test -x "$LLVM_BIN/clang"
           test -x "$LLVM_BIN/clang++"
 
-          LIBCXX_LINK="$(find "$LLVM_PATH" -type f \( -name 'libc++.so' -o -name 'libc++.so.1' \) -print -quit)"
-          if [[ -z "$LIBCXX_LINK" ]]; then
-            echo "Bundled LLVM libc++ runtime was not found under $LLVM_PATH" >&2
-            find "$LLVM_PATH" -maxdepth 6 -type f \( -name 'libc++*' -o -name 'libunwind*' \) -print || true
-            exit 1
-          fi
-
-          LIBCXX_LIB_DIR="$(dirname "$LIBCXX_LINK")"
-
           export CC="$LLVM_BIN/clang"
           export CXX="$LLVM_BIN/clang++"
 
-          # Let Clang discover both libc++'s generic and target-specific
-          # include roots. Forcing only include/c++/v1 hides __config_site.
-          export CXXFLAGS="${CXXFLAGS:-} -stdlib=libc++"
-          export LDFLAGS="${LDFLAGS:-} -fuse-ld=lld -stdlib=libc++ -L$LIBCXX_LIB_DIR -Wl,-rpath,$LIBCXX_LIB_DIR"
+          # Homebrew llvm@20 does not bundle libc++ on Linux.
+          # Clang 20 works with the runner's libstdc++ ABI/runtime, so use that
+          # and bundle libstdc++ + libgcc_s into the portable toolchain.
+          LIBSTDCXX="$("$CXX" -print-file-name=libstdc++.so.6)"
+          LIBGCC_S="$("$CC" -print-file-name=libgcc_s.so.1)"
+          test -f "$LIBSTDCXX"
+          test -f "$LIBGCC_S"
 
-          export LD_LIBRARY_PATH="$LIBCXX_LIB_DIR:$LLVM_PATH/lib:${LD_LIBRARY_PATH:-}"
-          export PATH="$LLVM_BIN:$PWD/package/share/gekkoaot/toolchain/cmake/bin:$PWD/package/share/gekkoaot/toolchain/bin:$PATH"
+          export LDFLAGS="${LDFLAGS:-} -fuse-ld=lld"
+          export LD_LIBRARY_PATH="$LLVM_PATH/lib:${LD_LIBRARY_PATH:-}"
+          export PATH="$LLVM_BIN:$LLD_PATH/bin:$PWD/package/share/gekkoaot/toolchain/cmake/bin:$PWD/package/share/gekkoaot/toolchain/bin:$PATH"
 
           echo "Portable-engine compiler:"
           "$CC" --version
           "$CXX" --version
-          echo "libc++ runtime: $LIBCXX_LINK"
-          echo "CXXFLAGS=$CXXFLAGS"
+          echo "C++ runtime: $LIBSTDCXX"
+          echo "GCC runtime: $LIBGCC_S"
           echo "LDFLAGS=$LDFLAGS"
 
-          if command -v ld.lld >/dev/null 2>&1; then
-            ld.lld --version
-          fi
+          "$LLD_PATH/bin/ld.lld" --version
 
-          echo "Clang libc++ include search:"
-          "$CXX" -stdlib=libc++ -v -E -x c++ /dev/null 2>&1 |
+          echo "Clang default C++ include search:"
+          "$CXX" -v -E -x c++ /dev/null 2>&1 |
             sed -n '/#include <...> search starts here:/,/End of search list./p'
 
-          cat > "$RUNNER_TEMP/gekkoaot-libcxx-smoke.cpp" <<'EOF'
+          cat > "$RUNNER_TEMP/gekkoaot-cxx-smoke.cpp" <<'EOF'
           #include <string>
           #include <vector>
           int main() {
@@ -517,12 +510,19 @@ jobs:
           }
           EOF
 
-          "$CXX" $CXXFLAGS "$RUNNER_TEMP/gekkoaot-libcxx-smoke.cpp"             $LDFLAGS -o "$RUNNER_TEMP/gekkoaot-libcxx-smoke"
-          "$RUNNER_TEMP/gekkoaot-libcxx-smoke"
+          "$CXX" "$RUNNER_TEMP/gekkoaot-cxx-smoke.cpp" \
+            $LDFLAGS -o "$RUNNER_TEMP/gekkoaot-cxx-smoke"
+          "$RUNNER_TEMP/gekkoaot-cxx-smoke"
 
           ./package/bin/gekkoaotctl tools
 
-          python tools/stage_portable_toolchain.py capture-engine             --root "$PWD/package/share/gekkoaot"             --state "$PWD/portable-engine-state"             --platform Linux             --llvm-root "$LLVM_PATH"
+          python tools/stage_portable_toolchain.py capture-engine \
+            --root "$PWD/package/share/gekkoaot" \
+            --state "$PWD/portable-engine-state" \
+            --platform Linux \
+            --llvm-root "$LLVM_PATH" \
+            --runtime "$LIBSTDCXX" \
+            --runtime "$LIBGCC_S"
 
       - name: Prebuild portable engine (Windows)
         if: runner.os == 'Windows'

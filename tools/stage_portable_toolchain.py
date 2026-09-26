@@ -143,7 +143,8 @@ def find_first(root: Path, patterns: tuple[str, ...]) -> Path | None:
     candidates.sort(key=lambda p: (len(p.parts), len(str(p))))
     return candidates[0] if candidates else None
 
-def capture_engine(root: Path, state: Path, platform: str, llvm_root: Path | None) -> None:
+def capture_engine(root: Path, state: Path, platform: str, llvm_root: Path | None,
+                   runtime_files: list[Path]) -> None:
     platform = platform.lower()
     tc = root / "toolchain"
     bin_dir = tc / "bin"
@@ -202,29 +203,20 @@ def capture_engine(root: Path, state: Path, platform: str, llvm_root: Path | Non
                 if p.name.lower().startswith(("llvm", "lib", "zlib", "zstd")):
                     shutil.copy2(p, bin_dir / p.name)
         elif platform == "linux":
-            # Official LLVM Linux archives use libc++ internally. Keep the
-            # matching C++ runtime beside the portable engine for clean hosts.
-            runtime_patterns = (
-                "libLLVM*.so*",
-                "libc++.so*",
-                "libc++abi.so*",
-                "libunwind.so*",
-            )
+            # Homebrew llvm@20 does not bundle libc++ on Linux. Keep LLVM's
+            # shared runtime here; compiler runtimes are supplied explicitly
+            # with --runtime and copied below.
             copied = set()
-            for pattern in runtime_patterns:
-                for p in llvm_root.rglob(pattern):
-                    if not p.is_file():
-                        continue
-                    if p.name in copied:
-                        continue
-                    copied.add(p.name)
-                    shutil.copy2(p, lib_dir / p.name)
+            for p in llvm_root.rglob("libLLVM*.so*"):
+                if not p.is_file() or p.name in copied:
+                    continue
+                copied.add(p.name)
+                shutil.copy2(p, lib_dir / p.name)
 
-            if not any(name.startswith("libc++.so") for name in copied):
-                raise RuntimeError(
-                    "LLVM Linux bundle uses libc++, but no libc++.so runtime "
-                    "was found to stage into the portable package"
-                )
+    for runtime in runtime_files:
+        if not runtime.exists() or not runtime.is_file():
+            raise RuntimeError(f"portable runtime file missing: {runtime}")
+        shutil.copy2(runtime, lib_dir / runtime.name)
 
     for source, prefix in ((state / "src/Aurora", "Aurora"), (dst_dol, "DolRecomp")):
         for name in ("LICENSE", "LICENSE.txt", "COPYING"):
@@ -253,13 +245,19 @@ def main() -> int:
     c.add_argument("--state", required=True, type=Path)
     c.add_argument("--platform", required=True)
     c.add_argument("--llvm-root", type=Path)
+    c.add_argument("--runtime", action="append", type=Path, default=[])
 
     ns = ap.parse_args()
     if ns.cmd == "bootstrap":
         bootstrap(ns.root.resolve(), ns.platform.lower())
     else:
-        capture_engine(ns.root.resolve(), ns.state.resolve(), ns.platform.lower(),
-                       ns.llvm_root.resolve() if ns.llvm_root else None)
+        capture_engine(
+            ns.root.resolve(),
+            ns.state.resolve(),
+            ns.platform.lower(),
+            ns.llvm_root.resolve() if ns.llvm_root else None,
+            [runtime.resolve() for runtime in ns.runtime],
+        )
     return 0
 
 if __name__ == "__main__":
