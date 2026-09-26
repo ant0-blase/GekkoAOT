@@ -1,47 +1,92 @@
 # Releasing
 
-GekkoAOT uses two complementary pieces of automation:
+GekkoAOT releases are **manual-only**.
 
-1. **Release Please** prepares future version/changelog pull requests from Conventional Commits.
-2. **Release workflow** builds and publishes the version currently stored in `version.txt` whenever the matching `vX.Y.Z` tag does not yet exist.
+Normal development commits pushed to `main` — including `fix:`, `feat:`, `perf:`, `docs:`, `refactor:`, `build:`, `ci:` and `chore:` commits — do **not** create a Git tag or GitHub Release.
 
-This makes the initial `v0.0.1` publish automatic while keeping later version bumps reviewable.
+This is intentional: merging a bug fix must never silently publish a new version.
 
-## Initial v0.0.1
+## Release policy
 
-After this release-preparation change reaches `main`, `.github/workflows/release.yml` sees `version.txt = 0.0.1`.
-If `v0.0.1` does not exist, it:
+The release pipeline has one trigger:
 
-1. validates `CHANGELOG.md`;
-2. builds Linux x86_64 and Windows x86_64;
-3. stages the CMake install tree;
-4. creates OS/architecture-named archives and SHA-256 files;
-5. creates GitHub tag/release `v0.0.1` at that commit;
-6. attaches both platform archives/checksums.
+```text
+Actions -> Release -> Run workflow
+```
+
+There is no `push:` trigger on `.github/workflows/release.yml`.
+
+The version stored in `version.txt` is the version that will be published.
+
+For example, if:
+
+```text
+version.txt = 0.0.3
+```
+
+a manual Release workflow run will target:
+
+```text
+v0.0.3
+```
+
+provided that release does not already exist.
+
+## Publishing a new version
+
+1. Update `version.txt`.
+2. Update `CHANGELOG.md` / release notes for that version.
+3. Commit those release-preparation changes to `main`.
+4. Open **GitHub Actions -> Release**.
+5. Choose **Run workflow** on `main`.
+6. Leave `force_publish=false` for a new version.
+
+The workflow then:
+
+1. validates the version and release notes;
+2. checks whether `vX.Y.Z` already exists;
+3. builds Linux x86_64 and Windows x86_64;
+4. stages the portable package trees;
+5. creates archives/checksums;
+6. creates the Git tag and GitHub Release;
+7. uploads the release assets.
 
 `0.x` releases are marked as GitHub prereleases.
 
-## Future versions
+## What normal commits do
 
-Use Conventional Commits on normal development work, for example:
+These are ordinary development commits:
 
 ```text
-feat: add REL loader coverage for another relocation class
-fix: preserve VI timing across native scheduler wakeups
-perf: reduce redundant native FIFO boundary work
-docs: document GHLE69 compatibility state
+fix(windows): shorten native module cache paths
+feat: add another native SDK service
+perf: reduce FIFO boundary overhead
+docs: update compatibility notes
 ```
 
-Release Please groups these changes and opens/updates a release PR. The manifest is configured with `include-component-in-tag: false`, so the expected release boundary is exactly `vX.Y.Z` rather than `GekkoAOT-vX.Y.Z`. For the pre-1.0 policy in `release-please-config.json`:
+They may be merged directly to `main`.
 
-- `fix`, `feat`, `perf`, etc. normally advance the patch version;
-- a breaking change advances the minor version while the project is below `1.0.0`.
+They do **not**:
 
-When the release PR is merged, its updated `version.txt` has no corresponding tag yet. The release workflow therefore builds and publishes that exact version. After publication, Release Please sees the new release boundary and starts collecting changes for the next one.
+- bump `version.txt`;
+- create a release commit;
+- create a Git tag;
+- create a GitHub Release;
+- rebuild release assets.
 
-## GitHub repository setting
+A release happens only after an explicit manual workflow dispatch.
 
-Release Please needs permission to create release pull requests. In the repository's Actions settings, allow GitHub Actions to create pull requests, or provide an appropriately scoped token and configure the workflow to use it.
+## Rebuilding an existing release
+
+To rebuild the binary assets for the version currently stored in `version.txt`, manually run the **Release** workflow with:
+
+```text
+force_publish=true
+```
+
+If the matching GitHub Release already exists, the workflow keeps the existing tag/release and replaces its uploaded assets with the newly built packages.
+
+This is useful for rebuilding `v0.0.2` after a packaging-only correction without inventing `v0.0.3`.
 
 ## Asset names
 
@@ -50,16 +95,22 @@ Release assets follow:
 ```text
 GekkoAOT-vX.Y.Z-Linux-x86_64.tar.gz
 GekkoAOT-vX.Y.Z-Linux-x86_64.tar.gz.sha256
+GekkoAOT-vX.Y.Z-Linux-x86_64.AppImage
+GekkoAOT-vX.Y.Z-Linux-x86_64.AppImage.sha256
 GekkoAOT-vX.Y.Z-Windows-x86_64.zip
 GekkoAOT-vX.Y.Z-Windows-x86_64.zip.sha256
 ```
 
 ## Version source of truth
 
-`version.txt` is the canonical version file. Top-level CMake reads it during configure, so source builds, binaries and release automation cannot silently drift to different version numbers.
+`version.txt` is the canonical version file.
 
-Do not manually create a new GitHub release while leaving `version.txt` unchanged. Either merge the Release Please PR or intentionally update `version.txt` + `CHANGELOG.md` together.
+Top-level CMake reads it during configure, so source builds, binaries and the release workflow use the same version.
 
-## Rebuilding an existing release
+Do not manually create a new GitHub Release while leaving `version.txt` at another version.
 
-The workflow can be launched manually with `force_publish=true` to rebuild and replace the binary/checksum assets for the current `version.txt`. Manual release runs are intentionally restricted to the `main` branch. The existing tag and release notes are preserved.
+## Release Please configuration
+
+`release-please-config.json` and `.release-please-manifest.json` remain in the repository as versioning/changelog metadata, but the publication workflow no longer invokes or auto-merges Release Please.
+
+They therefore cannot create a tag or release from an ordinary commit.
