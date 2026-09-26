@@ -226,6 +226,23 @@ std::string TextHash64(std::string_view text) {
   std::ostringstream out; out<<std::hex<<h; return out.str();
 }
 
+std::string CacheComponent(std::string_view full_key) {
+#ifdef _WIN32
+  // Windows portable installs can easily hit the legacy MAX_PATH boundary once
+  // the descriptive AOT tuning/intercept key is nested below LOCALAPPDATA.
+  // Keep a readable prefix, but hash the full key so cache identity stays tied
+  // to every compiler/runtime parameter without requiring long-path support.
+  constexpr std::size_t kReadablePrefix=28;
+  std::string compact(full_key.substr(0,(std::min)(kReadablePrefix,full_key.size())));
+  while(!compact.empty() && (compact.back()=='-' || compact.back()=='.'))
+    compact.pop_back();
+  compact += "-h" + TextHash64(full_key);
+  return compact;
+#else
+  return std::string(full_key);
+#endif
+}
+
 fs::path ExecutablePath() {
 #ifdef _WIN32
   std::wstring w(32768,L'\0'); DWORD n=GetModuleFileNameW(nullptr,w.data(),static_cast<DWORD>(w.size())); w.resize(n); return fs::path(w);
@@ -1871,10 +1888,16 @@ fs::path CompileModuleVariant(Pipeline& p,const fs::path& dolrecomp,std::string_
     tuning += "-adaptive-"+adaptive_hash+"-fullssa2-structural9-hostnative10";
   if(llvm_backend)
     tuning += "-sharedpoll75-ctxabi76-globalindirect87-memrestart95-vmcap97-ctrabi129-msree151";
-  const auto artifact=p.cache/"modules"/p.game_id/(std::string("v")+GEKKOAOT_VERSION+"-"+
+  const std::string artifact_key=std::string("v")+GEKKOAOT_VERSION+"-"+
       std::string(backend)+"-"+std::string(policy_tag)+"-"+tuning+"-"+profile_hash+"-"+
       intercept_hash+"-"+std::string(GEKKOAOT_DOLRECOMP_REV).substr(0,8)+"-"+
-      std::string(GEKKOAOT_AURORA_REV).substr(0,8));
+      std::string(GEKKOAOT_AURORA_REV).substr(0,8);
+  const auto artifact=p.cache/"modules"/p.game_id/CacheComponent(artifact_key);
+#ifdef _WIN32
+  std::cout<<"GEKKOAOT_WINDOWS_CACHE_PATH_V1=1 kind=module full-key-chars="<<artifact_key.size()
+           <<" compact-key=\""<<artifact.filename().string()<<"\" path-chars="
+           <<artifact.wstring().size()<<"\n";
+#endif
   const auto module=artifact/("g"+p.game_id+"_recomp"+SharedSuffix());
   if(fs::exists(module)&&!force){std::cout<<"cache hit: native module "<<module<<"\nGEKKOAOT_PROGRESS=93|Native module cache hit\n";return module;}
   fs::create_directories(artifact);
@@ -1884,10 +1907,16 @@ fs::path CompileModuleVariant(Pipeline& p,const fs::path& dolrecomp,std::string_
   std::string gen;
   if(llvm_backend) {
     const auto native_abi=Env("GEKKOAOT_NATIVE_ABI","unrestricted");
-    const auto llvm_cache = p.cache/"dolrecomp-llvm"/(
+    const std::string llvm_cache_key=
         std::string("cache21-msree151-ctrabi129-")+intercept_hash+"-"+tuning+"-"+profile_hash+"-"+
         std::string(GEKKOAOT_DOLRECOMP_REV).substr(0,8)+"-"+native_abi+
-        "-state-in-memory-host-exact");
+        "-state-in-memory-host-exact";
+    const auto llvm_cache=p.cache/"dolrecomp-llvm"/CacheComponent(llvm_cache_key);
+#ifdef _WIN32
+    std::cout<<"GEKKOAOT_WINDOWS_CACHE_PATH_V1=1 kind=llvm full-key-chars="<<llvm_cache_key.size()
+             <<" compact-key=\""<<llvm_cache.filename().string()<<"\" path-chars="
+             <<llvm_cache.wstring().size()<<"\n";
+#endif
     fs::create_directories(llvm_cache);
     gen = "cmake -E env " +
           QuoteText(std::string("DOLRECOMP_LLVM_CACHE=")+llvm_cache.string()) + " " +
