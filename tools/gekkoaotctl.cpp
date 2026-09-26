@@ -1576,13 +1576,33 @@ fs::path BuildDolRecomp(Pipeline& p,std::string_view backend) {
   std::string cfg="cmake -S "+Quote(p.dolrecomp_src)+" -B "+Quote(b)+" -G Ninja -DCMAKE_BUILD_TYPE=Release -DDOLRECOMP_ENABLE_LLVM="+(llvm_backend?"ON":"OFF");
   const auto llvm=Env("GEKKOAOT_LLVM_DIR");
   if(llvm_backend&&!llvm.empty()) cfg += " -DLLVM_DIR="+Quote(fs::path(llvm));
-  Require(Run(cfg),"DolRecomp configure"); Require(Run("cmake --build "+Quote(b)+" --target dolrecomp -j"+std::to_string(Jobs())),"DolRecomp build");
-  fs::path exe=b/"dolrecomp";
+  Require(Run(cfg),"DolRecomp configure");
+  Require(Run("cmake --build "+Quote(b)+" --target dolrecomp -j"+std::to_string(Jobs())),
+          "DolRecomp build");
+
 #ifdef _WIN32
-  if(!fs::exists(exe))exe=b/"Release/dolrecomp.exe";
+  // Ninja is a single-config generator, so the executable is emitted directly
+  // into the build root as dolrecomp.exe. Keep Release/ as a fallback for
+  // multi-config/stale build trees, then search recursively as a last resort.
+  fs::path exe=b/"dolrecomp.exe";
+  if(!fs::exists(exe)) exe=b/"Release/dolrecomp.exe";
+  if(!fs::exists(exe)) {
+    const auto found=FindFileRecursive(b,"dolrecomp.exe");
+    if(!found.empty()) exe=found;
+  }
+#else
+  fs::path exe=b/"dolrecomp";
+  if(!fs::exists(exe)) {
+    const auto found=FindFileRecursive(b,"dolrecomp");
+    if(!found.empty()) exe=found;
+  }
 #endif
-  if (!fs::exists(exe))
-    throw std::runtime_error("dolrecomp executable not found");
+
+  if(!fs::exists(exe))
+    throw std::runtime_error("dolrecomp executable not found under "+b.string());
+
+  std::cout<<"GEKKOAOT_DOLRECOMP_BUILT_V1=1 path=\""<<exe.string()
+           <<"\" backend="<<backend<<"\n";
   return exe;
 }
 void PrepareCMakeBuildTree(const fs::path& build_dir, const fs::path& source_dir) {
