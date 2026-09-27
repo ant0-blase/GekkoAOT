@@ -1980,7 +1980,16 @@ fs::path CompileModuleVariant(Pipeline& p,const fs::path& dolrecomp,std::string_
   if(!fs::exists(smc)) { for(const auto& e:fs::directory_iterator(generated)) if(e.is_regular_file()&&e.path().filename().string().ends_with("_smc.txt")){fs::copy_file(e.path(),smc,fs::copy_options::overwrite_existing);break;} }
   if(!fs::exists(smc))WriteText(smc,"");
   const auto tables=artifact/"module_tables.inc";
-  Require(Run(Quote(p.meta_tool)+" "+Quote(generated/"generated.h")+" "+Quote(smc)+" "+Quote(p.disc/"sys/main.dol")+" "+Quote(tables)),"module metadata");
+  Require(
+      RunProcess(
+          p.meta_tool,
+          std::vector<fs::path>{
+              generated/"generated.h",
+              smc,
+              p.disc/"sys/main.dol",
+              tables,
+          }),
+      "module metadata");
   const auto mb=artifact/"module-build"; std::error_code ec; fs::remove_all(mb,ec);
   std::string cfg="cmake -S "+Quote(p.root/"runtime/module")+" -B "+Quote(mb)+" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGAME_ID="+QuoteText(p.game_id)+" -DGENERATED_DIR="+Quote(generated)+" -DDOLRECOMP_DIR="+Quote(p.dolrecomp_src)+" -DGEKKOAOT_ROOT="+Quote(p.root)+" -DMODULE_TABLES="+Quote(tables);
   const auto portable_toolchain=p.root/"toolchain/gekkoaot-zig.cmake";
