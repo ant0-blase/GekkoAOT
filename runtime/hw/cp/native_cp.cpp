@@ -292,6 +292,21 @@ bool NativeCP::StepPastHandledBreakpointOnce() {
 }
 
 bool NativeCP::NotifyGatherWrite(std::uint32_t bytes) {
+  // HostRuntime publishes one complete hardware gather line at a time. Avoid
+  // accumulator-loop overhead on that steady-state renderer path.
+  if (bytes == 32u && gather_bytes_ == 0u) {
+    if (!GPLinkEnabled()) return false;
+    AdvancePointer(&fifo_write_pointer_);
+    const std::uint32_t fifo_span =
+        fifo_end_ >= fifo_base_ ? (fifo_end_ - fifo_base_ + 32u) : 0u;
+    if (fifo_span != 0u)
+      fifo_rw_distance_ = std::min(fifo_rw_distance_ + 32u, fifo_span);
+    else
+      fifo_rw_distance_ += 32u;
+    if (GPReadEnabled()) DrainSynchronousGpu();
+    return true;
+  }
+
   gather_bytes_ += bytes;
   bool changed = false;
   while (gather_bytes_ >= 32u) {
@@ -299,9 +314,6 @@ bool NativeCP::NotifyGatherWrite(std::uint32_t bytes) {
     if (!GPLinkEnabled()) continue;
     changed = true;
     AdvancePointer(&fifo_write_pointer_);
-    // SDK top is base + size - 4, but WriteLow/WriteHigh store the CP
-    // register with its low five bits cleared. fifo_end_ therefore names
-    // the final 32-byte burst, not the last word of that burst.
     const std::uint32_t fifo_span =
         fifo_end_ >= fifo_base_ ? (fifo_end_ - fifo_base_ + 32u) : 0u;
     if (fifo_span != 0u)

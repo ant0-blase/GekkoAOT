@@ -327,7 +327,14 @@ static int generate_project(const char* project,const char* generated,const char
   fclose(c);printf("GEKKOAOT_SECONDARY_ROUTER=1 chunks=%zu source=%s\n",chunks.n,generated);free(chunks.v);return 1;
 }
 
-static int build_project(const char* project,const char* build,int jobs){char cmd[16384];snprintf(cmd,sizeof(cmd),"cmake -S");qappend(cmd,sizeof(cmd),project);strcat(cmd," -B");qappend(cmd,sizeof(cmd),build);strcat(cmd," -G Ninja -DCMAKE_BUILD_TYPE=Release");if(run_cmd(cmd))return 0;snprintf(cmd,sizeof(cmd),"cmake --build");qappend(cmd,sizeof(cmd),build);char tail[64];snprintf(tail,sizeof(tail)," -j%d",jobs);strcat(cmd,tail);return run_cmd(cmd)==0;}
+static int build_project(const char* project,const char* build,int jobs){char cmd[16384];
+  // AppImages mount at a different /tmp/.mount_* path on every launch. CMake
+  // caches absolute compiler/toolchain/Ninja paths, so a side-module build tree
+  // from an older launch becomes invalid even though its LLVM objects are still
+  // reusable. Recreate only this tiny CMake build tree.
+  snprintf(cmd,sizeof(cmd),"cmake -E rm -rf");qappend(cmd,sizeof(cmd),build);if(run_cmd(cmd))return 0;
+  snprintf(cmd,sizeof(cmd),"cmake -S");qappend(cmd,sizeof(cmd),project);strcat(cmd," -B");qappend(cmd,sizeof(cmd),build);strcat(cmd," -G Ninja -DCMAKE_BUILD_TYPE=Release");if(run_cmd(cmd))return 0;
+  snprintf(cmd,sizeof(cmd),"cmake --build");qappend(cmd,sizeof(cmd),build);char tail[64];snprintf(tail,sizeof(tail)," -j%d",jobs);strcat(cmd,tail);return run_cmd(cmd)==0;}
 
 static int find_generated_for_rel(const StrVec* headers,uint32_t module_id,char* out,size_t cap){char suffix[64];snprintf(suffix,sizeof(suffix),"_%u",module_id);for(size_t i=0;i<headers->n;i++){char d[MAX_PATHBUF];dir_name(d,sizeof(d),headers->v[i]);const char* b=base_name(d);size_t bn=strlen(b),sn=strlen(suffix);if(bn>=sn&&!strcmp(b+bn-sn,suffix)){snprintf(out,cap,"%s",d);return 1;}}return 0;}
 static void collect_dol_code(const char* p,RangeVec* code,uint32_t* entry){size_t n=0;unsigned char* d=read_file(p,&n);if(!d||n<0x100)die("invalid DOL while collecting code");*entry=be32(d+0xe0);for(int i=0;i<7;i++){uint32_t a=be32(d+0x48+i*4),z=be32(d+0x90+i*4);if(z)rv_push(code,a,a+z);}free(d);qsort(code->v,code->n,sizeof(Range),range_cmp);}

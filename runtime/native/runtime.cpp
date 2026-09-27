@@ -1895,14 +1895,22 @@ bool HostRuntime::QueueGpuFifoGather(std::uint64_t value, std::uint8_t size,
   if (!native_gx_.Ready()) return false;
   if (gpu_fifo_gather_size_ == 0u) gpu_fifo_first_pc_ = guest_pc;
 
-  for (std::uint8_t i = 0; i < size; ++i) {
-    gpu_fifo_gather_[gpu_fifo_gather_size_++] =
-        static_cast<std::uint8_t>(value >> ((size - 1u - i) * 8u));
+  // Materialize the big-endian store once, then copy contiguous spans into the
+  // 32-byte gather line. This removes the branch/shift/store loop from the
+  // common 32/64-bit WGPIPE path while preserving line-straddling stores.
+  std::uint8_t ordered[8];
+  for (std::uint8_t i = 0; i < size; ++i)
+    ordered[i] = static_cast<std::uint8_t>(value >> ((size - 1u - i) * 8u));
+
+  std::uint8_t consumed = 0u;
+  while (consumed < size) {
+    const std::size_t room = gpu_fifo_gather_.size() - gpu_fifo_gather_size_;
+    const std::size_t chunk = std::min<std::size_t>(room, size - consumed);
+    std::memcpy(gpu_fifo_gather_.data() + gpu_fifo_gather_size_, ordered + consumed, chunk);
+    gpu_fifo_gather_size_ += static_cast<std::uint32_t>(chunk);
+    consumed += static_cast<std::uint8_t>(chunk);
     if (gpu_fifo_gather_size_ != gpu_fifo_gather_.size()) continue;
 
-    // A completed WG line first reaches the PI CPU FIFO in MEM1. CP alone
-    // decides when that line can be consumed: GPRead and breakpoints gate
-    // renderer effects, not merely the guest-visible pointer accounting.
     if (pi_.FifoBase() != 0u || pi_.FifoEnd() != 0u) {
       const auto destination = pi_.FifoWritePointer();
       auto* bytes = memory_.Resolve(destination, gpu_fifo_gather_.size());
@@ -1915,8 +1923,6 @@ bool HostRuntime::QueueGpuFifoGather(std::uint64_t value, std::uint8_t size,
       pi_.AdvanceCpuFifoWritePointer();
       if (cp_.NotifyGatherWrite(32u)) SyncNativeCPInterrupt();
     } else {
-      // Retain the pre-FIFO direct bridge path for hosts without a configured
-      // retail PI FIFO. Once configured, all consumption uses the CP path.
       if (!native_gx_.WriteBurst(gpu_fifo_gather_.data(), 32u, gpu_fifo_first_pc_)) {
         gpu_fifo_gather_size_ = 0u;
         SetFault(FaultKind::MmioWrite, 0x0c008000u, 32u);
@@ -1925,10 +1931,11 @@ bool HostRuntime::QueueGpuFifoGather(std::uint64_t value, std::uint8_t size,
     }
     ++gpu_fifo_bursts_;
     gpu_fifo_gather_size_ = 0u;
+    gpu_fifo_first_pc_ = guest_pc;
     if (!gpu_fifo_burst_logged_) {
       gpu_fifo_burst_logged_ = true;
       std::fprintf(stderr,
-                   "GEKKOAOT_NATIVE_GX_GPU_WG_BURST_V13=1 burst=32 abi=bulk mode=host-gather\n");
+                   "GEKKOAOT_NATIVE_GX_GPU_WG_BURST_V14=1 burst=32 abi=bulk mode=chunk-copy\n");
     }
   }
   return true;
