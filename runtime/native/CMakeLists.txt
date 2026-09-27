@@ -159,17 +159,48 @@ if(GEKKOAOT_NATIVE_NOD)
     target_link_libraries(gekkoaot_native_runtime PUBLIC nod::nod)
 endif()
 
-# Standalone input belongs to the native host. Prefer the system SDL3 package when available.
+# Standalone input belongs to the native host. Prefer a system SDL3 package
+# for developer builds. Portable release builds must not silently ship without
+# input, so fetch a pinned static SDL3 when the host has no package installed.
+set(_gekkoaot_sdl3_target "")
 find_package(SDL3 QUIET CONFIG)
 if(TARGET SDL3::SDL3)
+    set(_gekkoaot_sdl3_target SDL3::SDL3)
+elseif(TARGET SDL3::SDL3-static)
+    set(_gekkoaot_sdl3_target SDL3::SDL3-static)
+endif()
+
+if(NOT _gekkoaot_sdl3_target AND GEKKOAOT_NATIVE_PORTABLE)
+    include(FetchContent)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(gekkoaot_sdl3
+        GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+        GIT_TAG release-3.2.22
+        GIT_SHALLOW TRUE
+        EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(gekkoaot_sdl3)
+    if(TARGET SDL3::SDL3-static)
+        set(_gekkoaot_sdl3_target SDL3::SDL3-static)
+    elseif(TARGET SDL3::SDL3)
+        set(_gekkoaot_sdl3_target SDL3::SDL3)
+    endif()
+endif()
+
+if(_gekkoaot_sdl3_target)
     target_compile_definitions(gekkoaot_native_runtime PUBLIC GEKKOAOT_NATIVE_SDL_INPUT=1 GEKKOAOT_NATIVE_SDL3=1)
-    target_link_libraries(gekkoaot_native_runtime PUBLIC SDL3::SDL3)
+    target_link_libraries(gekkoaot_native_runtime PUBLIC ${_gekkoaot_sdl3_target})
     find_package(X11 QUIET)
     if(X11_FOUND)
         target_compile_definitions(gekkoaot_native_runtime PUBLIC HAVE_X11=1)
         target_link_libraries(gekkoaot_native_runtime PUBLIC X11::X11)
     endif()
-    message(STATUS "gekkoaot: standalone SDL3 keyboard/gamepad input enabled")
+    message(STATUS "gekkoaot: standalone SDL3 keyboard/gamepad input enabled (${_gekkoaot_sdl3_target})")
 else()
     message(STATUS "gekkoaot: SDL3 not found; standalone input bridge disabled")
 endif()

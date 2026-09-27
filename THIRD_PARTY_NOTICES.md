@@ -49,3 +49,16 @@ Qt 6 is used by the optional desktop frontend. The v0.0.1 GitHub archives create
 ## Game and platform trademarks
 
 Nintendo, GameCube and game titles/trademarks belong to their respective owners. GekkoAOT is an independent project and is not affiliated with or endorsed by Nintendo, Electronic Arts, Warner Bros. or other game/platform rights holders.
+
+
+## SDL3
+
+Upstream: `https://github.com/libsdl-org/SDL`
+
+Pinned portable fallback: `release-3.2.22`
+
+License: zlib License. Portable builds may statically link SDL3 to provide native keyboard, gamepad and joystick input when no system SDL3 package is available.
+
+Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+
+This software is provided 'as-is', without any express or implied warranty. In no event will the authors be held liable for any damages arising from the use of this software. Permission is granted to anyone to use this software for any purpose, including commercial applications, and to alter it and redistribute it freely, subject to the conditions of the SDL zlib license.

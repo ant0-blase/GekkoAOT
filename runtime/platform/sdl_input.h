@@ -1,6 +1,12 @@
 #pragma once
 #include "input.h"
 #include <SDL3/SDL.h>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -292,6 +298,44 @@ class SDLInput {
       LoadTrigger(s, "l_analog", &cfg.l_analog); LoadTrigger(s, "r_analog", &cfg.r_analog);
     }
   }
+
+#if defined(_WIN32)
+  static int Win32VirtualKey(SDL_Scancode scancode) {
+    if (scancode >= SDL_SCANCODE_A && scancode <= SDL_SCANCODE_Z)
+      return 'A' + (scancode - SDL_SCANCODE_A);
+    if (scancode >= SDL_SCANCODE_1 && scancode <= SDL_SCANCODE_9)
+      return '1' + (scancode - SDL_SCANCODE_1);
+    if (scancode == SDL_SCANCODE_0) return '0';
+    if (scancode >= SDL_SCANCODE_F1 && scancode <= SDL_SCANCODE_F12)
+      return VK_F1 + (scancode - SDL_SCANCODE_F1);
+    switch (scancode) {
+    case SDL_SCANCODE_RETURN: return VK_RETURN;
+    case SDL_SCANCODE_ESCAPE: return VK_ESCAPE;
+    case SDL_SCANCODE_BACKSPACE: return VK_BACK;
+    case SDL_SCANCODE_TAB: return VK_TAB;
+    case SDL_SCANCODE_SPACE: return VK_SPACE;
+    case SDL_SCANCODE_LEFT: return VK_LEFT;
+    case SDL_SCANCODE_RIGHT: return VK_RIGHT;
+    case SDL_SCANCODE_UP: return VK_UP;
+    case SDL_SCANCODE_DOWN: return VK_DOWN;
+    case SDL_SCANCODE_INSERT: return VK_INSERT;
+    case SDL_SCANCODE_DELETE: return VK_DELETE;
+    case SDL_SCANCODE_HOME: return VK_HOME;
+    case SDL_SCANCODE_END: return VK_END;
+    case SDL_SCANCODE_PAGEUP: return VK_PRIOR;
+    case SDL_SCANCODE_PAGEDOWN: return VK_NEXT;
+    case SDL_SCANCODE_LSHIFT: return VK_LSHIFT;
+    case SDL_SCANCODE_RSHIFT: return VK_RSHIFT;
+    case SDL_SCANCODE_LCTRL: return VK_LCONTROL;
+    case SDL_SCANCODE_RCTRL: return VK_RCONTROL;
+    case SDL_SCANCODE_LALT: return VK_LMENU;
+    case SDL_SCANCODE_RALT: return VK_RMENU;
+    case SDL_SCANCODE_LGUI: return VK_LWIN;
+    case SDL_SCANCODE_RGUI: return VK_RWIN;
+    default: return 0;
+    }
+  }
+#endif
 
 #if defined(HAVE_X11)
   static KeySym X11KeySym(SDL_Scancode scancode) {
@@ -596,6 +640,17 @@ private:
     std::array<std::uint8_t, SDL_SCANCODE_COUNT> merged_keys{};
     for (int i = 0; sdl_keys && i < key_count && i < SDL_SCANCODE_COUNT; ++i)
       merged_keys[static_cast<std::size_t>(i)] = sdl_keys[i] ? 1 : 0;
+#if defined(_WIN32)
+    // The standalone renderer owns the Win32 window, not SDL. SDL can therefore
+    // have no keyboard focus window even though its gamepad/event subsystems are
+    // active. Merge the process-independent Win32 key state so the default
+    // keyboard profile works reliably in the Aurora window.
+    for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
+      const int vk = Win32VirtualKey(static_cast<SDL_Scancode>(i));
+      if (vk && (GetAsyncKeyState(vk) & 0x8000))
+        merged_keys[static_cast<std::size_t>(i)] = 1;
+    }
+#endif
 #if defined(HAVE_X11)
     if (x11_display_)
     {

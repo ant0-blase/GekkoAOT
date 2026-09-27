@@ -2624,8 +2624,11 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   config.desiredBackend=BackendFromEnv();
   config.vsync=EnvBool("GEKKOAOT_NATIVE_GX_VSYNC",false);
   config.startFullscreen=EnvBool("GEKKOAOT_NATIVE_GX_FULLSCREEN",false);
-  config.windowWidth=EnvUnsigned("GEKKOAOT_NATIVE_GX_WIDTH",1280);
-  config.windowHeight=EnvUnsigned("GEKKOAOT_NATIVE_GX_HEIGHT",720);
+  // Aurora reports framebuffer pixels after DPI scaling. A 1280x720 logical
+  // default becomes 1920x1080 at Windows 150% scaling, which is unnecessarily
+  // large for the standalone window. Keep env overrides, but start compact.
+  config.windowWidth=EnvUnsigned("GEKKOAOT_NATIVE_GX_WIDTH",960);
+  config.windowHeight=EnvUnsigned("GEKKOAOT_NATIVE_GX_HEIGHT",540);
   config.pauseOnFocusLost=false;
   config.allowJoystickBackgroundEvents=true;
   config.mem1Size=0; config.mem2Size=0;
