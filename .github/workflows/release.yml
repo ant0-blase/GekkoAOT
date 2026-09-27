@@ -1,6 +1,12 @@
 name: Release
 
 on:
+  # One-shot push trigger used for the v0.0.4 publication commit; restored to manual-only immediately after dispatch.
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
       force_publish:
