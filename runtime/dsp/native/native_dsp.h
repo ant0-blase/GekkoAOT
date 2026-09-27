@@ -102,6 +102,7 @@ private:
   void StartAudioDma(std::uint16_t value);
   void AdvanceAudioDma(std::uint64_t cycles);
   void SubmitAudioBlock();
+  void ResetTaskEngine();
   void LoadInitProgramFromMainMemory();
   bool LooksLikeSdkInitProgram() const;
   void StartSdkBootstrap();
@@ -158,6 +159,10 @@ private:
   bool sdk_bootstrap_loaded_ = false;
   bool sdk_bootstrap_running_ = false;
   bool sdk_bootstrap_completed_ = false;
+  // RESET enters the ROM task loader. DSPInit 1->0 instead uploads the
+  // audio-system initialization program from MEM1; these are distinct boots.
+  bool rom_loader_active_ = true;
+  bool rom_loader_ready_pending_ = true;
 
   std::uint8_t sdk_task_loader_stage_ = 0;
   std::uint32_t sdk_task_code_address_ = 0;

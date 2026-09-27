@@ -1,0 +1,182 @@
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -46,7 +46,14 @@
+ 
+ struct CachedTextureEntry {
+   gfx::TextureHandle handle;
++  const void* sourceData = nullptr;
++  u32 sourceWidth = 0;
++  u32 sourceHeight = 0;
++  u32 sourceFormat = 0;
++  u32 sourceMips = 0;
+   u32 texDataVersion = 0;
++  u32 tlutFormat = 0;
++  u16 tlutEntries = 0;
+   u32 tlutObjId = 0;
+   u32 tlutDataVersion = 0;
+   uint64_t replacementId = 0;
+@@ -195,7 +202,7 @@
+ }
+ 
+ void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 tlutObjId = 0, u32 tlutDataVersion = 0,
+-                          uint64_t replacementId = 0) {
++                          uint64_t replacementId = 0, u32 tlutFormat = 0, u16 tlutEntries = 0) {
+   if (obj.texObjId == 0) {
+     return;
+   }
+@@ -205,6 +212,13 @@
+     clear_texture_dependency(obj.texObjId, entry);
+   }
+ 
++  entry.sourceData = obj.data;
++  entry.sourceWidth = obj.width();
++  entry.sourceHeight = obj.height();
++  entry.sourceFormat = obj.format();
++  entry.sourceMips = obj.mip_count();
++  entry.tlutFormat = tlutFormat;
++  entry.tlutEntries = tlutEntries;
+   entry.handle = std::move(handle);
+   entry.texDataVersion = obj.texDataVersion;
+   entry.tlutObjId = tlutObjId;
+@@ -595,13 +609,19 @@
+   }
+ }
+ 
++static bool matches_source(const CachedTextureEntry& entry, const GXTexObj_& obj) {
++  return entry.sourceData == obj.data && entry.sourceWidth == obj.width() &&
++         entry.sourceHeight == obj.height() && entry.sourceFormat == obj.format() &&
++         entry.sourceMips == obj.mip_count() && entry.texDataVersion == obj.texDataVersion;
++}
++
+ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+   ZoneScoped;
+ 
+   if (obj.texObjId != 0) {
+     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
+       auto& entry = it->second;
+-      if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == 0) {
++      if (entry.handle && matches_source(entry, obj) && entry.tlutObjId == 0) {
+         entry.lastUsedFrame = s_frameCount;
+         ++s_stats.objectHits;
+         return entry.handle;
+@@ -651,8 +671,9 @@
+   if (obj.texObjId != 0) {
+     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
+       auto& entry = it->second;
+-      if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == tlut.tlutObjId &&
+-          entry.tlutDataVersion == tlut.tlutDataVersion) {
++      if (entry.handle && matches_source(entry, obj) && entry.tlutObjId == tlut.tlutObjId &&
++          entry.tlutDataVersion == tlut.tlutDataVersion && entry.tlutFormat == tlut.format &&
++          entry.tlutEntries == tlut.numEntries) {
+         entry.lastUsedFrame = s_frameCount;
+         if (auto tlutIt = s_tlutObjectCaches.find(tlut.tlutObjId); tlutIt != s_tlutObjectCaches.end()) {
+           tlutIt->second.lastUsedFrame = s_frameCount;
+@@ -696,7 +717,8 @@
+     }
+   }
+   if (!obj.no_cache() && !tlut.no_cache()) {
+-    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion, replacementId);
++    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion, replacementId,
++                         tlut.format, tlut.numEntries);
+   }
+   return handle;
+ }
+@@ -848,10 +870,30 @@
+ 
+     GXTexObj_ obj = g_gxState.loadedTextures[i];
+     auto& textureBind = g_gxState.textures[i];
++    // Descriptor and sampler changes are independent of texel data versions.
++    // Only reuse the bound resource when its source and palette interpretation
++    // still match the descriptor-aware object cache.
+     if (textureBind.generation == s_bindGeneration && obj.texObjId != 0 &&
+-        obj.texObjId == textureBind.texObj.texObjId && obj.texDataVersion == textureBind.texObj.texDataVersion) {
+-      touch_bound_texture(obj);
+-      continue;
++        obj.texObjId == textureBind.texObj.texObjId &&
++        obj.mode0 == textureBind.texObj.mode0 && obj.mode1 == textureBind.texObj.mode1 &&
++        obj.flags == textureBind.texObj.flags && obj.tlut == textureBind.texObj.tlut) {
++      const auto cached = s_textureObjectCaches.find(obj.texObjId);
++      bool matches = cached != s_textureObjectCaches.end() && texture::matches_source(cached->second, obj);
++      if (matches && is_palette_format(obj.format())) {
++        const auto tlutIdx = static_cast<size_t>(obj.tlut);
++        if (tlutIdx >= g_gxState.loadedTluts.size()) {
++          matches = false;
++        } else {
++          const auto& tlut = g_gxState.loadedTluts[tlutIdx];
++          const auto& entry = cached->second;
++          matches = entry.tlutObjId == tlut.tlutObjId && entry.tlutDataVersion == tlut.tlutDataVersion &&
++                    entry.tlutFormat == tlut.format && entry.tlutEntries == tlut.numEntries;
++        }
++      }
++      if (matches) {
++        touch_bound_texture(obj);
++        continue;
++      }
+     }
+ 
+     gfx::TextureHandle handle;
+--- a/tests/gx_texture_cache_test.cpp
++++ b/tests/gx_texture_cache_test.cpp
+@@ -97,6 +97,62 @@
+ 
+   EXPECT_EQ(testing::texture_allocations(), 3);
+   EXPECT_EQ(texture_stats().misses, 3);
++}
++
++TEST_F(GxTextureCacheTest, SameObjectVersionReinterpretsDimensionsFormatAndMips) {
++  std::array<uint8_t, 256> pixels{};
++  auto obj = make_texture(pixels.data(), 1, GX_TF_I4, 8, 8);
++  const auto first = texture::resolve_static_texture(obj);
++  obj.mWidth = 16;
++  const auto wider = texture::resolve_static_texture(obj);
++  EXPECT_NE(first, wider);
++  obj.mFormat = GX_TF_I8;
++  const auto reformatted = texture::resolve_static_texture(obj);
++  EXPECT_NE(wider, reformatted);
++  obj.flags |= 1;
++  obj.mode1 = 16 << 8;
++  EXPECT_NE(reformatted, texture::resolve_static_texture(obj));
++  EXPECT_EQ(testing::texture_allocations(), 4);
++}
++
++TEST_F(GxTextureCacheTest, DirtyBindingReinterpretsSameObjectAndPalette) {
++  std::array<uint8_t, 128> indices{};
++  std::array<uint8_t, 512> palette{};
++  g_gxState.loadedTextures[0] = make_texture(indices.data(), 1, GX_TF_C4, 8, 8);
++  g_gxState.loadedTluts[0] = make_tlut(palette.data(), 1);
++  ShaderInfo info{};
++  info.sampledTextures.set(0);
++  resolve_sampled_textures(info);
++  const auto first = g_gxState.textures[0].ref;
++  g_gxState.loadedTextures[0].mWidth = 16;
++  resolve_sampled_textures(info);
++  const auto wider = g_gxState.textures[0].ref;
++  EXPECT_NE(first, wider);
++  g_gxState.loadedTluts[0].format = GX_TL_IA8;
++  resolve_sampled_textures(info);
++  EXPECT_NE(wider, g_gxState.textures[0].ref);
++  const auto ia8 = g_gxState.textures[0].ref;
++  g_gxState.loadedTluts[0].numEntries = 256;
++  resolve_sampled_textures(info);
++  EXPECT_NE(ia8, g_gxState.textures[0].ref);
++  EXPECT_EQ(testing::texture_allocations(), 4);
++}
++
++TEST_F(GxTextureCacheTest, DirtyBindingUpdatesSamplerWithoutUploadingTexels) {
++  std::array<uint8_t, 16> pixels{};
++  g_gxState.loadedTextures[0] = make_texture(pixels.data(), 1);
++  ShaderInfo info{};
++  info.sampledTextures.set(0);
++  resolve_sampled_textures(info);
++  const auto first = g_gxState.textures[0].ref;
++  g_gxState.loadedTextures[0].mode0 = 1 | (1 << 4);
++  g_gxState.loadedTextures[0].mode1 = 8;
++  resolve_sampled_textures(info);
++  EXPECT_EQ(first, g_gxState.textures[0].ref);
++  EXPECT_EQ(g_gxState.textures[0].texObj.wrap_s(), GX_REPEAT);
++  EXPECT_EQ(g_gxState.textures[0].texObj.mag_filter(), GX_LINEAR);
++  EXPECT_FLOAT_EQ(g_gxState.textures[0].texObj.min_lod(), 0.5f);
++  EXPECT_EQ(testing::texture_allocations(), 1);
+ }
+ 
+ TEST_F(GxTextureCacheTest, DestroyedObjectStillReusesContent) {

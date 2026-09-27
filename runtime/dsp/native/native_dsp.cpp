@@ -2,6 +2,7 @@
 #include "dsp/native/native_dsp.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 
@@ -62,6 +63,15 @@ constexpr std::uint32_t kInitProgramMainAddress = 0x01000000u;
 constexpr std::uint32_t kInitProgramBytes = 0x400u;
 constexpr std::uint32_t kInitProgramWords = kInitProgramBytes / 2u;
 constexpr std::uint32_t kSdkBootstrapMail = 0x00544348u;
+constexpr std::uint32_t kRomLoaderReadyMail = 0x8071feedu;
+
+bool TraceDsp() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GEKKOAOT_TRACE_DSP");
+    return value && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
 
 // Approximate the work performed by the tiny SDK bootstrap before it posts its
 // ready mail.  The DSP runs at one sixth of the 486 MHz Gekko clock; the
@@ -171,6 +181,8 @@ void NativeDSP::Reset() {
   sdk_task_init_count_ = 0;
   last_cpu_mail_ = 0;
   cpu_mail_write_count_ = 0;
+  rom_loader_active_ = true;
+  rom_loader_ready_pending_ = true;
 }
 
 bool NativeDSP::Handles(std::uint32_t address) const {
@@ -202,7 +214,10 @@ void NativeDSP::PostDspMailbox(std::uint32_t mail, bool interrupt) {
   if (interrupt) GenerateInterrupt(kDsp);
 }
 
-void NativeDSP::LoadInitProgramFromMainMemory() {
+void NativeDSP::ResetTaskEngine() {
+  core_.Reset();
+  ax_hle_.Reset();
+  jaudio_hle_.Reset();
   sdk_bootstrap_loaded_ = false;
   sdk_bootstrap_running_ = false;
   sdk_bootstrap_completed_ = false;
@@ -210,6 +225,8 @@ void NativeDSP::LoadInitProgramFromMainMemory() {
   sdk_task_loader_stage_ = 0;
   sdk_task_code_address_ = 0;
   sdk_task_code_size_ = 0;
+  sdk_task_imem_address_ = 0;
+  sdk_task_dmem_length_ = 0;
   sdk_task_entry_ = 0;
   sdk_task_init_cycles_ = 0;
   sdk_romless_task_ready_pending_ = false;
@@ -224,6 +241,12 @@ void NativeDSP::LoadInitProgramFromMainMemory() {
   sdk_romless_completion_callback_mode_ = true;
   sdk_romless_completion_cycles_ = 0;
   sdk_romless_completion_payload_pending_ = 0;
+}
+
+void NativeDSP::LoadInitProgramFromMainMemory() {
+  ResetTaskEngine();
+  rom_loader_active_ = false;
+  rom_loader_ready_pending_ = false;
 
   if (!memory_) return;
   const auto* source = memory_->Resolve(kInitProgramMainAddress, kInitProgramBytes);
@@ -237,6 +260,9 @@ void NativeDSP::LoadInitProgramFromMainMemory() {
   }
 
   sdk_bootstrap_loaded_ = LooksLikeSdkInitProgram();
+  if (TraceDsp())
+    std::fprintf(stderr, "GEKKOAOT_DSP_INIT source=%08x recognized=%u\n",
+                 kInitProgramMainAddress, unsigned(sdk_bootstrap_loaded_));
 }
 
 bool NativeDSP::LooksLikeSdkInitProgram() const {
@@ -290,7 +316,7 @@ void NativeDSP::HandleSdkTaskLoaderMail(std::uint32_t mail) {
   const std::uint32_t payload = mail & 0x7fffffffu;
   last_cpu_mail_ = payload;
   ++cpu_mail_write_count_;
-  if (!sdk_bootstrap_completed_) return;
+  if (!sdk_bootstrap_completed_ && !rom_loader_active_) return;
   mail = payload;
 
   // SDK revisions differ slightly in the data words interleaved with the
@@ -355,11 +381,16 @@ void NativeDSP::HandleSdkTaskLoaderMail(std::uint32_t mail) {
     if ((mail & 0xffff0000u) == 0u) {
       sdk_task_entry_ = static_cast<std::uint16_t>(mail);
       sdk_task_loader_stage_ = 10u;
+      rom_loader_active_ = false;
+      rom_loader_ready_pending_ = false;
 
       // v50: known GameCube AX tasks take the ROM-free HLE fast path.  The
       // detector looks at the uploaded DSP image/protocol, never at game id.
       // Unknown/custom tasks continue to the standalone LLE core unchanged.
       const bool ax_started = ax_hle_.ProbeTask(sdk_task_code_address_, sdk_task_code_size_);
+      if (TraceDsp())
+        std::fprintf(stderr, "GEKKOAOT_DSP_TASK code=%08x bytes=%u entry=%04x ax=%u\n",
+                     sdk_task_code_address_, sdk_task_code_size_, sdk_task_entry_, unsigned(ax_started));
       bool lle_started = false;
       if (!ax_started) {
         lle_started = core_.LoadTask(
@@ -511,14 +542,15 @@ void NativeDSP::WriteControl(std::uint16_t value) {
     audio_dma_control_ = 0;
     audio_dma_remaining_blocks_ = 0;
     aid_interrupt_cycles_ = 0;
-    core_.Reset();
-    // Reset self-clears and returns the native core to halted/init state.
+    ResetTaskEngine();
+    rom_loader_active_ = true;
+    rom_loader_ready_pending_ = true;
+    // RESET self-clears. HALT and INIT retain the values written by the CPU.
+    // Reset starts the ROM loader, not a DMA from 0x01000000 (which games
+    // are free to reuse after OSInitAudioSystem).
     control_ &= static_cast<std::uint16_t>(~kDspReset);
-    control_ |= kDspHalt | kDspInit;
-
-    // With DSPInit asserted, reset performs the hardware bootstrap DMA from
-    // physical 0x01000000 into DSP instruction RAM.
-    if (value & kDspInit) LoadInitProgramFromMainMemory();
+    if (TraceDsp())
+      std::fprintf(stderr, "GEKKOAOT_DSP_RESET control=%04x loader=rom\n", control_);
   }
 
   // DSPAssertInt/CR_EXTERNAL_INT is an edge from the Gekko into the DSP core.
@@ -532,6 +564,7 @@ void NativeDSP::WriteControl(std::uint16_t value) {
   // Keep the externally visible init-code pulse; the actual ucode execution is
   // intentionally left for the native DSP core, not Dolphin HLE.
   if (init_was_set && (control_ & kDspInit) == 0u) {
+    LoadInitProgramFromMainMemory();
     control_ |= kDspInitCode;
     init_code_clear_cycles_ = 130u;
   }
@@ -539,9 +572,9 @@ void NativeDSP::WriteControl(std::uint16_t value) {
   // Clearing HALT starts execution from the freshly loaded SDK bootstrap.
   // This is intentionally delayed; the PPC immediately polls DMBH and should
   // observe an empty mailbox for a while before the DSP finishes its work.
-  if (halt_was_set && (control_ & kDspHalt) == 0u) {
+  if ((control_ & kDspHalt) == 0u) {
     StartSdkBootstrap();
-    if (sdk_task_loader_stage_ >= 10u && core_.Available()) core_.SetRunning(true);
+    if (halt_was_set && sdk_task_loader_stage_ >= 10u && core_.Available()) core_.SetRunning(true);
   }
   if ((control_ & kDspHalt) != 0u) core_.SetRunning(false);
 }
@@ -908,6 +941,15 @@ bool NativeDSP::Write(std::uint32_t address, std::uint64_t value, std::uint8_t s
 
 void NativeDSP::AdvanceCycles(std::uint64_t cycles) {
   if (cycles == 0u) return;
+
+  // Native ROM-loader protocol progresses at the ordinary device boundary.
+  // It never produces a ready message while halted, or overwrites unread mail.
+  if (rom_loader_ready_pending_ && (control_ & kDspHalt) == 0u && !dsp_mail_pending_) {
+    rom_loader_ready_pending_ = false;
+    PostDspMailbox(kRomLoaderReadyMail, false);
+    if (TraceDsp())
+      std::fprintf(stderr, "GEKKOAOT_DSP_ROM_READY mail=%08x irq=0\n", kRomLoaderReadyMail);
+  }
 
   core_.AdvancePpcCycles(cycles);
   ax_hle_.AdvancePpcCycles(cycles);

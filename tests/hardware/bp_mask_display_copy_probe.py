@@ -58,6 +58,15 @@ def main():
     bp(0x52, 1 << 14)
     bp(0x4b, 0x30000 >> 5)
     bp(0x52, 1 << 14)
+    # Display copy changed destination height. A subsequent texture copy with
+    # unchanged source registers must restore source dimensions and half scale.
+    bp(0x4a, 7 | (7 << 10))
+    bp(0x4e, 128)
+    bp(0x52, (1 << 14) | (1 << 10))
+    bp(0x4b, 0x50000 >> 5)
+    bp(0x52, (12 << 3) | (1 << 9))  # RGBA8, half scale: 4x4
+    bp(0x4b, 0x60000 >> 5)
+    bp(0x52, 12 << 3)               # same source, full scale: 8x8
     lib.gekkoaot_native_gx_present()
     lib.gekkoaot_native_gx_shutdown()
     print('BP_MASK_DISPLAY_COPY_PROBE_COMPLETED')

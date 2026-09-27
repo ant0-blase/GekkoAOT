@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -25,6 +26,7 @@ struct Options {
   std::filesystem::path sdk_manifest;
   std::filesystem::path emit_sdk_manifest;
   std::filesystem::path stop_file;
+  std::filesystem::path snapshot_file;
   std::vector<std::filesystem::path> secondary_modules;
   std::string game_id;
   GekkoAOT::Native::GameCubeBootConfig::VideoMode video_mode =
@@ -44,6 +46,8 @@ void PrintRuntimeSnapshot(const GekkoAOT::Native::HostRuntime& runtime) {
   const auto& memory = runtime.Memory();
   const auto& cp = runtime.CommandProcessor();
   const auto& vi = runtime.VideoInterface();
+  const auto& dsp = runtime.DspInterface();
+  const auto& di = runtime.DiscInterface();
   const auto word = [&](std::uint32_t address) {
     std::uint32_t value = 0;
     memory.Read32(address, &value);
@@ -68,6 +72,15 @@ void PrintRuntimeSnapshot(const GekkoAOT::Native::HostRuntime& runtime) {
             << " top=" << vi.XfbAddressTop() << " bottom=" << vi.XfbAddressBottom()
             << std::dec << " width=" << vi.XfbWidthPixels()
             << " stride=" << vi.XfbStrideBytes() << " field_height=" << vi.XfbFieldHeight();
+  std::cout << "\nGEKKOAOT_SNAPSHOT_DSP control=" << std::hex << dsp.Control()
+            << " cpu_mail=" << dsp.CpuMailbox() << " dsp_mail=" << dsp.DspMailbox()
+            << " pending=" << dsp.DspMailboxPending()
+            << " bootstrap=" << dsp.SdkBootstrapCompleted()
+            << " loader_stage=" << unsigned(dsp.SdkTaskLoaderStage())
+            << " ax=" << dsp.NativeAxHleActive() << " jaudio=" << dsp.NativeJAudioHleActive()
+            << " core_pc=" << dsp.NativeCorePc()
+            << "\nGEKKOAOT_SNAPSHOT_DI status=" << di.Status() << " control=" << di.DMAControl()
+            << " sequence=" << std::dec << di.CommandSequence();
   const auto current = word(0x800000e4u);
   std::cout << "\nGEKKOAOT_FINAL_OS_V96=1" << std::hex
             << " current=" << current << " context=" << word(0x800000d4u)
@@ -114,6 +127,7 @@ void Usage(const char* argv0) {
       << "  --sdk-manifest FILE      load build-time resolved native SDK/HLE hooks\n"
       << "  --emit-sdk-manifest FILE resolve SDK/HLE hooks, write manifest and exit\n"
       << "  --stop-file FILE          poll for a graceful stop request between native slices\n"
+      << "  --snapshot-file FILE      consume a request and dump device/thread state and FILE.mem1.bin\n"
       << "  --secondary-module FILE  load native REL/overlay side module (repeatable)\n"
       << "  --dispatch-limit N       stop after N native dispatches (0 = unlimited, default)\n"
       << "  --mem2                   allocate 64 MiB MEM2\n"
@@ -234,6 +248,7 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
     else if (arg == "--sdk-manifest") { auto v = next(); if (!v) return {}; options.sdk_manifest = *v; }
     else if (arg == "--emit-sdk-manifest") { auto v = next(); if (!v) return {}; options.emit_sdk_manifest = *v; }
     else if (arg == "--stop-file") { auto v = next(); if (!v) return {}; options.stop_file = *v; }
+    else if (arg == "--snapshot-file") { auto v = next(); if (!v) return {}; options.snapshot_file = *v; }
     else if (arg == "--secondary-module") { auto v = next(); if (!v) return {}; options.secondary_modules.emplace_back(*v); }
     else if (arg == "--video-mode") {
       auto v = next(); if (!v) return {}; auto mode = ParseVideoMode(*v); if (!mode) return {};
@@ -373,7 +388,7 @@ int main(int argc, char** argv) {
 
     GekkoAOT::Native::RunResult result{};
     bool pgo_stop_observed = false;
-    if (options->stop_file.empty()) {
+    if (options->stop_file.empty() && options->snapshot_file.empty()) {
       result = runtime.Run(options->dispatch_limit);
     } else {
       // PGO needs a normal process exit so compiler-rt writes its counters.
@@ -391,7 +406,19 @@ int main(int argc, char** argv) {
       std::uint64_t total_cycles = 0;
       while (true) {
         std::error_code stop_ec;
-        if (std::filesystem::exists(options->stop_file, stop_ec)) {
+        if (!options->snapshot_file.empty() && std::filesystem::exists(options->snapshot_file, stop_ec)) {
+          auto dump_path = options->snapshot_file;
+          dump_path += ".mem1.bin";
+          std::ofstream dump(dump_path, std::ios::binary | std::ios::trunc);
+          const auto bytes = runtime.Memory().Mem1();
+          dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+          dump.close();
+          PrintRuntimeSnapshot(runtime);
+          std::cout << "GEKKOAOT_SNAPSHOT_MEMORY path=\"" << dump_path.string()
+                    << "\" success=" << unsigned(bool(dump)) << '\n' << std::flush;
+          std::filesystem::remove(options->snapshot_file, stop_ec);
+        }
+        if (!options->stop_file.empty() && std::filesystem::exists(options->stop_file, stop_ec)) {
           // Preserve an acknowledgement for the parent controller.  Merely
           // testing that the request file disappeared after native-run exits is
           // ambiguous because the file is absent before training starts too.

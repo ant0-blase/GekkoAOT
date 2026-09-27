@@ -47,5 +47,19 @@ int main() {
   CHECK(cp.NotifyGatherWrite(128));
   CHECK(cp.FifoReadPointer() == 0x1000 && cp.FifoWritePointer() == 0x1000);
   CHECK(cp.FifoReadWriteDistance() == 0);
+  // Moving a breakpoint resumes the already queued FIFO. No further CPU
+  // gather write or GP-enable toggle is required to make the device progress.
+  pair(0x3c, 0x1020);
+  write(2, 0x33);
+  CHECK(cp.NotifyGatherWrite(128));
+  CHECK(cp.FifoReadPointer() == 0x1020 && cp.FifoReadWriteDistance() == 96);
+  CHECK(cp.InterruptPending());
+  pair(0x3c, 0x1060);
+  CHECK(cp.FifoReadPointer() == 0x1060 && cp.FifoReadWriteDistance() == 32);
+  CHECK(cp.InterruptPending()); // new stop, not a skipped completion fence
+  write(2, 0x13); // acknowledge the interrupt while retaining the stop
+  pair(0x3c, 0x1040); // move the stop behind the current reader
+  CHECK(cp.FifoReadPointer() == 0x1000 && cp.FifoReadWriteDistance() == 0);
+  CHECK(!cp.InterruptPending());
   std::cout << "CP FIFO capacity/wrap/breakpoint tests passed\n";
 }

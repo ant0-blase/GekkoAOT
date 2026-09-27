@@ -11,10 +11,14 @@ class BpMaskDisplayCopy(unittest.TestCase):
     def test_display_copy_consumes_one_shot_bp_mask(self):
         probe = Path(__file__).with_name('bp_mask_display_copy_probe.py')
         result = subprocess.run([sys.executable, str(probe)], text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45,
+                                env=dict(os.environ, GEKKOAOT_TRACE_GX_COPY='1'))
         output = result.stdout[-12000:]
         self.assertEqual(result.returncode, 0, output)
         self.assertIn('BP_MASK_DISPLAY_COPY_PROBE_COMPLETED', output)
+        self.assertIn('event=texture-copy width=4 height=4 half=1', output)
+        self.assertIn('event=texture-copy width=8 height=8 half=0', output)
+        self.assertNotIn('GPU Validation Error', output)
         self.assertIn('GEKKOAOT_NATIVE_XFB_CACHE_V12=1 copy=1 xfb=00010000', output)
         self.assertIn('GEKKOAOT_NATIVE_XFB_CACHE_V12=1 copy=2 xfb=00030000', output)
 
