@@ -178,6 +178,15 @@ if(NOT _gekkoaot_sdl3_target AND GEKKOAOT_NATIVE_PORTABLE)
     set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
     set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+
+    # Portable GekkoAOT only needs SDL's input stack. Aurora owns the actual
+    # presentation window, while keyboard state comes from Win32/X11 directly.
+    # Disabling SDL video avoids requiring the full X11/Wayland development
+    # stack on release builders and keeps the bundled SDL dependency minimal.
+    set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    set(SDL_GPU OFF CACHE BOOL "" FORCE)
+    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(gekkoaot_sdl3
         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
         GIT_TAG release-3.2.22
