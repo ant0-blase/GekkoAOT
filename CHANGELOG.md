@@ -10,6 +10,8 @@ Future release entries are maintained by Release Please from Conventional Commit
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.4...v0.0.5) (2026-09-27)
+
 ### Fixes
 
 - Fixed a Windows native-runner crash with exit code `0xC00000FD` (`STATUS_STACK_OVERFLOW`) during NativeGX startup. The 1 MiB TLUT backing store is now heap-backed and reset in place, and the Windows runner reserves a 16 MiB main-thread stack for additional runtime/renderer headroom.
