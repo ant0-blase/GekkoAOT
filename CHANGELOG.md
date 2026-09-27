@@ -10,6 +10,10 @@ Future release entries are maintained by Release Please from Conventional Commit
 
 ## [Unreleased]
 
+### Fixes
+
+- Fixed portable secondary AOT linking for large executables by archiving generated LLVM chunks before linking the side module. This avoids Zig/LLD exhausting the process file-descriptor quota on titles with thousands of generated objects (for example MOH Frontline's 5,527-chunk secondary ELF).
+
 ## [0.0.5](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.4...v0.0.5) (2026-09-27)
 
 ### Fixes

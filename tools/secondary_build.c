@@ -269,8 +269,10 @@ static int generate_project(const char* project,const char* generated,const char
             "file(GLOB_RECURSE C_INPUTS CONFIGURE_DEPENDS \"${GENERATED_DIR}/*.c\")\n"
             "if(LLVM_OBJECTS)\n"
             "  set_source_files_properties(${LLVM_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)\n"
-            "  set(DOL_INPUTS ${LLVM_OBJECTS})\n"
-            "  set(GEKKOAOT_SECONDARY_BACKEND llvm)\n"
+            "  add_library(gekkoaot_secondary_chunks STATIC ${LLVM_OBJECTS})\n"
+            "  set_target_properties(gekkoaot_secondary_chunks PROPERTIES LINKER_LANGUAGE C)\n"
+            "  set(DOL_INPUTS)\n"
+            "  set(GEKKOAOT_SECONDARY_BACKEND llvm-archive)\n"
             "elseif(C_INPUTS)\n"
             "  set_source_files_properties(${C_INPUTS} PROPERTIES GENERATED TRUE)\n"
             "  set(DOL_INPUTS ${C_INPUTS})\n"
@@ -282,6 +284,9 @@ static int generate_project(const char* project,const char* generated,const char
             "add_library(gekkoaot_secondary SHARED secondary_module_export.c\n  \"");
   cmake_path(c,rel?cpu:cpu_src);
   fprintf(c,"\"\n  ${DOL_INPUTS})\n"
+            "if(TARGET gekkoaot_secondary_chunks)\n"
+            "  target_link_libraries(gekkoaot_secondary PRIVATE gekkoaot_secondary_chunks)\n"
+            "endif()\n"
             "target_include_directories(gekkoaot_secondary PRIVATE \"${GENERATED_DIR}\" \"");
   cmake_path(c,dolrecomp_src);
   fprintf(c,"/src\" \"");
