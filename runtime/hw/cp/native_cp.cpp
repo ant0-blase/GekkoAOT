@@ -249,6 +249,16 @@ void NativeCP::DrainSynchronousGpu() {
   // GXBreakPtCallback.
   if (!GPReadEnabled()) return;
 
+  // Synchronous GekkoAOT normally receives exactly one newly completed gather
+  // line and drains it immediately. Handle that overwhelmingly common case
+  // without entering the general backlog/breakpoint loop.
+  if (fifo_rw_distance_ == 32u && !BreakpointActive()) {
+    if (read_burst_ && !read_burst_(read_burst_user_, fifo_read_pointer_)) return;
+    AdvancePointer(&fifo_read_pointer_);
+    fifo_rw_distance_ = 0u;
+    return;
+  }
+
   while (fifo_rw_distance_ != 0u) {
     if (BreakpointActive()) break;
     if (fifo_rw_distance_ < 32u) break;
