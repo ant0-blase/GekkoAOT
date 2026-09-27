@@ -30,6 +30,10 @@ int main() {
   CHECK(memory.Load(1023u | (1024u<<10),large));
   CHECK(memory.Palette(1023u,16384).back()==0x5a);
   CHECK(memory.Palette(1023u,UINT32_MAX).empty());
+  memory.Reset();
+  CHECK(memory.Revision()==0);
+  auto reset_palette=memory.Palette(0x180u,256);
+  CHECK(reset_palette.size()==512 && reset_palette.front()==0 && reset_palette.back()==0);
   CHECK(GekkoAOT::GX::TlutMemory::SourceAddress(0x64a311a9u)==0x00623520u);
   std::cout << "TLUT CI4/CI8/CI14X2 lengths, IA8 bytes, partial uploads and ownership passed\n";
 }

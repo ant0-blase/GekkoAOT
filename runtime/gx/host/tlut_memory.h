@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-#include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <vector>
 
 namespace GekkoAOT::GX {
 // Raw BP addresses are 512-byte offsets in TMEM, not
@@ -11,6 +12,17 @@ namespace GekkoAOT::GX {
 class TlutMemory {
 public:
   static constexpr std::uint32_t Size = 1024 * 1024;
+
+  // Keep the 1 MiB TMEM/TLUT backing off the host thread stack. This matters on
+  // Windows where the default executable stack reserve is commonly close to
+  // 1 MiB and aggregate reset/assignment can otherwise materialize a large
+  // temporary during NativeGX initialization.
+  TlutMemory() : bytes_(Size, 0) {}
+
+  void Reset() {
+    std::fill(bytes_.begin(), bytes_.end(), 0);
+    revision_ = 0;
+  }
   // GameCube's TLUT DMA ignores the upper address bits. Retail libraries
   // sometimes leave these set; they must not become host/guest pointer bits.
   static constexpr std::uint32_t SourceAddress(std::uint32_t word) { return (word << 5u) & 0x01ffffffu; }
@@ -32,7 +44,7 @@ public:
   }
   std::uint64_t Revision() const { return revision_; }
 private:
-  std::array<std::uint8_t, Size> bytes_{};
+  std::vector<std::uint8_t> bytes_;
   std::uint64_t revision_ = 0;
 };
 }
