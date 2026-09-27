@@ -18,9 +18,6 @@
 namespace GekkoAOT::GX {
 namespace {
 
-constexpr std::uint32_t kWriteGatherPipePhysical = 0x0c008000u;
-constexpr std::uint32_t kWriteGatherPipeMask = 0x3fffffe0u;
-
 std::uint64_t EnvUnsigned64(const char* name, std::uint64_t fallback) {
   const char* text = std::getenv(name);
   if (!text || !*text) return fallback;
@@ -56,10 +53,6 @@ std::string WindowsError() {
 } // namespace
 
 HostBridge::~HostBridge() { Close(); }
-
-bool HostBridge::IsWriteGatherPipe(std::uint32_t address) {
-  return (address & kWriteGatherPipeMask) == kWriteGatherPipePhysical;
-}
 
 void* HostBridge::FindSymbol(const char* name) {
   if (!library_ || !name) return nullptr;

@@ -2095,9 +2095,10 @@ bool ProcessSpan(const std::uint8_t* data, std::size_t bytes, unsigned depth);
 void RememberFifoWrite(std::uint64_t value, std::uint8_t size, std::uint64_t stream_offset,
                        std::uint32_t guest_pc) {
   g_fifo_write_trace[g_fifo_write_trace_head] = {value, stream_offset, guest_pc, size};
-  g_fifo_write_trace_head = (g_fifo_write_trace_head + 1u) % g_fifo_write_trace.size();
-  g_fifo_write_trace_count = std::min<std::size_t>(g_fifo_write_trace_count + 1u,
-                                                   g_fifo_write_trace.size());
+  static_assert((g_fifo_write_trace.size() & (g_fifo_write_trace.size() - 1u)) == 0u);
+  g_fifo_write_trace_head =
+      (g_fifo_write_trace_head + 1u) & (g_fifo_write_trace.size() - 1u);
+  if (g_fifo_write_trace_count < g_fifo_write_trace.size()) ++g_fifo_write_trace_count;
 }
 
 void RememberDecodedCommand(const std::uint8_t* p, std::size_t len, std::uint64_t stream_offset) {
@@ -2120,9 +2121,10 @@ void RememberDecodedCommand(const std::uint8_t* p, std::size_t len, std::uint64_
     trace.stride = g_fifo_last_draw_stride;
   }
   g_fifo_command_trace[g_fifo_command_trace_head] = trace;
-  g_fifo_command_trace_head = (g_fifo_command_trace_head + 1u) % g_fifo_command_trace.size();
-  g_fifo_command_trace_count = std::min<std::size_t>(g_fifo_command_trace_count + 1u,
-                                                     g_fifo_command_trace.size());
+  static_assert((g_fifo_command_trace.size() & (g_fifo_command_trace.size() - 1u)) == 0u);
+  g_fifo_command_trace_head =
+      (g_fifo_command_trace_head + 1u) & (g_fifo_command_trace.size() - 1u);
+  if (g_fifo_command_trace_count < g_fifo_command_trace.size()) ++g_fifo_command_trace_count;
 }
 
 void DumpFifoFault(std::size_t fault_offset) {

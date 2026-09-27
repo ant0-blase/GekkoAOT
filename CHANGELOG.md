@@ -12,6 +12,8 @@ Future release entries are maintained by Release Please from Conventional Commit
 
 ### Fixes
 
+- Fixed portable Linux/AppImage secondary rebuilds reusing stale CMake paths from a previous `/tmp/.mount_*` instance; the small side-module CMake tree is regenerated while expensive LLVM objects stay cached.
+- Reduced steady-state GX/CP overhead with inline WGPIPE detection, chunked write-gather copies, a dedicated 32-byte CP notification fast path, and cheaper power-of-two FIFO diagnostic rings.
 - Fixed portable secondary AOT linking for large executables by archiving generated LLVM chunks before linking the side module. This avoids Zig/LLD exhausting the process file-descriptor quota on titles with thousands of generated objects (for example MOH Frontline's 5,527-chunk secondary ELF).
 
 ## [0.0.5](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.4...v0.0.5) (2026-09-27)

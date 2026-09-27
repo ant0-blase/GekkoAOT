@@ -26,7 +26,10 @@ public:
   bool Ready() const { return ready_; }
   const std::string& LastError() const { return last_error_; }
 
-  static bool IsWriteGatherPipe(std::uint32_t address);
+  static constexpr bool IsWriteGatherPipe(std::uint32_t address) {
+    // Fixed Flipper WGPIPE aperture. This predicate is on every GX store.
+    return (address & 0x3fffffe0u) == 0x0c008000u;
+  }
   bool Write(std::uint64_t value, std::uint8_t size, std::uint32_t guest_pc);
   // Optional bulk WGPIPE ABI. Newer NativeGX plugins consume one already
   // ordered byte span instead of crossing the DSO boundary once per guest
