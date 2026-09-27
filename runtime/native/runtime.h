@@ -259,6 +259,7 @@ private:
   static void NativeGXPeEvent(void* user, std::uint32_t reg, std::uint32_t value);
 
   void WireCpuCallbacks();
+  void ServiceDiscCompletion(std::uint64_t cycles);
   bool DispatchHostCall(std::uint32_t address);
   bool DispatchGlobalIndirect(std::uint32_t runtime_address);
   bool DispatchOsHle(GekkoAOT::NativeOS::Kind kind, std::uint32_t address);
@@ -362,6 +363,7 @@ private:
   std::uint32_t rel_last_runtime_ = 0;
   Fault fault_{};
   bool compat_diagnostics_enabled_ = false;
+  bool run_banner_reported_ = false;
   // v79: correctness-first host boundary mode. This reproduces the useful
   // execution-boundary side effect of the GDB compatibility path without
   // enabling debugger traps or diagnostics. Retail titles that hand work

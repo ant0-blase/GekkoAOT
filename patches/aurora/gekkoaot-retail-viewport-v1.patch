@@ -1,0 +1,53 @@
+--- a/lib/gx/regs.cpp
++++ b/lib/gx/regs.cpp
+@@ -924,8 +924,8 @@
+   f32 width = sx * 2.0f;
+   f32 height = -sy * 2.0f;
+   set_logical_viewport({
+-      .left = ox - 340.0f - width / 2.0f,
+-      .top = oy - 340.0f - height / 2.0f,
++      .left = ox - 342.0f - width / 2.0f,
++      .top = oy - 342.0f - height / 2.0f,
+       .width = width,
+       .height = height,
+       .znear = (oz - sz) / 1.6777215e7f,
+--- a/lib/dolphin/gx/GXTransform.cpp
++++ b/lib/dolphin/gx/GXTransform.cpp
+@@ -140,8 +140,8 @@
+ 
+   sx = width / 2.0f;
+   sy = -height / 2.0f;
+-  ox = 340.0f + (left + width / 2.0f);
+-  oy = 340.0f + (top + height / 2.0f);
++  ox = 342.0f + (left + width / 2.0f);
++  oy = 342.0f + (top + height / 2.0f);
+   zmin = 1.6777215e7f * nearZ;
+   zmax = 1.6777215e7f * farZ;
+   sz = zmax - zmin;
+--- a/tests/gx_fifo_test.cpp
++++ b/tests/gx_fifo_test.cpp
+@@ -2624,6 +2624,24 @@
+   EXPECT_FLOAT_EQ(vp[5], 0.9f);
+ }
+ 
++TEST_F(GXFifoTest, Viewport_RetailRawOriginUses342) {
++  // Independent retail FIFO values, not an encoder/decoder round trip.
++  std::vector<u8> bytes{0x10, 0x00, 0x05, 0x10, 0x1a};
++  for (float value : {320.0f, -224.0f, 16777215.0f, 662.0f, 566.0f, 16777215.0f}) {
++    const u32 word = std::bit_cast<u32>(value);
++    bytes.push_back(word >> 24);
++    bytes.push_back(word >> 16);
++    bytes.push_back(word >> 8);
++    bytes.push_back(word);
++  }
++  reset_gx_state();
++  decode_fifo(bytes);
++  EXPECT_FLOAT_EQ(g_gxState.logicalViewport.left, 0.0f);
++  EXPECT_FLOAT_EQ(g_gxState.logicalViewport.top, 0.0f);
++  EXPECT_FLOAT_EQ(g_gxState.logicalViewport.width, 640.0f);
++  EXPECT_FLOAT_EQ(g_gxState.logicalViewport.height, 448.0f);
++}
++
+ TEST_F(GXFifoTest, Viewport_DecodesLogicalViewportState) {
+   GXSetViewport(10.0f, 20.0f, 640.0f, 480.0f, 0.1f, 1.0f);
+   auto bytes = capture_fifo();

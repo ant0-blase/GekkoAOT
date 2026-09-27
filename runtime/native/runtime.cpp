@@ -534,7 +534,7 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
   frame_interpolation_enabled_ = RuntimeEnvBool("GEKKOAOT_FRAME_INTERPOLATION", true);
   perf_metrics_enabled_ = RuntimeEnvBool("GEKKOAOT_PERF_METRICS", true);
   cp_idle_breakpoint_recovery_enabled_ =
-      RuntimeEnvBool("GEKKOAOT_CP_IDLE_BREAKPOINT_RECOVERY", true);
+      RuntimeEnvBool("GEKKOAOT_CP_IDLE_BREAKPOINT_RECOVERY", false);
   if (const char* user_dir = std::getenv("GEKKOAOT_USER_DIR"); user_dir && *user_dir)
     live_video_config_path_ = std::filesystem::path(user_dir) / "config.ini";
   Reset();
@@ -1015,7 +1015,7 @@ bool HostRuntime::ReadDiscImage(std::uint64_t offset, void* destination, std::ui
       ++vfs_reads_;
       vfs_read_bytes_ += size;
       static unsigned vfs_logs = 0u;
-      if (vfs_logs++ < 96u)
+      if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && vfs_logs++ < 256u)
         std::fprintf(stderr,
                      "GEKKOAOT_NATIVE_VFS_V154=1 phase=read offset=%08llx bytes=%u source=%s reads=%llu\n",
                      static_cast<unsigned long long>(offset), size,
@@ -1190,7 +1190,7 @@ GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
     const auto sequence = request.sequence;
 
     static unsigned schedule_logs = 0u;
-    if (schedule_logs++ < 128u)
+    if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && schedule_logs++ < 256u)
       std::fprintf(stderr,
                    "GEKKOAOT_NATIVE_DI_PARITY_V143=1 phase=schedule seq=%llu offset=%08llx dma=%08x bytes=%u delay_cycles=%llu mode=%s visibility=completion\n",
                    static_cast<unsigned long long>(sequence),
@@ -2048,7 +2048,7 @@ void HostRuntime::ExternalWrite(CPUState* cpu, std::uint32_t address, std::uint6
         self->di_async_cycles_remaining_ = 0u;
         self->di_async_staging_.clear();
         static unsigned cancel_logs = 0u;
-        if (cancel_logs++ < 32u)
+        if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && cancel_logs++ < 32u)
           std::fprintf(stderr,
                        "GEKKOAOT_NATIVE_DI_ASYNC_V98=1 phase=cancel-immediate seq=%llu pc=%08x\n",
                        static_cast<unsigned long long>(self->di_async_sequence_), cpu->pc);
@@ -3668,6 +3668,56 @@ void HostRuntime::PollLiveVideoConfig(std::uint64_t charged) {
   if (have_aspect) native_gx_.SetAspectMode(aspect_mode);
 }
 
+void HostRuntime::ServiceDiscCompletion(std::uint64_t cycles) {
+  if (di_async_completion_pending_) {
+    // A guest may cancel/break the DI command before the deferred completion.
+    // NativeDI clears TSTART in that case; drop the scheduled TCINT instead of
+    // resurrecting a cancelled command.
+    if ((di_.DMAControl() & 1u) == 0u || di_.CommandSequence() != di_async_sequence_) {
+      static unsigned cancel_logs = 0u;
+      if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && cancel_logs++ < 32u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_NATIVE_DI_ASYNC_V58=1 phase=cancel seq=%llu offset=%08llx dma=%08x bytes=%u\n",
+                     static_cast<unsigned long long>(di_async_sequence_),
+                     static_cast<unsigned long long>(di_async_disc_offset_),
+                     di_async_dma_address_, di_async_bytes_);
+      di_async_completion_pending_ = false;
+      di_async_cycles_remaining_ = 0u;
+      di_async_staging_.clear();
+    } else if (cycles >= di_async_cycles_remaining_) {
+      const auto sequence = di_async_sequence_;
+      const auto bytes = di_async_bytes_;
+      const auto dma = di_async_dma_address_;
+      const auto offset = di_async_disc_offset_;
+      di_async_completion_pending_ = false;
+      di_async_cycles_remaining_ = 0u;
+      bool published = false;
+      if (di_async_staging_.size() == bytes) {
+        if (auto* target = memory_.Resolve(dma, bytes)) {
+          std::memcpy(target, di_async_staging_.data(), bytes);
+          published = true;
+        }
+      }
+      di_async_staging_.clear();
+      const bool completed = published && di_.CompletePendingFor(sequence, true, 0u, bytes, 0u);
+      if (!published) {
+        ++di_read_failures_;
+        di_.CompletePendingFor(sequence, false, 0u, 0u, 0x00031100u);
+      }
+      SyncNativeDIInterrupt();
+      static unsigned complete_logs = 0u;
+      if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && complete_logs++ < 256u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_NATIVE_DI_PARITY_V143=1 phase=%s seq=%llu offset=%08llx dma=%08x bytes=%u status=%08x visibility=completion\n",
+                     completed ? "complete" : (published ? "stale-drop" : "dma-fault"),
+                     static_cast<unsigned long long>(sequence),
+                     static_cast<unsigned long long>(offset), dma, bytes, di_.Status());
+    } else {
+      di_async_cycles_remaining_ -= cycles;
+    }
+  }
+}
+
 void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
                                        bool idle_wait) {
   if (charged > std::numeric_limits<std::uint64_t>::max() - result.cycles)
@@ -3693,53 +3743,7 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
   const bool gx_ready = native_gx_.Ready();
 
   if (hardware_cycles != 0u) {
-  if (di_async_completion_pending_) {
-    // A guest may cancel/break the DI command before the deferred completion.
-    // NativeDI clears TSTART in that case; drop the scheduled TCINT instead of
-    // resurrecting a cancelled command.
-    if ((di_.DMAControl() & 1u) == 0u) {
-      static unsigned cancel_logs = 0u;
-      if (cancel_logs++ < 32u)
-        std::fprintf(stderr,
-                     "GEKKOAOT_NATIVE_DI_ASYNC_V58=1 phase=cancel seq=%llu offset=%08llx dma=%08x bytes=%u\n",
-                     static_cast<unsigned long long>(di_async_sequence_),
-                     static_cast<unsigned long long>(di_async_disc_offset_),
-                     di_async_dma_address_, di_async_bytes_);
-      di_async_completion_pending_ = false;
-      di_async_cycles_remaining_ = 0u;
-      di_async_staging_.clear();
-    } else if (hardware_cycles >= di_async_cycles_remaining_) {
-      const auto sequence = di_async_sequence_;
-      const auto bytes = di_async_bytes_;
-      const auto dma = di_async_dma_address_;
-      const auto offset = di_async_disc_offset_;
-      di_async_completion_pending_ = false;
-      di_async_cycles_remaining_ = 0u;
-      bool published = false;
-      if (di_async_staging_.size() == bytes) {
-        if (auto* target = memory_.Resolve(dma, bytes)) {
-          std::memcpy(target, di_async_staging_.data(), bytes);
-          published = true;
-        }
-      }
-      di_async_staging_.clear();
-      const bool completed = published && di_.CompletePendingFor(sequence, true, 0u, bytes, 0u);
-      if (!published) {
-        ++di_read_failures_;
-        di_.CompletePendingFor(sequence, false, 0u, 0u, 0x00031100u);
-      }
-      SyncNativeDIInterrupt();
-      static unsigned complete_logs = 0u;
-      if (complete_logs++ < 128u)
-        std::fprintf(stderr,
-                     "GEKKOAOT_NATIVE_DI_PARITY_V143=1 phase=%s seq=%llu offset=%08llx dma=%08x bytes=%u status=%08x visibility=completion\n",
-                     completed ? "complete" : (published ? "stale-drop" : "dma-fault"),
-                     static_cast<unsigned long long>(sequence),
-                     static_cast<unsigned long long>(offset), dma, bytes, di_.Status());
-    } else {
-      di_async_cycles_remaining_ -= hardware_cycles;
-    }
-  }
+  ServiceDiscCompletion(hardware_cycles);
 
   PollLiveVideoConfig(hardware_cycles);
   AdvanceCpuTimers(hardware_cycles);
@@ -4453,8 +4457,9 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
   // Device MMIO writes and AdvanceRuntimeCycles keep PI causes synchronized.
   // Seed the initial state once, rather than polling every device again before
   // every dispatch (the old loop duplicated the end-of-dispatch synchronization).
-  std::fprintf(stderr,
-               "GEKKOAOT_NATIVE_CP_FIFO_V88=1 drain=32-byte-step breakpoint=stop+irq fifo-top=base+size-4 wrap=exact\n");
+  if (!run_banner_reported_)
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_CP_FIFO_V88=1 drain=32-byte-step breakpoint=stop+irq fifo-top=base+size-4 wrap=exact\n");
   SyncNativeCPInterrupt();
   SyncNativeDSPInterrupt();
   SyncNativeAIInterrupt();
@@ -4464,9 +4469,12 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
 
   const std::uint32_t native_idle_sleep_us =
       RuntimeEnvU32("GEKKOAOT_NATIVE_IDLE_SLEEP_US", 0u, 1000u);
-  std::fprintf(stderr,
-               "GEKKOAOT_RUNTIME_PERF_V140=1 clock=tsc-or-steady zero-cycle=fast-return external-pointer=ram-first wgpipe=early-fastpath irq-probe=single-load nativeos=o1-best+priority-coherent safe-chain=%lld spin-yield=off context-drop=off idle-sleep-us=%u\n",
-               static_cast<long long>(cpu_.cycle_budget), native_idle_sleep_us);
+  if (!run_banner_reported_) {
+    std::fprintf(stderr,
+                 "GEKKOAOT_RUNTIME_PERF_V140=1 clock=tsc-or-steady zero-cycle=fast-return external-pointer=ram-first wgpipe=early-fastpath irq-probe=single-load nativeos=o1-best+priority-coherent safe-chain=%lld spin-yield=off context-drop=off idle-sleep-us=%u\n",
+                 static_cast<long long>(cpu_.cycle_budget), native_idle_sleep_us);
+    run_banner_reported_ = true;
+  }
 
   while (dispatch_limit == 0 || result.dispatches < dispatch_limit) {
     if (cpu_.pc == 0u) {
@@ -4730,7 +4738,7 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
   const double guest_fps = produced_frame_period_.count() > 0
       ? 1000000000.0 / static_cast<double>(produced_frame_period_.count())
       : 0.0;
-  std::fprintf(stderr,
+  if (result.status != RunStatus::DispatchLimitReached) std::fprintf(stderr,
                "GEKKOAOT_HOST_FRAME_STATS_V48 target_hz=%u guest_fps=%.3f presents=%llu interpolated=%llu direct=%llu collapsed=%llu\n",
                host_fps_limit_hz_, guest_fps,
                static_cast<unsigned long long>(host_present_count_),

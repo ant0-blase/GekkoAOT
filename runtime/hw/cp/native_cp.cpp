@@ -180,7 +180,14 @@ bool NativeCP::Write16(std::uint32_t offset, std::uint16_t value) {
   CP_WRITE_PAIR(kFifoRwDistanceLo, kFifoRwDistanceHi, fifo_rw_distance_);
   CP_WRITE_PAIR(kFifoWritePointerLo, kFifoWritePointerHi, fifo_write_pointer_);
   CP_WRITE_PAIR(kFifoReadPointerLo, kFifoReadPointerHi, fifo_read_pointer_);
-  CP_WRITE_PAIR(kFifoBreakpointLo, kFifoBreakpointHi, fifo_breakpoint_);
+  case kFifoBreakpointLo:
+    WriteLow(&fifo_breakpoint_, value);
+    DrainSynchronousGpu();
+    return true;
+  case kFifoBreakpointHi:
+    WriteHigh(&fifo_breakpoint_, value);
+    DrainSynchronousGpu();
+    return true;
 #undef CP_WRITE_PAIR
   default:
     return false;

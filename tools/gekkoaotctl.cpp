@@ -1053,6 +1053,26 @@ R"GEKKO(PipelineRef find_pipeline(const gx::PipelineConfig& config, const Render
           "Aurora shader-vertex patch");
   std::cout << "GEKKOAOT_AURORA_SHADER_VERTEX_V1=1 nbt3=independent-indexed-vectors texmtx-identity=handled\n";
 
+  const auto aurora_viewport_patch =
+      p.root / "patches/aurora/gekkoaot-retail-viewport-v1.patch";
+  if (!fs::exists(aurora_viewport_patch))
+    throw std::runtime_error("missing Aurora retail viewport patch: " + aurora_viewport_patch.string());
+  Require(Run("git -C " + Quote(p.aurora_src) + " apply --check " + Quote(aurora_viewport_patch)),
+          "Aurora retail viewport patch check");
+  Require(Run("git -C " + Quote(p.aurora_src) + " apply " + Quote(aurora_viewport_patch)),
+          "Aurora retail viewport patch");
+  std::cout << "GEKKOAOT_AURORA_RETAIL_VIEWPORT_V1=1 origin=342\n";
+
+  const auto aurora_texture_descriptor_patch =
+      p.root / "patches/aurora/gekkoaot-texture-descriptor-cache-v1.patch";
+  if (!fs::exists(aurora_texture_descriptor_patch))
+    throw std::runtime_error("missing Aurora texture descriptor patch: " + aurora_texture_descriptor_patch.string());
+  Require(Run("git -C " + Quote(p.aurora_src) + " apply --check " + Quote(aurora_texture_descriptor_patch)),
+          "Aurora texture descriptor patch check");
+  Require(Run("git -C " + Quote(p.aurora_src) + " apply " + Quote(aurora_texture_descriptor_patch)),
+          "Aurora texture descriptor patch");
+  std::cout << "GEKKOAOT_AURORA_TEXTURE_DESCRIPTOR_CACHE_V1=1 source=address+dimensions+format+mips palette=format+entries+version\n";
+
   // v142: GameCube vertex matrix indices are six-bit values. Dolphin masks
   // both PNMTXIDX and TEXMTXIDX with 0x3f while translating the FIFO vertex
   // stream. Aurora 9c consumed the full host byte instead, so stale/high bits

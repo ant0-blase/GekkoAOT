@@ -10,20 +10,53 @@ Future release entries are maintained by Release Please from Conventional Commit
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.3...v0.0.4) (2026-09-27)
+
+### Compatibility
+
+- **Medal of Honor: Frontline** (`GMFE69`): font/text rendering now works in the currently tested path, movie playback no longer remains on a black screen, and level loading now progresses into the level.
+- **Star Fox Adventures**: compatibility continues to advance through the generic runtime/graphics fixes in this release; support remains incomplete.
+- No retail title is claimed as fully playable yet.
+
+### AuroraGX / graphics
+
+- Added host-side GameCube **TLUT/TMEM palette handling** for CI4/CI8/CI14X2 paths, including partial palette uploads, raw BP address decoding and regression coverage. This restores palette-backed rendering paths used by fonts and other indexed textures.
+- Added a descriptor-aware Aurora texture cache patch so cached textures are invalidated when source address, dimensions, format, mip count or palette interpretation changes instead of relying only on object/version IDs.
+- Corrected the raw retail GX viewport origin from `340` to `342` and added an independent FIFO regression test for a 640x448 retail viewport.
+- Expanded GX state diagnostics around projection/viewport, texture/TLUT state and draw-time matrix state while continuing matrix/mesh/camera correctness work.
+- Improved CP FIFO breakpoint/resume behavior and BP-mask/display-copy regression coverage.
+
+### Disc, DSP and video
+
+- Expanded native disc/runtime coverage for FST lookup, exact and unaligned reads, end-of-image behavior, deferred DI DMA visibility, cancellation and cascaded transfers.
+- Reworked native DSP reset/init/task lifecycle behavior so GameCube SDK reset, bootstrap and task-loader transitions are kept separate and covered by a dedicated regression test.
+- Improved the movie/video presentation path used by **Medal of Honor: Frontline**, removing the previous persistent black output in the tested sequence.
+- Native **VP6/VP6F** support is still incomplete. GekkoAOT has an optional FFmpeg/libavcodec codec backend, but the full native game movie frontend/integration still needs work; visible video artifacts can remain.
+
+### Known remaining issues
+
+- **Medal of Honor: Frontline** still shows rendering artifacts affecting camera/projection, matrices/transforms and meshes.
+- Video rendering/decoding can still show artifacts until the native VP6 path and its frontend integration are completed.
+- **Star Fox Adventures** remains an active compatibility target rather than a playable-status claim.
+
 ## [0.0.3](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.2...v0.0.3) (2026-09-27)
 
 ### Fixes
 
 - Fixed Windows portable builds failing before AOT compilation when the native module/cache path exceeded the legacy Win32 path length. Module and LLVM cache directory names now use compact deterministic keys while preserving full cache identity.
+- Fixed Windows module metadata generation by launching the metadata helper directly instead of routing its arguments through `cmd.exe`.
+- Fixed portable module configuration by providing Zig `ar`/`ranlib` wrappers and explicit CMake archive-tool configuration.
+- Added a pinned portable SDL3 fallback for keyboard/gamepad input, including headless Linux release builds and direct Win32 keyboard-state fallback for the Aurora window.
+- Reduced the default standalone AuroraGX window to `960x540` logical pixels while keeping environment overrides.
 
 ### Documentation
 
 - Refreshed the project README and full-resolution runtime/gameplay screenshots.
+- Added SDL3 portable-build licensing information.
 
 ### Release workflow
 
 - Release publishing is explicit/manual so normal development commits do not create unintended version tags.
-
 
 ## [0.0.2](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.1...v0.0.2) (2026-09-26)
 

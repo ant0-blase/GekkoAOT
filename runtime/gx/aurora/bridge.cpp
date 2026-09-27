@@ -16,6 +16,7 @@
 #include "webgpu/gpu.hpp"
 #include <SDL3/SDL.h>
 #include "window.hpp"
+#include "../host/tlut_memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -92,6 +93,9 @@ struct IndexScanLayout {
 std::array<IndexScanLayout, 8> g_index_scan_layout{};
 std::uint8_t g_index_scan_valid = 0;
 std::array<std::uint32_t, 8> g_texture_image3_word{};
+std::array<std::uint32_t, 8> g_texture_mapped_image0{};
+std::array<std::uint32_t, 8> g_texture_mapped_mips{};
+std::uint8_t g_texture_image3_written = 0;
 std::array<std::uint32_t, GX_VA_MAX_ATTR> g_array_available{};
 // v141: retain the authoritative guest base separately from Aurora's host
 // pointer/visible byte window. CPU D-cache maintenance publishes dynamic
@@ -1095,7 +1099,14 @@ bool PrepareRawTextureCopy(std::uint32_t word) {
                    g_copy_dest_physical,word&0x00ffffffu);
     return false;
   }
+  const unsigned shift=Bits(word,9u,1u);
+  g_gxState.texCopyDstWidth=std::max(1u,static_cast<unsigned>(g_gxState.texCopySrc.width)>>shift);
+  g_gxState.texCopyDstHeight=std::max(1u,static_cast<unsigned>(g_gxState.texCopySrc.height)>>shift);
   g_gxState.texCopyFmt=format;
+  static unsigned copy_logs=0;
+  if(EnvBool("GEKKOAOT_TRACE_GX_COPY",false) && copy_logs++<128u)
+    std::fprintf(stderr,"GEKKOAOT_TRACE_GX_COPY event=texture-copy width=%u height=%u half=%u format=%u\n",
+                 g_gxState.texCopyDstWidth,g_gxState.texCopyDstHeight,shift,unsigned(format));
   static unsigned logs=0;
   if(logs++<24u)
     std::fprintf(stderr,
@@ -1884,6 +1895,8 @@ void MapTextureImage3(std::uint8_t reg, std::uint32_t word) {
   if(map>=MaxTextures) return;
   auto& slot=g_gxState.loadedTextures[map];
   const std::uint8_t bit=static_cast<std::uint8_t>(1u<<map);
+  g_texture_image3_word[map] = word;
+  g_texture_image3_written = static_cast<std::uint8_t>(g_texture_image3_written | bit);
   const std::uint32_t guest=(word & 0x00ffffffu)<<5;
   const std::size_t texture_bytes=aurora::gx::texture::texture_source_size(
       slot.format(),slot.width(),slot.height(),slot.mip_count());
@@ -1923,14 +1936,26 @@ void MapTextureImage3(std::uint8_t reg, std::uint32_t word) {
     return;
   }
 
+  static unsigned video_logs=0;
+  if(EnvBool("GEKKOAOT_TRACE_VIDEO",false) && video_logs++<256u) {
+    const auto* bytes=static_cast<const std::uint8_t*>(ptr);
+    std::uint64_t hash=1469598103934665603ull;
+    for(unsigned i=0;i<required;++i) hash=(hash^bytes[i])*1099511628211ull;
+    std::fprintf(stderr,"GEKKOAOT_TRACE_VIDEO event=texture map=%u guest=%08x format=%u width=%u height=%u bytes=%u hash=%016llx\n",
+                 map,guest,unsigned(slot.format()),slot.width(),slot.height(),required,
+                 static_cast<unsigned long long>(hash));
+  }
+
   // Games commonly re-emit the same IMAGE3 state for every draw. Treat that as
   // a binding, not a texture mutation. Aurora can then reuse its converted GPU
   // resource instead of new_static_texture_2d/convert/upload on every bind.
   const bool stable_bind=(g_texture_image3_valid&bit)!=0u &&
-                         g_texture_image3_word[map]==word && slot.data==ptr;
+                         g_texture_mapped_image0[map]==slot.image0 &&
+                         g_texture_mapped_mips[map]==slot.mip_count() && slot.data==ptr;
   if(stable_bind && g_texture_bind_cache) return;
 
-  g_texture_image3_word[map]=word;
+  g_texture_mapped_image0[map] = slot.image0;
+  g_texture_mapped_mips[map] = slot.mip_count();
   g_texture_image3_valid=static_cast<std::uint8_t>(g_texture_image3_valid|bit);
   slot.data=ptr;
   // Keep object identity stable per hardware texture unit. With the retail
@@ -1944,38 +1969,71 @@ void MapTextureImage3(std::uint8_t reg, std::uint32_t word) {
   g_gxState.dirty |= DirtyTextures;
 }
 
+void RefreshTextureMappings() {
+  for (unsigned map = 0; map < aurora::gx::MaxTextures; ++map) {
+    const auto bit = static_cast<std::uint8_t>(1u << map);
+    if ((g_texture_image3_written & bit) == 0) continue;
+    const auto& slot = aurora::gx::g_gxState.loadedTextures[map];
+    if ((g_texture_image3_valid & bit) == 0 ||
+        g_texture_mapped_image0[map] != slot.image0 ||
+        g_texture_mapped_mips[map] != slot.mip_count()) {
+      // IMAGE0/MODE1 can be changed without writing IMAGE3. Validate the new
+      // complete source span at draw time, after the descriptor is installed.
+      MapTextureImage3(static_cast<std::uint8_t>((map < 4 ? 0x94 : 0xb4) + (map & 3)),
+                       g_texture_image3_word[map]);
+    }
+  }
+}
+
+GekkoAOT::GX::TlutMemory g_tlut_memory;
+std::array<std::uint64_t, 8> g_tlut_revisions{};
+std::array<std::uint32_t, 8> g_tlut_bindings{};
+
 void MapTlut() {
   using namespace aurora::gx;
   const auto load=g_gxState.bpRegCache[0x64];
   const auto trigger=g_gxState.bpRegCache[0x65];
-  const unsigned idx=trigger & 0x3ffu;
-  if(idx>=MaxTluts) return;
-  auto& slot=g_gxState.loadedTluts[idx];
-  const std::uint32_t guest=(load & 0x00ffffffu)<<5;
-  const std::size_t tlut_bytes=aurora::gx::texture::tlut_source_size(slot.numEntries);
-  const std::uint32_t required=tlut_bytes>std::numeric_limits<std::uint32_t>::max()
-                                   ? 0u : static_cast<std::uint32_t>(tlut_bytes);
+  const std::uint32_t guest=GekkoAOT::GX::TlutMemory::SourceAddress(load);
+  const auto required=GekkoAOT::GX::TlutMemory::UploadBytes(trigger);
   const void* ptr=nullptr; std::uint32_t available=0;
-  if(required==0u || !Resolve(guest,required,&ptr,&available) || available<required) {
-    slot.data=nullptr;
-    slot.tlutDataVersion=static_cast<std::uint32_t>(++g_texture_generation);
+  const bool valid=required==0u ||
+      (Resolve(guest,required,&ptr,&available) && available>=required);
+  const bool copied=valid && g_tlut_memory.Load(trigger,
+      {static_cast<const std::uint8_t*>(ptr),valid ? required : 0u});
+  static unsigned logs=0;
+  if(EnvBool("GEKKOAOT_TRACE_FONT",false) && logs++<128u)
+    std::fprintf(stderr,"GEKKOAOT_TRACE_FONT event=tlut-load guest=%08x tmem=%05x bytes=%u success=%u revision=%llu\n",
+                 guest,GekkoAOT::GX::TlutMemory::Offset(trigger),required,copied?1u:0u,
+                 static_cast<unsigned long long>(g_tlut_memory.Revision()));
+  if(!copied) { g_fifo_fault=true; g_quit=true; }
+}
+
+void BindRawTluts() {
+  using namespace aurora::gx;
+  for(unsigned map=0;map<MaxTextures;++map) {
+    auto& texture=g_gxState.loadedTextures[map];
+    const auto format=texture.format();
+    const unsigned entries=format==GX_TF_C4 ? 16u : format==GX_TF_C8 ? 256u :
+                           format==GX_TF_C14X2 ? 16384u : 0u;
+    if(!entries) continue;
+    const unsigned reg=0x98u+(map&3u)+(map>=4u ? 0x20u : 0u);
+    const auto binding=g_gxState.bpRegCache[reg]&0xfffu;
+    // Include texture format: the same TMEM address can be rebound as CI4/CI8.
+    const auto key=binding|(format<<16u);
+    if(g_tlut_revisions[map]==g_tlut_memory.Revision()+1u && g_tlut_bindings[map]==key) continue;
+    const auto bytes=g_tlut_memory.Palette(binding,entries);
+    auto& palette=g_gxState.loadedTluts[map];
+    palette.data=bytes.empty() ? nullptr : bytes.data();
+    palette.numEntries=static_cast<std::uint16_t>(entries);
+    palette.format=static_cast<GXTlutFmt>((binding>>10u)&3u);
+    palette.tlutObjId=map+1u;
+    palette.tlutDataVersion=static_cast<std::uint32_t>(++g_texture_generation);
+    texture.tlut=static_cast<GXTlut>(map);
+    g_tlut_bindings[map]=key;
+    g_tlut_revisions[map]=g_tlut_memory.Revision()+1u;
     g_gxState.dirty |= DirtyTextures;
     aurora::gx::texture::invalidate_bindings();
-    static unsigned bad_tlut_logs=0;
-    if(bad_tlut_logs++<16u)
-      std::fprintf(stderr,
-                   "GEKKOAOT_NATIVE_GX_TLUT_BASE_V87=0 slot=%u guest=%08x required=%u available=%u action=invalidate-stale-mapping\n",
-                   idx,guest,required,available);
-    return;
   }
-  // TLUT loads are explicit mutations, so preserve version bumps here.
-  slot.data=ptr;
-  // Same rule as textures: keep one stable object identity per TLUT slot and
-  // bump only the data version on explicit loads. Otherwise a game that reloads
-  // palettes every frame creates an unbounded Aurora object-cache population.
-  slot.tlutObjId=static_cast<std::uint32_t>(idx+1u);
-  slot.tlutDataVersion=static_cast<std::uint32_t>(++g_texture_generation);
-  g_gxState.dirty |= DirtyTextures;
 }
 
 void InvalidateTextureCacheV87() {
@@ -2144,6 +2202,15 @@ void DumpFifoFault(std::size_t fault_offset) {
 
 bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
   const std::uint8_t cmd=p[0], op=cmd & GX_OPCODE_MASK;
+  static const bool trace_xf=EnvBool("GEKKOAOT_TRACE_GX_STATE",false);
+  if(trace_xf && op==GX_LOAD_XF_REG) {
+    const auto header=Be32(p+1);
+    const unsigned address=header&0xffffu, count=(header>>16)+1u;
+    static unsigned xf_logs=0;
+    if(address>=0x101au && address<=0x1026u && xf_logs++<128u)
+      std::fprintf(stderr,"GEKKOAOT_TRACE_GX_STATE event=xf-projection-viewport address=%04x words=%u first=%08x\n",
+                   address,count,Be32(p+5));
+  }
   if(g_array_base_trace && op==GX_CMD_INVL_VC) ++g_array_base_trace_invalidate;
   if(op==GX_CMD_CALL_DL) {
     // The retail CP has one display-list call level. A stream may call one DL,
@@ -2209,6 +2276,11 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
       aurora::gx::g_gxState.bpRegValid.set(reg);
       bp_cache[0xFEu]=0x00ffffffu;
     };
+    if(reg==0x65u) {
+      consume_intercepted_bp();
+      MapTlut();
+      return !g_fifo_fault;
+    }
     if(reg>=0x49u && reg<=0x4Eu) TrackRawCopyRegister(reg,effective_word);
     if(reg==0x52u && ((effective_word>>14)&1u)!=0u) {
       ++g_display_copy_count;
@@ -2271,6 +2343,29 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
     const auto fmt=static_cast<GXVtxFmt>(cmd&GX_VAT_MASK);
     const auto prim=static_cast<GXPrimitive>(cmd&GX_OPCODE_MASK);
     const std::uint16_t count=Be16(p+1);
+    RefreshTextureMappings();
+    BindRawTluts();
+    if(trace_xf) {
+      using namespace aurora::gx;
+      static unsigned draw_logs=0;
+      static std::uint64_t previous=~std::uint64_t{0};
+      std::uint64_t signature=1469598103934665603ull;
+      for(const auto reg : {0x00,0x28,0x41,0xc0,0xc1,0xf3})
+        signature=(signature^g_gxState.bpRegCache[reg])*1099511628211ull;
+      signature=(signature^g_gxState.loadedTextures[0].image0)*1099511628211ull;
+      if(signature!=previous && draw_logs++<128u) {
+        const auto& tcg=g_gxState.tcgs[0];
+        std::fprintf(stderr,"GEKKOAOT_TRACE_GX_STATE event=draw vertices=%u pn=%u texgens=%u tev=%u tex0=%ux%u:%u tref=%06x color=%06x alpha=%06x compare=%06x blend=%06x texgen=%u:%u mtx=%u post=%u normalize=%u dual=%u viewport=%.2f,%.2f,%.2f,%.2f\n",
+                     count,g_gxState.currentPnMtx,g_gxState.numTexGens,g_gxState.numTevStages,
+                     g_gxState.loadedTextures[0].width(),g_gxState.loadedTextures[0].height(),unsigned(g_gxState.loadedTextures[0].format()),
+                     g_gxState.bpRegCache[0x28]&0xffffffu,g_gxState.bpRegCache[0xc0]&0xffffffu,g_gxState.bpRegCache[0xc1]&0xffffffu,
+                     g_gxState.bpRegCache[0xf3]&0xffffffu,g_gxState.bpRegCache[0x41]&0xffffffu,
+                     unsigned(tcg.type),unsigned(tcg.src),unsigned(tcg.mtx),unsigned(tcg.postMtx),unsigned(tcg.normalize),
+                     g_gxState.xfRegCache[0x12],g_gxState.logicalViewport.left,g_gxState.logicalViewport.top,
+                     g_gxState.logicalViewport.width,g_gxState.logicalViewport.height);
+        previous=signature;
+      }
+    }
     CaptureDraw(cmd,p,len);
 
     // GXBegin with zero vertices is a legal no-op in retail code.  The framed
@@ -2582,7 +2677,8 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   g_fifo_last_draw_count=0; g_fifo_last_draw_stride=0;
   g_vertex_size_cache.fill(0); g_vertex_size_valid=0;
   g_index_scan_layout.fill({}); g_index_scan_valid=0;
-  g_texture_image3_word.fill(0); g_texture_image3_valid=0;
+  g_texture_image3_word.fill(0); g_texture_image3_valid=0; g_texture_image3_written=0;
+  g_tlut_memory={}; g_tlut_revisions.fill(0); g_tlut_bindings.fill(0);
   g_array_available.fill(0);
   g_array_guest_base.fill(0);
   g_array_cache_control_events=0;
@@ -2899,6 +2995,7 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_shutdown(){
   g_index_scan_valid=0;
   g_texture_image3_word.fill(0);
   g_texture_image3_valid=0;
+  g_texture_image3_written=0;
   g_array_frame_refresh=false;
   g_array_available.fill(0);
   g_array_guest_base.fill(0);
