@@ -218,6 +218,17 @@ endif()
 add_executable(gekkoaot-native-run runner.cpp)
 target_link_libraries(gekkoaot-native-run PRIVATE gekkoaot_native_runtime)
 
+# The Windows host performs native renderer/runtime initialization on the main
+# thread. Reserve explicit headroom so future large local state or deep native
+# call chains fail less readily than the platform's small default stack.
+if(WIN32)
+    if(MSVC)
+        target_link_options(gekkoaot-native-run PRIVATE /STACK:16777216)
+    else()
+        target_link_options(gekkoaot-native-run PRIVATE "LINKER:--stack,16777216")
+    endif()
+endif()
+
 include(CheckIPOSupported)
 check_ipo_supported(RESULT GEKKOAOT_NATIVE_IPO_OK OUTPUT GEKKOAOT_NATIVE_IPO_ERROR LANGUAGES CXX)
 if(GEKKOAOT_NATIVE_IPO_OK)

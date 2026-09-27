@@ -2678,7 +2678,7 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   g_vertex_size_cache.fill(0); g_vertex_size_valid=0;
   g_index_scan_layout.fill({}); g_index_scan_valid=0;
   g_texture_image3_word.fill(0); g_texture_image3_valid=0; g_texture_image3_written=0;
-  g_tlut_memory={}; g_tlut_revisions.fill(0); g_tlut_bindings.fill(0);
+  g_tlut_memory.Reset(); g_tlut_revisions.fill(0); g_tlut_bindings.fill(0);
   g_array_available.fill(0);
   g_array_guest_base.fill(0);
   g_array_cache_control_events=0;
