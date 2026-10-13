@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstdint>
+#include <limits>
 
 namespace GekkoAOT::HW::AI {
 
@@ -24,6 +25,9 @@ public:
   void AdvanceCycles(std::uint64_t cycles);
 
   bool InterruptPending() const;
+  // Earliest sample-counter interrupt that can wake the PPC. max() means no
+  // masked timing event is armed; 0 means the cause is already asserted.
+  std::uint64_t CyclesUntilInterrupt() const;
   bool IsPlaying() const { return (control_ & kPstat) != 0u; }
   std::uint32_t Control() const { return control_; }
   std::uint32_t Volume() const { return volume_; }

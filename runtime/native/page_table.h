@@ -11,6 +11,11 @@ struct PageTranslation {
   enum class Status { Mapped, Missing, Protection, NoExecute, DirectStore, InvalidTable };
   Status status = Status::Missing;
   std::uint32_t physical = 0;
+  // Filled for hashed-page-table hits. Keeping the backing PTE identity lets
+  // HostRuntime model the Gekko DTLB without re-walking the HPT on every load.
+  std::uint32_t pte_address = 0;
+  std::uint32_t pte_upper = 0;
+  std::uint32_t pte_lower = 0;
 };
 enum class PageAccess { Read, Write, Execute };
 
@@ -49,9 +54,11 @@ inline PageTranslation TranslatePage(AddressSpace& memory, std::uint32_t ea,
       // Gekko sets R even on page-protection faults, but never C on a fault.
       const std::uint32_t history = 0x100u |
           ((permitted && access == PageAccess::Write) ? 0x80u : 0u);
-      if ((lower & history) != history) memory.Write32(pte + 4u, lower | history);
+      const std::uint32_t effective_lower = lower | history;
+      if (effective_lower != lower) memory.Write32(pte + 4u, effective_lower);
       if (!permitted) return {Status::Protection};
-      return {Status::Mapped, (lower & 0xfffff000u) | (ea & 0xfffu)};
+      return {Status::Mapped, (lower & 0xfffff000u) | (ea & 0xfffu),
+              pte, upper, effective_lower};
     }
   }
   return {Status::Missing};

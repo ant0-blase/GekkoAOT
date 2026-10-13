@@ -387,6 +387,8 @@ def command_match(args: argparse.Namespace) -> int:
             if candidate is None:
                 continue
             conf, kind = candidate
+            if getattr(args, "exact_only", False) and kind != "exact":
+                continue
             if best is None or conf > best[0]:
                 best = (conf, kind, db_entry)
         if best is not None:
@@ -707,6 +709,8 @@ def main() -> int:
     match.add_argument("--symbol-order", type=Path, required=True)
     match.add_argument("--compile-chunk", type=int, default=DEFAULT_COMPILE_CHUNK)
     match.add_argument("--chunk-locked", action="store_true")
+    match.add_argument("--exact-only", action="store_true",
+                       help="only identical normalized PPC signatures; no fuzzy hot hints")
     match.add_argument(
         "--exclude-game",
         default="",

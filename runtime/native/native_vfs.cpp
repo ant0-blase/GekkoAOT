@@ -60,9 +60,23 @@ std::string NativeVfs::NormalizeLookup(std::string_view path) {
 
 void NativeVfs::Reset() {
 #ifdef GEKKOAOT_HAVE_NOD
+  {
+    std::scoped_lock lock(partition_file_mutex_);
+    for (auto& cached : partition_files_) {
+      if (cached.handle) nod_free(static_cast<NodHandle*>(cached.handle));
+      cached = {};
+      cached.index = 0xffffffffu;
+    }
+    partition_file_stamp_ = 1u;
+  }
   if (partition_) nod_free(static_cast<NodHandle*>(partition_));
 #endif
   partition_ = nullptr;
+  {
+    std::scoped_lock lock(host_file_mutex_);
+    for (auto& cached : host_files_) cached = {};
+    host_file_stamp_ = 1u;
+  }
   extracted_root_.clear();
   overlay_root_.clear();
   entries_by_offset_.clear();
@@ -209,13 +223,55 @@ bool NativeVfs::ReadHostFile(const std::filesystem::path& root, const Entry& ent
                              std::uint32_t size) const {
   if (root.empty() || !destination) return false;
   const auto path = root / std::filesystem::path(entry.path);
-  std::error_code ec;
-  const std::uint64_t host_size = std::filesystem::file_size(path, ec);
-  if (ec || file_offset > host_size || size > host_size - file_offset) return false;
-  if (file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+
+  // Overlay files are intentionally reopened every read so a developer can
+  // replace an asset while the title is running. Extracted roots are immutable
+  // for a normal session and benefit substantially from persistent file handles
+  // during streamed audio/video/texture reads.
+  if (root == overlay_root_) {
+    std::error_code ec;
+    const std::uint64_t host_size = std::filesystem::file_size(path, ec);
+    if (ec || file_offset > host_size || size > host_size - file_offset) return false;
+    if (file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+      return false;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    in.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
+    if (!in) return false;
+    in.read(static_cast<char*>(destination), static_cast<std::streamsize>(size));
+    return in.gcount() == static_cast<std::streamsize>(size);
+  }
+
+  std::scoped_lock lock(host_file_mutex_);
+  CachedHostFile* slot = nullptr;
+  for (auto& cached : host_files_) {
+    if (cached.stream && cached.path == path) { slot = &cached; break; }
+  }
+  if (!slot) {
+    slot = &host_files_.front();
+    for (auto& cached : host_files_) {
+      if (!cached.stream) { slot = &cached; break; }
+      if (cached.stamp < slot->stamp) slot = &cached;
+    }
+    std::error_code ec;
+    const std::uint64_t host_size = std::filesystem::file_size(path, ec);
+    if (ec) return false;
+    auto stream = std::make_unique<std::ifstream>(path, std::ios::binary);
+    if (!*stream) return false;
+    slot->path = path;
+    slot->stream = std::move(stream);
+    slot->size = host_size;
+  }
+  if (file_offset > slot->size || size > slot->size - file_offset ||
+      file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
     return false;
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return false;
+  slot->stamp = host_file_stamp_++;
+  if (host_file_stamp_ == 0u) {
+    host_file_stamp_ = 1u;
+    for (auto& cached : host_files_) cached.stamp = cached.stream ? 1u : 0u;
+  }
+  auto& in = *slot->stream;
+  in.clear();
   in.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
   if (!in) return false;
   in.read(static_cast<char*>(destination), static_cast<std::streamsize>(size));
@@ -233,32 +289,54 @@ bool NativeVfs::ReadPartitionFile(const Entry& entry, std::uint64_t file_offset,
 #else
   if (!partition_ || !destination || file_offset > entry.size || size > entry.size - file_offset)
     return false;
-  NodHandle* file = nullptr;
-  if (nod_partition_open_file(static_cast<NodHandle*>(partition_), entry.index, &file) !=
-          NOD_RESULT_OK ||
-      !file)
+  if (file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
     return false;
-  const auto close = [&]() { nod_free(file); };
-  if (file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-    close();
-    return false;
+
+  // Opening a nod file for every DVD read is surprisingly expensive for
+  // streaming audio/video and texture archives.  Keep a tiny LRU of file
+  // objects; the seek/read cursor is protected because DI and media workers can
+  // legitimately touch the VFS concurrently.  The FST index remains the source
+  // of truth, so this changes no guest-visible filesystem semantics.
+  std::scoped_lock lock(partition_file_mutex_);
+  CachedPartitionFile* slot = nullptr;
+  for (auto& cached : partition_files_) {
+    if (cached.handle && cached.index == entry.index) { slot = &cached; break; }
   }
+  if (!slot) {
+    slot = &partition_files_.front();
+    for (auto& cached : partition_files_) {
+      if (!cached.handle) { slot = &cached; break; }
+      if (cached.stamp < slot->stamp) slot = &cached;
+    }
+    if (slot->handle) nod_free(static_cast<NodHandle*>(slot->handle));
+    NodHandle* file = nullptr;
+    if (nod_partition_open_file(static_cast<NodHandle*>(partition_), entry.index, &file) !=
+            NOD_RESULT_OK ||
+        !file) {
+      slot->handle = nullptr;
+      slot->index = 0xffffffffu;
+      slot->stamp = 0u;
+      return false;
+    }
+    slot->handle = file;
+    slot->index = entry.index;
+  }
+  slot->stamp = partition_file_stamp_++;
+  if (partition_file_stamp_ == 0u) {
+    partition_file_stamp_ = 1u;
+    for (auto& cached : partition_files_) cached.stamp = cached.handle ? 1u : 0u;
+  }
+
+  auto* file = static_cast<NodHandle*>(slot->handle);
   const auto sought = nod_seek(file, static_cast<std::int64_t>(file_offset), 0);
-  if (sought < 0 || static_cast<std::uint64_t>(sought) != file_offset) {
-    close();
-    return false;
-  }
+  if (sought < 0 || static_cast<std::uint64_t>(sought) != file_offset) return false;
   auto* out = static_cast<std::uint8_t*>(destination);
   std::size_t done = 0;
   while (done < size) {
     const std::int64_t got = nod_read(file, out + done, size - done);
-    if (got <= 0) {
-      close();
-      return false;
-    }
+    if (got <= 0) return false;
     done += static_cast<std::size_t>(got);
   }
-  close();
   return true;
 #endif
 }

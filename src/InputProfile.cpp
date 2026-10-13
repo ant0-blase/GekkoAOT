@@ -42,6 +42,25 @@ void setTrigger(InputPortProfile& p, const QString& name, const QString& key,
     p.values[name + "_axis"] = axis;
     p.values[name + "_joy_axis"] = QString::number(joyAxis);
 }
+
+void migrateLegacyShoulderBindings(InputPortProfile& p)
+{
+    // Keep custom profiles intact; only migrate the exact historical defaults
+    // that mapped L1->L and R1->Z+R.
+    const bool legacy =
+        p.values.value("z_button") == "right_shoulder" &&
+        p.values.value("z_joy_button") == "5" &&
+        p.values.value("l_button") == "left_shoulder" &&
+        p.values.value("l_joy_button") == "4" &&
+        p.values.value("r_button") == "right_shoulder" &&
+        p.values.value("r_joy_button") == "5";
+    if (!legacy)
+        return;
+    p.values["l_button"] = "";
+    p.values["l_joy_button"] = "-1";
+    p.values["r_button"] = "";
+    p.values["r_joy_button"] = "-1";
+}
 }
 
 InputPortProfile defaultInputPortProfile(int port)
@@ -53,9 +72,12 @@ InputPortProfile defaultInputPortProfile(int port)
     setDigital(p, "x", "U", "west", 2);
     setDigital(p, "y", "I", "north", 3);
     setDigital(p, "start", "Return", "start", 9);
+    // Modern-controller default: R1/RB is the GameCube Z button. GameCube
+    // L/R are provided by L2/LT and R2/RT below, including their digital click
+    // near full travel. L1/LB is intentionally left unused.
     setDigital(p, "z", "R", "right_shoulder", 5);
-    setDigital(p, "l", "Q", "left_shoulder", 4);
-    setDigital(p, "r", "E", "right_shoulder", 5);
+    setDigital(p, "l", "Q", "", -1);
+    setDigital(p, "r", "E", "", -1);
     setDigital(p, "dpad_up", "T", "dpad_up", 12);
     setDigital(p, "dpad_down", "G", "dpad_down", 13);
     setDigital(p, "dpad_left", "F", "dpad_left", 14);
@@ -109,6 +131,8 @@ QVector<InputPortProfile> loadInputProfiles(const QString& filename)
         else
             result[current].values[key] = value;
     }
+    for (auto& profile : result)
+        migrateLegacyShoulderBindings(profile);
     return result;
 }
 
@@ -129,7 +153,8 @@ bool saveInputProfiles(const QString& filename, const QVector<InputPortProfile>&
     }
     QTextStream out(&file);
     out << "# GekkoAOT native SDL3 input profile\n"
-           "# source = auto | keyboard | gamepad | joystick | disabled\n";
+           "# source = auto | keyboard | gamepad | joystick | disabled\n"
+           "# default shoulders: R1/RB=Z, L1/LB=none; L2/LT and R2/RT are GameCube L/R\n";
     for (int i = 0; i < 4; ++i)
     {
         const InputPortProfile p = i < profiles.size() ? profiles[i] : defaultInputPortProfile(i);

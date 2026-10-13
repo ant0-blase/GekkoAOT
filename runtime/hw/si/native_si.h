@@ -46,6 +46,12 @@ public:
   bool Write(std::uint32_t address, std::uint64_t value, std::uint8_t size);
 
   void SetDeviceHooks(DeviceHooks hooks) { hooks_ = hooks; }
+  // Native transfer completion is a deadline, not a reentrant callback from
+  // the COMCSR store. The old synchronous bus path remains independently
+  // selectable for compatibility and differential tests.
+  void SetTransferEvents(bool enabled) { transfer_events_ = enabled; }
+  void AdvanceCycles(std::uint64_t cycles);
+  std::uint64_t CyclesUntilTransfer() const;
   void PollNow();
   bool InterruptPending() const;
 
@@ -111,6 +117,7 @@ private:
   bool WriteRegister32(std::uint32_t offset, std::uint32_t value);
   void UpdateInterruptState();
   void RunBufferTransfer();
+  void CompleteBufferTransfer();
   void SendDirectCommands();
   void SetNoResponse(std::uint32_t channel);
 
@@ -121,6 +128,11 @@ private:
   std::uint32_t exi_clock_count_ = 0;
   std::array<std::uint8_t, BufferSize> buffer_{};
   DeviceHooks hooks_{};
+  bool transfer_events_ = false;
+  std::uint64_t transfer_cycles_ = 0;
+  std::array<std::uint8_t, BufferSize> transfer_buffer_{};
+  int transfer_response_ = 0;
+  std::uint32_t transfer_channel_ = 0;
 };
 
 } // namespace GekkoAOT::HW::SI

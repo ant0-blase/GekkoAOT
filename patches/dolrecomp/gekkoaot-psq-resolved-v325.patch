@@ -1,0 +1,295 @@
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -259,6 +259,10 @@
+   llvm::Value *pagedVmemPointer(llvm::Value *address, u32 width, bool write,
+                                 llvm::BasicBlock *miss);
+   llvm::Value *pagedVmemState(DolIRStateSlot slot);
++  // GEKKOAOT_PSQ_RESOLVED_V325: one host pointer for a whole psq pair window.
++  bool psqResolvedPath() const;
++  llvm::Value *psqHostPointer(llvm::Value *address, bool write,
++                              llvm::BasicBlock *miss);
+   llvm::Value *ram_ = nullptr;
+   llvm::Value *ram_size_ = nullptr;
+   llvm::Value *mem2_ = nullptr;
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -1,5 +1,7 @@
+ #include "backend/llvm/rel_pointer_manifest.h"
+ #include "backend/llvm/emitter.h"
++
++#include <llvm/ADT/SmallVector.h>
+ #include "cpu/cpu.h"
+ #include <cstdlib>
+ 
+@@ -108,6 +110,97 @@
+                                     builder_.CreateZExt(physical, builder_.getInt64Ty()));
+ }
+ 
++// GEKKOAOT_PSQ_RESOLVED_V325: v320 sent every quantized psq to the C helper,
++// whose memory reads only know MEM1 and otherwise call the external service.
++// HPCOS streams quantized vertices through the locked cache (~8.6M external
++// accesses/s). Resolve the full 8-byte psq window once - MEM1, locked cache,
++// flat or paged VM, exactly the regions the per-lane ladders admit - and let
++// the caller decode/encode every GQR type from that host pointer.
++bool FunctionEmitter::psqResolvedPath() const {
++  static const bool enabled = [] {
++    const char *setting = std::getenv("DOLRECOMP_PSQ_RESOLVED");
++    return !setting || setting[0] != '0';
++  }();
++  return enabled && fixed_memory_layout_ && expected_mem2_size_ == 0 &&
++         expected_ram_size_ >= 8u;
++}
++
++Value *FunctionEmitter::psqHostPointer(Value *address, bool write,
++                                       BasicBlock *miss) {
++  constexpr u32 span = 8u;
++  Type *pointer = PointerType::getUnqual(context_);
++  BasicBlock *resolved = BasicBlock::Create(context_, "psq_resolved", function_);
++  SmallVector<std::pair<Value *, BasicBlock *>, 4> incoming;
++
++  Value *normalized = normalizeAddress(address);
++  Value *mem1Offset = builder_.CreateSub(normalized, builder_.getInt32(GC_RAM_BASE));
++  BasicBlock *mem1 = BasicBlock::Create(context_, "psq_resolve_mem1", function_);
++  BasicBlock *other = BasicBlock::Create(context_, "psq_resolve_other", function_);
++  // A MEM1 store journals each lane; keep journaled builds on the lane path.
++  Value *mem1Admitted = builder_.CreateICmpULE(
++      mem1Offset, builder_.getInt32(expected_ram_size_ - span));
++  if (write && write_journal_)
++    mem1Admitted = builder_.getFalse();
++  builder_.CreateCondBr(mem1Admitted, mem1, other,
++                        MDBuilder(context_).createBranchWeights(2000, 1));
++  builder_.SetInsertPoint(mem1);
++  incoming.push_back({nativeMemoryPointer(normalized, ram_, mem1Offset),
++                      builder_.GetInsertBlock()});
++  builder_.CreateBr(resolved);
++
++  builder_.SetInsertPoint(other);
++  if (native_locked_cache_base_) {
++    Value *offset = builder_.CreateSub(address, builder_.getInt32(0xe0000000u));
++    Value *admitted = builder_.CreateAnd(
++        builder_.CreateIsNotNull(native_locked_cache_base_),
++        builder_.CreateICmpULE(offset, builder_.getInt32(0x40000u - span)));
++    auto *direct = BasicBlock::Create(context_, "psq_resolve_locked_cache", function_);
++    auto *next = BasicBlock::Create(context_, "psq_resolve_vm", function_);
++    builder_.CreateCondBr(admitted, direct, next);
++    builder_.SetInsertPoint(direct);
++    incoming.push_back({builder_.CreateInBoundsGEP(builder_.getInt8Ty(),
++                                                   native_locked_cache_base_, offset),
++                        builder_.GetInsertBlock()});
++    builder_.CreateBr(resolved);
++    builder_.SetInsertPoint(next);
++  }
++  if (native_flat_vmem_view_) {
++    auto *viewType = StructType::get(context_, {pointer, builder_.getInt32Ty()});
++    auto *size = builder_.CreateLoad(builder_.getInt32Ty(),
++        builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 1));
++    size->setVolatile(true);
++    Value *offset = builder_.CreateSub(address, builder_.getInt32(0x7e000000u));
++    Value *admitted = builder_.CreateAnd(
++        builder_.CreateICmpUGE(size, builder_.getInt32(span)),
++        builder_.CreateICmpULE(offset, builder_.CreateSub(size, builder_.getInt32(span))));
++    auto *direct = BasicBlock::Create(context_, "psq_resolve_flat_vmem", function_);
++    auto *next = BasicBlock::Create(context_, "psq_resolve_paged_vmem", function_);
++    builder_.CreateCondBr(admitted, direct, next);
++    builder_.SetInsertPoint(direct);
++    Value *base = builder_.CreateLoad(pointer,
++        builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 0));
++    incoming.push_back({builder_.CreateInBoundsGEP(builder_.getInt8Ty(), base, offset),
++                        builder_.GetInsertBlock()});
++    builder_.CreateBr(resolved);
++    builder_.SetInsertPoint(next);
++    if (nativePagedVmemEnabled()) {
++      Value *host = pagedVmemPointer(address, span, write, miss);
++      incoming.push_back({host, builder_.GetInsertBlock()});
++      builder_.CreateBr(resolved);
++    } else {
++      builder_.CreateBr(miss);
++    }
++  } else {
++    builder_.CreateBr(miss);
++  }
++
++  builder_.SetInsertPoint(resolved);
++  PHINode *host = builder_.CreatePHI(pointer, incoming.size(), "psq.host");
++  for (auto &[value, block] : incoming)
++    host->addIncoming(value, block);
++  return host;
++}
++
+ Value *FunctionEmitter::normalizeAddress(Value *address) {
+   return builder_.CreateAnd(address, builder_.getInt32(~0x40000000u));
+ }
+--- a/src/backend/llvm/psq_load.cpp
++++ b/src/backend/llvm/psq_load.cpp
+@@ -63,21 +63,29 @@
+     const char *setting = std::getenv("DOLRECOMP_PSQ_INLINE_QUANTIZED");
+     return setting && setting[0] == '1';
+   }();
++  // GEKKOAOT_PSQ_RESOLVED_V325: v320 left quantized types to the helper,
++  // whose reads only know MEM1 (HPCOS streams quantized vertices through the
++  // locked cache: ~8.6M external accesses/s). Resolve the whole 8-byte pair
++  // window once and decode every GQR type from that host pointer; MMIO,
++  // page-crossing windows and region tails take the exact helper.
++  const bool resolved = !inlineQuantized && psqResolvedPath();
++  const bool allTypes = inlineQuantized || resolved;
+   BasicBlock *f32Block =
+       BasicBlock::Create(context_, "psq_load_f32", function_);
+   BasicBlock *u8Block = nullptr, *u16Block = nullptr, *s8Block = nullptr,
+              *s16Block = nullptr;
+-  if (inlineQuantized) {
++  if (allTypes) {
+     u8Block = BasicBlock::Create(context_, "psq_load_u8", function_);
+     u16Block = BasicBlock::Create(context_, "psq_load_u16", function_);
+     s8Block = BasicBlock::Create(context_, "psq_load_s8", function_);
+     s16Block = BasicBlock::Create(context_, "psq_load_s16", function_);
+   }
+   builder_.SetInsertPoint(dispatch);
++  Value *host = resolved ? psqHostPointer(address, false, slow) : nullptr;
+   SwitchInst *typeSwitch =
+-      builder_.CreateSwitch(typeValue, slow, inlineQuantized ? 5 : 1);
++      builder_.CreateSwitch(typeValue, slow, allTypes ? 5 : 1);
+   typeSwitch->addCase(builder_.getInt32(0), f32Block);
+-  if (inlineQuantized) {
++  if (allTypes) {
+     typeSwitch->addCase(builder_.getInt32(4), u8Block);
+     typeSwitch->addCase(builder_.getInt32(5), u16Block);
+     typeSwitch->addCase(builder_.getInt32(6), s8Block);
+@@ -88,28 +96,35 @@
+   auto emitLoads = [&](BasicBlock *block, u32 width, bool isSigned,
+                        bool unquantized) {
+     builder_.SetInsertPoint(block);
+-    auto loadLane = [&](Value *laneAddress) {
+-      if (unquantized) {
+-        Value *bits =
+-            emitGuestLoad(laneAddress, Type::getInt32Ty(context_), 4, false);
+-        return std::pair<Value *, Value *>(
+-            builder_.CreateBitCast(bits, Type::getFloatTy(context_)),
+-            extendPSQFloat(builder_, module_, bits));
+-      }
++    auto loadLane = [&](u32 lane) {
+       Type *integerType = IntegerType::get(context_, width * 8);
+-      Value *integer = emitGuestLoad(laneAddress, integerType, width, false);
++      Value *integer = nullptr;
++      if (host) {
++        Value *pointer = lane == 0 ? host
++            : builder_.CreateInBoundsGEP(builder_.getInt8Ty(), host,
++                                         builder_.getInt64(width));
++        integer = endianLoad(pointer, integerType, width, false);
++      } else {
++        Value *laneAddress = lane == 0 ? address
++            : builder_.CreateAdd(address, builder_.getInt32(width));
++        integer = emitGuestLoad(laneAddress, integerType, width, false);
++      }
++      if (unquantized)
++        return std::pair<Value *, Value *>(
++            builder_.CreateBitCast(integer, Type::getFloatTy(context_)),
++            extendPSQFloat(builder_, module_, integer));
+       Value *single =
+           dequantizePSQInteger(builder_, integer, scaleValue, isSigned);
+       return std::pair<Value *, Value *>(
+           single, builder_.CreateFPExt(single, Type::getDoubleTy(context_)));
+     };
+ 
+-    auto lane0 = loadLane(address);
++    auto lane0 = loadLane(0);
+     std::pair<Value *, Value *> lane1(
+         ConstantFP::get(Type::getFloatTy(context_), 1.0),
+         ConstantFP::get(Type::getDoubleTy(context_), 1.0));
+     if (!w)
+-      lane1 = loadLane(builder_.CreateAdd(address, builder_.getInt32(width)));
++      lane1 = loadLane(1);
+     Type *pairType = FixedVectorType::get(Type::getFloatTy(context_), 2);
+     Value *pair = PoisonValue::get(pairType);
+     pair = builder_.CreateInsertElement(pair, lane0.first, uint64_t{0});
+@@ -121,7 +136,7 @@
+     fastEnds.push_back(builder_.GetInsertBlock());
+   };
+   emitLoads(f32Block, 4, false, true);
+-  if (inlineQuantized) {
++  if (allTypes) {
+     emitLoads(u8Block, 1, false, false);
+     emitLoads(u16Block, 2, false, false);
+     emitLoads(s8Block, 1, true, false);
+--- a/src/backend/llvm/psq.cpp
++++ b/src/backend/llvm/psq.cpp
+@@ -96,6 +96,49 @@
+     s16Block = BasicBlock::Create(context_, "psq_store_s16", function_);
+   }
+   builder_.SetInsertPoint(dispatch);
++  SmallVector<BasicBlock *, 5> fastEnds;
++  // GEKKOAOT_PSQ_RESOLVED_V325: see emitPSQLoad. Encode every GQR type into
++  // one resolved host window (MEM1/locked cache/VM). Unresolved windows keep
++  // the previous inline float lanes (WGPIPE) and the exact quantized helper.
++  if (!inlineQuantized && psqResolvedPath()) {
++    BasicBlock *lanes = BasicBlock::Create(context_, "psq_store_lanes", function_);
++    Value *host = psqHostPointer(address, true, lanes);
++    SwitchInst *resolvedSwitch = builder_.CreateSwitch(typeValue, lanes, 5);
++    auto encode = [&](u32 type, u32 width, int minValue, int maxValue) {
++      BasicBlock *block =
++          BasicBlock::Create(context_, "psq_store_resolved", function_);
++      resolvedSwitch->addCase(builder_.getInt32(type), block);
++      builder_.SetInsertPoint(block);
++      const bool unquantized = type == 0;
++      Value *pair = fp_rep_[reg] == FPRepresentation::PairF32 &&
++                            (unquantized || fp_denormal_safe_[reg])
++                        ? pairF32(reg)
++                        : pairF64(reg);
++      auto laneBits = [&](u32 lane) {
++        Value *value = builder_.CreateExtractElement(pair, uint64_t{lane});
++        return unquantized ? truncatePSQFloat(builder_, value)
++                           : quantizePSQFloat(builder_, value, scale, minValue,
++                                              maxValue);
++      };
++      // Same per-lane effects as emitGuestStore: reservation, then the store.
++      clearReservation(address);
++      endianStore(host, laneBits(0), width);
++      if (!w) {
++        clearReservation(builder_.CreateAdd(address, builder_.getInt32(width)));
++        endianStore(builder_.CreateInBoundsGEP(builder_.getInt8Ty(), host,
++                                               builder_.getInt64(width)),
++                    laneBits(1), width);
++      }
++      builder_.CreateBr(join);
++      fastEnds.push_back(builder_.GetInsertBlock());
++    };
++    encode(0, 4, 0, 0);
++    encode(4, 1, 0, 255);
++    encode(5, 2, 0, 65535);
++    encode(6, 1, -128, 127);
++    encode(7, 2, -32768, 32767);
++    builder_.SetInsertPoint(lanes);
++  }
+   SwitchInst *typeSwitch =
+       builder_.CreateSwitch(typeValue, slow, inlineQuantized ? 5 : 1);
+   typeSwitch->addCase(builder_.getInt32(0), f32Block);
+@@ -106,7 +149,6 @@
+     typeSwitch->addCase(builder_.getInt32(7), s16Block);
+   }
+ 
+-  SmallVector<BasicBlock *, 5> fastEnds;
+   auto emitStores = [&](BasicBlock *block, u32 width, int minValue,
+                         int maxValue, bool unquantized) {
+     builder_.SetInsertPoint(block);
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -240,7 +240,7 @@
+       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+       "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
+       "x86-return-registers=3|"
+-      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s%s%s%s%s%s",
++      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s%s%s%s%s%s%s",
+       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+       static_cast<unsigned>(options ? options->native_abi_policy
+@@ -277,6 +277,10 @@
+       // GEKKOAOT_NATIVE_PAGED_VMEM_V322: inline DTLB-mirror admission.
+       std::getenv("DOLRECOMP_NATIVE_PAGED_VMEM") &&
+           std::string(std::getenv("DOLRECOMP_NATIVE_PAGED_VMEM")) == "0"
+-          ? "|native-paged-vmem=322-off" : "|native-paged-vmem=322-on");
++          ? "|native-paged-vmem=322-off" : "|native-paged-vmem=322-on",
++      // GEKKOAOT_PSQ_RESOLVED_V325
++      std::getenv("DOLRECOMP_PSQ_RESOLVED") &&
++          std::string(std::getenv("DOLRECOMP_PSQ_RESOLVED")) == "0"
++          ? "|psq-resolved=325-off" : "|psq-resolved=325-on");
+   return written >= 0 && static_cast<size_t>(written) < size;
+ }

@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -56,15 +58,28 @@ void PrintRuntimeSnapshot(const GekkoAOT::Native::HostRuntime& runtime) {
   std::cout << "GEKKOAOT_FINAL_CPU_V96=1" << std::hex
             << " pc=" << cpu.pc << " lr=" << cpu.lr << " cr=" << cpu.cr
             << " ctr=" << cpu.ctr << " msr=" << cpu.msr
-            << " dar=" << cpu.dar << " dsisr=" << cpu.dsisr;
+            << " dar=" << cpu.dar << " dsisr=" << cpu.dsisr << " timebase=" << cpu.timebase;
   for (unsigned i = 0; i < 32; ++i)
     std::cout << " r" << std::dec << i << "=" << std::hex << cpu.gpr[i];
+  std::cout << "\nGEKKOAOT_SNAPSHOT_FPU fpscr=" << cpu.fpscr;
+  for (unsigned i = 0; i < 32; ++i) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &cpu.fpr[i], sizeof(bits));
+    std::cout << " f" << std::dec << i << "=" << std::hex << bits;
+  }
   std::cout << "\nGEKKOAOT_FINAL_CP_V96=1 base=" << cp.FifoBase()
             << " end=" << cp.FifoEnd() << " read=" << cp.FifoReadPointer()
             << " write=" << cp.FifoWritePointer() << " distance=" << cp.FifoReadWriteDistance()
             << " breakpoint=" << cp.FifoBreakpoint() << " control=" << cp.Control()
             << " status=" << cp.Status() << " irq=" << cp.InterruptPending()
-            << " pi_write=" << runtime.ProcessorInterface().FifoWritePointer();
+            << " high_watermark=" << cp.FifoHiWatermark()
+            << " low_watermark=" << cp.FifoLoWatermark()
+            << " pi_write=" << runtime.ProcessorInterface().FifoWritePointer()
+            << "\nGEKKOAOT_SNAPSHOT_PE token=" << runtime.PixelEngine().Token()
+            << " token_irq=" << runtime.PixelEngine().TokenInterruptPending()
+            << " finish_irq=" << runtime.PixelEngine().FinishInterruptPending()
+            << " pi_cause=" << runtime.ProcessorInterface().InterruptCauseValue()
+            << " pi_mask=" << runtime.ProcessorInterface().InterruptMaskValue();
   std::uint64_t beam = 0;
   vi.Read(0xcc00202cu, 4, &beam);
   std::cout << "\nGEKKOAOT_FINAL_VI_V96=1 beam=" << beam
@@ -80,7 +95,14 @@ void PrintRuntimeSnapshot(const GekkoAOT::Native::HostRuntime& runtime) {
             << " ax=" << dsp.NativeAxHleActive() << " jaudio=" << dsp.NativeJAudioHleActive()
             << " core_pc=" << dsp.NativeCorePc()
             << "\nGEKKOAOT_SNAPSHOT_DI status=" << di.Status() << " control=" << di.DMAControl()
+            << " opcode=" << unsigned(di.LastOpcode()) << " error=" << di.LastError()
+            << " dma=" << di.DMAAddress() << " remaining=" << di.DMALength()
             << " sequence=" << std::dec << di.CommandSequence();
+  const auto& si = runtime.SerialInterface();
+  std::cout << "\nGEKKOAOT_SNAPSHOT_SI poll=" << std::hex << si.PollRegister()
+            << " csr=" << si.CommunicationCSR() << " status=" << si.StatusRegister()
+            << " irq=" << si.InterruptPending()
+            << " transfer_cycles=" << std::dec << si.CyclesUntilTransfer();
   const auto current = word(0x800000e4u);
   std::cout << "\nGEKKOAOT_FINAL_OS_V96=1" << std::hex
             << " current=" << current << " context=" << word(0x800000d4u)
@@ -400,7 +422,12 @@ int main(int argc, char** argv) {
         const char* value = std::getenv("GEKKOAOT_NATIVE_PC_TRACE");
         return value && value[0] == '1' && value[1] == '\0';
       }();
-      const std::uint64_t stop_poll_dispatches = trace_pc ? 25000u : 250000u;
+      // A dispatch can execute a complete guarded polling region. With the
+      // retail AOT quantum, 250K dispatches can take minutes in a GX wait and
+      // prevent the controller from stopping or collecting a snapshot.
+      // Bound only this explicit diagnostic/control path; normal Run() above
+      // still carries no filesystem checks or extra dispatch instrumentation.
+      const std::uint64_t stop_poll_dispatches = 4096u;
       std::uint64_t remaining = options->dispatch_limit;
       std::uint64_t total_dispatches = 0;
       std::uint64_t total_cycles = 0;
@@ -451,16 +478,44 @@ int main(int argc, char** argv) {
         total_dispatches += result.dispatches;
         total_cycles += result.cycles;
         if (trace_pc) {
+          static unsigned t3_timer_samples = 0;
+          if ((runtime.Cpu().pc == 0x802df4acu || runtime.Cpu().pc == 0x803936bcu) &&
+              runtime.Cpu().timebase > 0x10000000u &&
+              t3_timer_samples++ < 16u)
+            std::fprintf(stderr,
+                         "GEKKOAOT_T3_TIMER_DIAG pc=%08x f0=%.17g f1=%.17g f2=%.17g f28=%.17g f29=%.17g f30=%.17g f31=%.17g\n",
+                         runtime.Cpu().pc, runtime.Cpu().fpr[0], runtime.Cpu().fpr[1],
+                         runtime.Cpu().fpr[2], runtime.Cpu().fpr[28], runtime.Cpu().fpr[29],
+                         runtime.Cpu().fpr[30], runtime.Cpu().fpr[31]);
           std::uint32_t current_thread = 0;
           std::uint32_t active_head = 0;
           runtime.Memory().Read32(0x800000e4u, &current_thread);
           runtime.Memory().Read32(0x800000dcu, &active_head);
-          std::cout << "GEKKOAOT_NATIVE_PC_TRACE_V105=1 dispatches=" << std::dec
-                    << total_dispatches << " pc=" << std::hex << runtime.Cpu().pc
-                    << " lr=" << runtime.Cpu().lr << " current=" << current_thread
-                    << " active_head=" << active_head
-                    << " cp_distance=" << runtime.CommandProcessor().FifoReadWriteDistance()
-                    << " di_reads=" << std::dec << result.di_reads << '\n';
+          // Emit one stdio operation so renderer-thread diagnostics cannot
+          // splice fields into the middle of the watchdog record.
+          std::fprintf(stderr,
+                       "GEKKOAOT_NATIVE_PC_TRACE_V106=1 dispatches=%llu pc=%08x "
+                       "lr=%08x ctr=%08x cr=%08x msr=%08x downcount=%lld "
+                       "tb=%llu vi_halfline=%u ai_samples=%u dsp_ctl=%04x "
+                       "pi_cause=%08x pi_mask=%08x current=%08x active_head=%08x "
+                       "cp_read=%08x cp_write=%08x cp_distance=%08x "
+                       "di_reads=%llu hle_calls=%llu\n",
+                       static_cast<unsigned long long>(total_dispatches),
+                       runtime.Cpu().pc, runtime.Cpu().lr, runtime.Cpu().ctr,
+                       runtime.Cpu().cr, runtime.Cpu().msr,
+                       static_cast<long long>(runtime.Cpu().downcount),
+                       static_cast<unsigned long long>(runtime.Cpu().timebase),
+                       runtime.VideoInterface().HalfLineCount(),
+                       runtime.AudioInterface().SampleCounter(),
+                       runtime.DspInterface().Control(),
+                       runtime.ProcessorInterface().InterruptCauseValue(),
+                       runtime.ProcessorInterface().InterruptMaskValue(),
+                       current_thread, active_head,
+                       runtime.CommandProcessor().FifoReadPointer(),
+                       runtime.CommandProcessor().FifoWritePointer(),
+                       runtime.CommandProcessor().FifoReadWriteDistance(),
+                       static_cast<unsigned long long>(result.di_reads),
+                       static_cast<unsigned long long>(result.hle_calls));
         }
         if (options->dispatch_limit != 0) remaining -= std::min(remaining, result.dispatches);
         if (result.status != GekkoAOT::Native::RunStatus::DispatchLimitReached)
@@ -530,6 +585,8 @@ int main(int argc, char** argv) {
               << " rel_refreshes=" << result.rel_mapping_refreshes
               << " rel_addr_xlate=" << result.rel_address_translations
               << " rel_addr_miss=" << result.rel_address_misses
+              << " idle_waits=" << result.idle_event_waits
+              << " idle_wait_cycles=" << result.idle_event_requested_cycles
               << std::hex << " rel_addr_last=0x" << result.rel_last_canonical
               << "->0x" << result.rel_last_runtime
               << std::dec << " hle_calls=" << result.hle_calls << " cycles=" << result.cycles;
@@ -538,8 +595,44 @@ int main(int argc, char** argv) {
     if (!result.halt_text_10.empty())
       std::cout << " halt_text10=\"" << EscapeForLog(result.halt_text_10) << "\"";
     std::cout << "\n";
-    if (result.status != GekkoAOT::Native::RunStatus::Completed)
+    if (result.status == GekkoAOT::Native::RunStatus::GuestHalted) {
+      for (std::uint8_t depth = 0; depth < result.halt_frame_count; ++depth) {
+        std::cout << "GEKKOAOT_GUEST_HALT_BACKTRACE_V164=1 depth="
+                  << std::dec << static_cast<unsigned>(depth)
+                  << std::hex << " sp=0x" << result.halt_frame_sp[depth]
+                  << " caller_lr=0x" << result.halt_frame_caller_lr[depth]
+                  << std::dec << "\n";
+      }
+    }
+    // An explicit diagnostic snapshot also captures null-target termination:
+    // pc==0 is classified as Completed, but can be an unexpected guest call.
+    if (result.status != GekkoAOT::Native::RunStatus::Completed ||
+        !options->snapshot_file.empty()) {
       PrintRuntimeSnapshot(runtime);
+      if (!options->snapshot_file.empty()) {
+        auto dump_path = options->snapshot_file;
+        dump_path += ".mem1.bin";
+        std::ofstream dump(dump_path, std::ios::binary);
+        const auto bytes = runtime.Memory().Mem1();
+        dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        if (!dump) std::cerr << "[gekkoaot] error: final MEM1 snapshot failed\n";
+      }
+    }
+    // v274: GEKKOAOT_FAULT_MEM1_DUMP=<file> writes MEM1 when the guest stops on
+    // a fault (GEKKOAOT_EXIT_MEM1_DUMP on a normal exit), without the sliced
+    // run loop that --snapshot-file enables (that changes dispatch timing and
+    // can hide timing-dependent failures).
+    const bool guest_fault = result.status != GekkoAOT::Native::RunStatus::Completed &&
+                             result.status != GekkoAOT::Native::RunStatus::HostRequestedExit;
+    const char* fault_dump = std::getenv(guest_fault ? "GEKKOAOT_FAULT_MEM1_DUMP"
+                                                     : "GEKKOAOT_EXIT_MEM1_DUMP");
+    if (fault_dump && *fault_dump) {
+      std::ofstream dump(fault_dump, std::ios::binary);
+      const auto bytes = runtime.Memory().Mem1();
+      dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      std::cout << "GEKKOAOT_FAULT_MEM1_DUMP_V274=" << (dump ? 1 : 0) << " path=\""
+                << fault_dump << "\"\n";
+    }
     std::cout << std::flush;
 
     // PGO Stop is a process-lifetime boundary. Flush compiler-rt while the
@@ -561,8 +654,30 @@ int main(int argc, char** argv) {
       std::_Exit(0);
     }
 
-    return (result.status == GekkoAOT::Native::RunStatus::Completed ||
-            result.status == GekkoAOT::Native::RunStatus::HostRequestedExit) ? 0 : 4;
+    const bool clean_exit =
+        result.status == GekkoAOT::Native::RunStatus::Completed ||
+        result.status == GekkoAOT::Native::RunStatus::HostRequestedExit;
+
+    const int exit_code = clean_exit ? 0 : 4;
+
+    // v171: NativeGX/Dawn owns asynchronous process-lifetime callbacks.  The
+    // renderer was explicitly drained above, but normal C++ process teardown
+    // can still run global WebGPU/SDL destructors after the pinned GX DSO has
+    // quiesced.  SMB1 reliably reached status=completed and only then died with
+    // SIGSEGV (controller code=139).  The same race can also hide a useful guest
+    // failure status, as seen after SMB2's OSPanic.  Diagnostics and snapshots
+    // are already emitted above, so preserve the intended process exit code and
+    // let the OS reclaim the remaining host libraries instead of running the
+    // hazardous late global-destructor phase.
+    if (!options->native_gx_bridge.empty()) {
+      std::cout << "GEKKOAOT_NATIVE_PROCESS_FAST_EXIT_V171=1 exit_code="
+                << exit_code
+                << " policy=os-reclaim-after-explicit-gx-shutdown\n" << std::flush;
+      std::cerr << std::flush;
+      std::_Exit(exit_code);
+    }
+
+    return exit_code;
   } catch (const std::exception& e) {
     std::cerr << "GEKKOAOT_NATIVE_HOST_ERROR \"" << e.what() << "\"\n";
     return 5;

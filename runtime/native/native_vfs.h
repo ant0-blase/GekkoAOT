@@ -1,8 +1,12 @@
 #pragma once
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -64,7 +68,27 @@ private:
                          void* destination, std::uint32_t size) const;
   static std::string NormalizeLookup(std::string_view path);
 
+  struct CachedPartitionFile {
+    std::uint32_t index = 0xffffffffu;
+    void* handle = nullptr;
+    std::uint64_t stamp = 0;
+  };
+  struct CachedHostFile {
+    std::filesystem::path path;
+    std::unique_ptr<std::ifstream> stream;
+    std::uint64_t size = 0;
+    std::uint64_t stamp = 0;
+  };
+  static constexpr std::size_t kPartitionFileCacheEntries = 16u;
+  static constexpr std::size_t kHostFileCacheEntries = 12u;
+
   void* partition_ = nullptr;
+  mutable std::array<CachedPartitionFile, kPartitionFileCacheEntries> partition_files_{};
+  mutable std::uint64_t partition_file_stamp_ = 1u;
+  mutable std::mutex partition_file_mutex_;
+  mutable std::array<CachedHostFile, kHostFileCacheEntries> host_files_{};
+  mutable std::uint64_t host_file_stamp_ = 1u;
+  mutable std::mutex host_file_mutex_;
   std::filesystem::path extracted_root_;
   std::filesystem::path overlay_root_;
   std::vector<Entry> entries_by_offset_;

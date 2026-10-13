@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 
 namespace GekkoAOT::DSP {
 
@@ -27,14 +28,28 @@ public:
   // physical form). Returns true when the packet belongs to JAudio.
   bool HandlePacket(const std::uint32_t* words, std::size_t count);
 
+  // Standard GameCube JAudio tasks are admitted by an exact uploaded-image
+  // hash. Other tasks retain their existing backend and protocol.
+  bool ProbeStandardTask(std::uint32_t address, std::uint32_t bytes);
+  bool StandardTask() const { return standard_task_; }
+  void StartStandardTask();
+  bool HandleStandardMail(std::uint32_t mail);
+  void AdvanceStandardMail(std::uint64_t cycles = 0);
+
+  std::uint64_t CyclesUntilStandardMail() const;
+
   bool Active() const { return active_; }
   std::uint64_t SetupPackets() const { return setup_packets_; }
   std::uint64_t SyncFrames() const { return sync_frames_; }
   std::uint64_t VoicesMixed() const { return voices_mixed_; }
 
 private:
+  friend struct NativeJAudioTestAccess;
   static constexpr std::size_t kMaxVoices = 64u;
   static constexpr std::size_t kVpbBytes = 0x180u;
+  // The DSP owns/writes back only the first 0x80 16-bit words. The final
+  // 0x40 words are PPC-owned/read-only parameters.
+  static constexpr std::size_t kVpbWritebackBytes = 0x100u;
   static constexpr std::size_t kMixerCount = 6u;
   static constexpr std::size_t kSamplesPerSubframe = 80u;
   static constexpr std::size_t kMaxSubframes = 16u;
@@ -77,6 +92,13 @@ private:
   bool LoadVoice(std::uint32_t index, Voice* voice) const;
   bool StoreVoice(std::uint32_t index, const Voice& voice);
 
+  void RenderVoiceRange(std::uint32_t begin, std::uint32_t end,
+                        const std::array<std::uint16_t, 4>* mask = nullptr,
+                        std::uint8_t* table = nullptr);
+  void RenderStandard();
+  void ExecuteStandardPacket(const std::array<std::uint32_t, 32>& packet, unsigned count);
+  void RunPendingStandardPackets();
+  void QueueStandardAck(std::uint16_t token);
   void BeginSubframe();
   void FinishSubframe(std::int16_t* left, std::int16_t* right);
   void RenderVoice(std::uint32_t index, Voice* voice);
@@ -85,6 +107,7 @@ private:
   void Resample(Voice* voice, const std::int16_t* source, MixBuffer* output);
   void LoadPcm(Voice* voice, std::int16_t* output, std::uint16_t count,
                std::uint8_t bytes_per_sample);
+  void LoadPcmMram(Voice* voice, std::int16_t* output, std::uint16_t count);
   void LoadAfc(Voice* voice, std::int16_t* output, std::uint16_t count);
   bool DecodeAfcBlocks(Voice* voice, std::int16_t* output, std::size_t blocks);
   void LoadPattern(Voice* voice, MixBuffer* output);
@@ -109,6 +132,30 @@ private:
   static std::uint32_t LoadBe32(const std::uint8_t* p);
   static void StoreBe16(std::uint8_t* p, std::uint16_t value);
   static void StoreBe32(std::uint8_t* p, std::uint32_t value);
+
+  enum class StandardState { Waiting, Packet, SyncMask, Upload, Halted };
+  struct Reply { std::uint32_t value; bool irq; std::uint64_t delay = 0; };
+  bool standard_task_ = false;
+  bool standard_ready_ = false;
+  std::uint32_t standard_image_hash_ = 0;
+  std::array<std::uint32_t, 10> standard_upload_{};
+  unsigned standard_upload_seen_ = 0;
+  bool dolby_louder_ = false;
+  bool standard_blocked_ = false;
+  StandardState standard_state_ = StandardState::Waiting;
+  std::deque<Reply> standard_replies_;
+  struct WorkPacket { std::array<std::uint32_t, 32> words; unsigned count; };
+  std::deque<WorkPacket> standard_pending_packets_;
+  std::array<std::uint32_t, 32> standard_packet_{};
+  std::uint32_t standard_expected_ = 0;
+  std::uint32_t standard_seen_ = 0;
+  std::array<std::uint16_t, 4> standard_masks_{};
+  std::uint32_t standard_frames_ = 0;
+  std::uint32_t standard_frame_ = 0;
+  std::uint32_t standard_voice_ = 0;
+  std::uint32_t standard_max_voice_ = 0;
+  std::uint32_t standard_left_ = 0;
+  std::uint32_t standard_right_ = 0;
 
   NativeDSP* dsp_ = nullptr;
   bool active_ = false;
@@ -135,6 +182,10 @@ private:
   std::uint64_t sync_frames_ = 0;
   std::uint64_t voices_mixed_ = 0;
   std::uint64_t unsupported_sources_ = 0;
+  std::uint64_t voice_slots_scanned_ = 0;
+  std::uint64_t voice_full_loads_ = 0;
+  std::uint64_t voice_slots_skipped_ = 0;
+  std::uint64_t output_clips_ = 0;
 };
 
 } // namespace GekkoAOT::DSP

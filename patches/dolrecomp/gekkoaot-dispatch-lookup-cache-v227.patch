@@ -1,0 +1,35 @@
+--- a/src/backend/dispatch.c
++++ b/src/backend/dispatch.c
+@@ -272,7 +272,7 @@
+ 
+     fprintf(out,
+             "\nstatic inline DolRecompFunction "
+-            "dolrecomp_find_original(u32 address) {\n");
++            "dolrecomp_find_original_uncached(u32 address) {\n");
+     fprintf(out, "    u32 page;\n");
+     fprintf(out, "    u32 run;\n");
+     fprintf(out, "    u32 offset;\n");
+@@ -294,6 +294,23 @@
+             "    return dolrecomp_run_chunks[dolrecomp_run_base[run] + "
+             "offset / dolrecomp_run_stride[run]];\n");
+     fprintf(out, "}\n");
++
++    fprintf(out,
++            "\n/* GekkoAOT v277: a module is dispatched by its owning PPC CPU thread.\n"
++            " * TLS made every hot lookup pay __tls_get_addr on ELF/glibc and\n"
++            " * showed up directly in perf. Keep the per-module cache in the DSO\n"
++            " * instead; separate game modules still own separate caches. */\n"
++            "typedef struct { u64 key; DolRecompFunction fn; } DolRecompLookupCacheEntry;\n"
++            "static inline DolRecompFunction dolrecomp_find_original(u32 address) {\n"
++            "    static DolRecompLookupCacheEntry cache[512];\n"
++            "    u32 slot = ((address >> 2u) ^ (address >> 13u)) & 511u;\n"
++            "    DolRecompLookupCacheEntry* entry = &cache[slot];\n"
++            "    u64 key = ((u64)address << 1u) | 1u;\n"
++            "    if (entry->key == key) return entry->fn;\n"
++            "    entry->key = key;\n"
++            "    entry->fn = dolrecomp_find_original_uncached(address);\n"
++            "    return entry->fn;\n"
++            "}\n");
+ 
+     printf("  dispatch lookup: indexed, %u chunks in %u runs, %u pages, "
+            "at most %u run%s walked per lookup\n",

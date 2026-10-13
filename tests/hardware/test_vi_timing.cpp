@@ -43,16 +43,22 @@ int main() {
 
   const std::uint32_t half_line_cycles = vi.TicksPerHalfLine();
   CHECK(half_line_cycles == 1800);
+  const std::uint64_t initial_frame_deadline = vi.CyclesUntilNextFrameBoundary();
+  CHECK(initial_frame_deadline > half_line_cycles);
   const std::uint32_t sample_cycles = half_line_cycles / 100;
+  CHECK(vi.CyclesUntilNextInterrupt() == 24u * sample_cycles);
 
   // HCT compares the current sample, so the first interrupt is not visible
   // until sample 25 actually begins. A half-line-only comparator misses it.
   vi.AdvanceCycles(24 * sample_cycles - 1);
+  CHECK(vi.CyclesUntilNextFrameBoundary() ==
+        initial_frame_deadline - (24 * sample_cycles - 1));
   CHECK(Read16(vi, 0x2e) == 24);
   CHECK(!vi.InterruptPending());
   vi.AdvanceCycles(1);
   CHECK(Read16(vi, 0x2e) == 25);
   CHECK(vi.InterruptPending());
+  CHECK(vi.CyclesUntilNextInterrupt() == 0u);
   CHECK((Read32(vi, 0x30) & 0x80000000u) != 0);
   CHECK(vi.ConsumeInterruptUpdate());
   CHECK(vi.Write(kViBase + 0x30, 0x1001, 2)); // ACK by clearing status.
@@ -88,6 +94,7 @@ int main() {
   CHECK(vi.ConsumeEvenFieldBoundary() && vi.ConsumeFrameBoundary());
   vi.AdvanceCycles(24 * sample_cycles);
   CHECK((Read32(vi, 0x30) & 0x80000000u) != 0);
+  CHECK(vi.CyclesUntilHalfLine() == half_line_cycles - 24 * sample_cycles);
 
   std::cout << "VI horizontal target, ACK and field timing passed\n";
 }

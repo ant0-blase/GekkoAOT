@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 
 namespace GekkoAOT::HW::VI {
 
@@ -34,6 +35,16 @@ public:
   std::uint16_t DtvStatus() const { return regs_[kDtvStatus / 2u]; }
   std::uint32_t HalfLineCount() const { return half_line_count_; }
   std::uint32_t TicksPerHalfLine() const;
+  // Earliest masked VI compare that can wake the PPC. Returns max() when
+  // no enabled compare exists, and 0 when one is already asserted.
+  std::uint64_t CyclesUntilNextInterrupt() const;
+  // Next full-frame wrap, used by NativeHW host presentation/event parking.
+  // This is independent of VI interrupt masks.
+  std::uint64_t CyclesUntilNextFrameBoundary() const;
+  std::uint32_t CyclesUntilHalfLine() const {
+    if ((regs_[kControl / 2u] & kControlEnable) == 0u) return 0;
+    return TicksPerHalfLine() - static_cast<std::uint32_t>(cycles_into_half_line_);
+  }
   std::uint32_t HalfLinesPerFrame() const;
   std::uint32_t XfbAddressTop() const;
   std::uint32_t XfbAddressBottom() const;

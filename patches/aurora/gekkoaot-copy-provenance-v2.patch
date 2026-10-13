@@ -1,0 +1,20 @@
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -314,6 +314,7 @@
+   struct CopyTextureRef {
+     gfx::TextureHandle handle;
+     u32 revision = 0;
++    gfx::ClipRect guestSource{};
+ 
+     operator bool() const noexcept { return handle.operator bool(); }
+   };
+--- a/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -67,6 +67,7 @@
+   gfx::resolve_pass_into(handle.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
+                          clear_depth_value(), texCopyFmt);
+   ++handle.revision;
++  handle.guestSource = g_gxState.texCopySrc;
+   g_gxState.copyTextures[dest] = handle;
+   texture::invalidate_bindings();
+ }

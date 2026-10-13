@@ -2,6 +2,8 @@
 #include "dsp/native/native_audio_sink.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <iostream>
 #include <vector>
 
@@ -13,6 +15,10 @@ namespace GekkoAOT::DSP {
 
 struct NativeAudioSink::Impl {
   std::uint64_t frames_submitted = 0;
+  std::uint64_t diagnostic_frames = 0;
+  std::uint64_t diagnostic_abs = 0;
+  std::uint32_t diagnostic_peak = 0;
+  unsigned diagnostic_reports = 0;
   std::uint32_t rate = 0;
 
 #if defined(GEKKOAOT_NATIVE_SDL3)
@@ -149,6 +155,26 @@ void NativeAudioSink::PushStereoS16(const std::int16_t* samples, std::size_t fra
                                     std::uint32_t sample_rate_hz) {
   if (!samples || frames == 0 || sample_rate_hz == 0) return;
   impl_->frames_submitted += frames;
+  static const bool audio_diagnostic = std::getenv("GEKKOAOT_AUDIO_DIAG") != nullptr;
+  if (audio_diagnostic && impl_->diagnostic_reports < 30u) {
+    for (std::size_t i = 0; i < frames * 2u; ++i) {
+      const int sample = samples[i];
+      const auto magnitude = static_cast<std::uint32_t>(sample < 0 ? -sample : sample);
+      impl_->diagnostic_abs += magnitude;
+      if (magnitude > impl_->diagnostic_peak) impl_->diagnostic_peak = magnitude;
+    }
+    impl_->diagnostic_frames += frames;
+    if (impl_->diagnostic_frames >= sample_rate_hz) {
+      std::fprintf(stderr, "GEKKOAOT_AUDIO_DIAG frames=%llu mean_abs=%llu peak=%u\n",
+                   static_cast<unsigned long long>(impl_->frames_submitted),
+                   static_cast<unsigned long long>(impl_->diagnostic_abs / (impl_->diagnostic_frames * 2u)),
+                   impl_->diagnostic_peak);
+      impl_->diagnostic_frames = 0;
+      impl_->diagnostic_abs = 0;
+      impl_->diagnostic_peak = 0;
+      ++impl_->diagnostic_reports;
+    }
+  }
 
 #if defined(GEKKOAOT_NATIVE_SDL3)
   if (!impl_->Ensure(sample_rate_hz)) return;

@@ -1,0 +1,191 @@
+diff --git a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -100,7 +100,8 @@ private:
+   void materialize(u32 pc);
+   void materialize(llvm::Value *pc);
+   void sideExit(u32 pc, u32 reason = 0);
+-  void emitBudgetGuard(u32 pc);
++  void emitBudgetGuard(u32 pc, bool poll_loop = false);
++  bool isPurePollingLoop(u32 header) const;
+   bool emitRegion(u32 index, llvm::raw_ostream &diagnostics);
+   llvm::Value *operand(const DolIRInstruction &instruction, u32 index);
+   llvm::Value *castValue(DolIROp op, llvm::Type *result_type,
+diff --git a/src/backend/llvm/instructions.cpp b/src/backend/llvm/instructions.cpp
+--- a/src/backend/llvm/instructions.cpp
++++ b/src/backend/llvm/instructions.cpp
+@@ -9,6 +9,96 @@ namespace dolllvm {
+
+ using namespace llvm;
+
++bool FunctionEmitter::isPurePollingLoop(u32 header) const {
++  if (header >= source_.block_count || !loop_headers_[header])
++    return false;
++
++  // Conservative, address-independent classifier for the common GameCube
++  // "wait until an interrupt/callback changes a RAM flag" pattern.  Do not
++  // recognize arbitrary computational loops: the loop must be short, linear,
++  // contain exactly one non-update integer load, write no memory, make no
++  // helper/runtime calls, and only redefine the GPR loaded from memory plus CR
++  // state used by the exit comparison.  This covers lbz/lhz/lwz flag waits
++  // while rejecting pointer walks, memcpy/checksum loops and CTR loops.
++  constexpr u32 kMaxPollBlocks = 8u;
++  const u32 limit =
++      source_.block_count - header < kMaxPollBlocks
++          ? source_.block_count
++          : header + kMaxPollBlocks;
++
++  for (u32 tail = header; tail < limit; ++tail) {
++    const DolIRTerminator &tailTerm = source_.blocks[tail].terminator;
++    if (tailTerm.kind != DOLIR_TERM_COND_BRANCH)
++      continue;
++
++    const bool back0 = tailTerm.targets[0] == header;
++    const bool back1 = tailTerm.targets[1] == header;
++    if (back0 == back1)
++      continue;
++
++    const u32 exitTarget = tailTerm.targets[back0 ? 1u : 0u];
++    if (exitTarget != DOLIR_NO_BLOCK && exitTarget >= header && exitTarget <= tail)
++      continue;
++
++    bool linear = true;
++    for (u32 member = header; member < tail; ++member) {
++      const DolIRTerminator &term = source_.blocks[member].terminator;
++      if (term.kind != DOLIR_TERM_FALLTHROUGH ||
++          term.targets[0] != member + 1u) {
++        linear = false;
++        break;
++      }
++    }
++    if (!linear)
++      continue;
++
++    bool safe = true;
++    bool sawLoad = false;
++    u32 loadedGpr = 32u;
++    u32 gprDefs = 0u;
++
++    for (u32 member = header; member <= tail && safe; ++member) {
++      const DolIRBlock &block = source_.blocks[member];
++      for (u32 index = 0; index < block.instruction_count; ++index) {
++        const DolIRInstruction &inst = block.instructions[index];
++
++        if (inst.op == DOLIR_OP_GUEST_STORE ||
++            inst.op == DOLIR_OP_HELPER_CALL ||
++            (inst.effects & (DOLIR_EFFECT_WRITE_MEMORY |
++                             DOLIR_EFFECT_MAY_EXIT |
++                             DOLIR_EFFECT_BARRIER)) != 0u) {
++          safe = false;
++          break;
++        }
++
++        if (inst.op == DOLIR_OP_GUEST_LOAD) {
++          // One stable-address scalar load is enough to model a flag wait.
++          // Restrict to non-update D-form integer loads.  The base GPR must not
++          // alias the destination, otherwise the effective address can change
++          // from one iteration to the next (pointer chase / stream scan).
++          if (sawLoad) {
++            safe = false;
++            break;
++          }
++          const u32 primary = block.raw >> 26u;
++          if (primary != 32u && primary != 34u &&
++              primary != 40u && primary != 42u) {
++            safe = false;
++            break;
++          }
++          const u32 rt = (block.raw >> 21u) & 31u;
++          const u32 ra = (block.raw >> 16u) & 31u;
++          if (rt == ra && ra != 0u) {
++            safe = false;
++            break;
++          }
++          sawLoad = true;
++          loadedGpr = rt;
++        }
++
++        for (u32 slot = 0; slot < DOLIR_STATE_COUNT; ++slot) {
++          const auto stateSlot = static_cast<DolIRStateSlot>(slot);
++          if (!dolir_state_mask_test(inst.state_defs, stateSlot))
++            continue;
++          if (stateSlot >= DOLIR_STATE_GPR0 && stateSlot <= DOLIR_STATE_GPR31) {
++            gprDefs |= 1u << (stateSlot - DOLIR_STATE_GPR0);
++            continue;
++          }
++          if (stateSlot == DOLIR_STATE_CR ||
++              (stateSlot >= DOLIR_STATE_CR0 && stateSlot <= DOLIR_STATE_CR7))
++            continue;
++          safe = false;
++          break;
++        }
++      }
++    }
++
++    if (safe && sawLoad && loadedGpr < 32u &&
++        gprDefs == (1u << loadedGpr))
++      return true;
++  }
++  return false;
++}
++
+ bool FunctionEmitter::emitRegion(u32 index, raw_ostream &diagnostics) {
+@@ -24,8 +114,10 @@ bool FunctionEmitter::emitRegion(u32 index, raw_ostream &diagnostics) {
+     }
+     const bool useService =
+         modern_runtime_ && native_abi_ && needsInterpreter(block);
+-    if (loop_headers_[current])
+-      emitBudgetGuard(block.guest_address);
++    if (loop_headers_[current]) {
++      const bool pollLoop = isPurePollingLoop(current);
++      emitBudgetGuard(block.guest_address, pollLoop);
++    }
+     chargeCycles(block.cycle_cost);
+     if (useService) {
+       emitInstructionService(block.guest_address);
+diff --git a/src/backend/llvm/timing.cpp b/src/backend/llvm/timing.cpp
+--- a/src/backend/llvm/timing.cpp
++++ b/src/backend/llvm/timing.cpp
+@@ -38,6 +38,11 @@ u64 recompcoreGuardSteps() {
+   return value;
+ }
++
++u64 pollGuardCycles() {
++  static const u64 value =
++      configuredBudget("DOLRECOMP_POLL_GUARD_CYCLES", 128u, 16u, 8192u);
++  return value;
++}
+ } // namespace
+@@ -126,7 +131,7 @@ void FunctionEmitter::reloadCallCounters() {
+         guard_cycles_local_);
+ }
+
+-void FunctionEmitter::emitBudgetGuard(u32 pc) {
++void FunctionEmitter::emitBudgetGuard(u32 pc, bool pollLoop) {
+   Value *cycles = builder_.CreateAdd(
+       builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_local_),
+       builder_.CreateLoad(Type::getInt64Ty(context_), cycles_));
+@@ -148,6 +153,10 @@ void FunctionEmitter::emitBudgetGuard(u32 pc) {
+         builder_.getInt64(1), cycleBudget, "effective_chain_cycle_budget");
+   }
++  if (pollLoop && !modern_runtime_) {
++    cycleBudget = ConstantInt::get(Type::getInt64Ty(context_),
++                                   pollGuardCycles());
++  }
+   Value *overCycles = builder_.CreateICmpUGE(cycles, cycleBudget);
+   Value *exhausted = overCycles;
+@@ -164,6 +173,15 @@ void FunctionEmitter::emitBudgetGuard(u32 pc) {
+   builder_.CreateCondBr(exhausted, exit, run);
+   builder_.SetInsertPoint(exit);
++  if (pollLoop && !modern_runtime_) {
++    // GekkoAOT CPU ABI v4 reserves external_rid as host scratch at dispatch
++    // boundaries.  0xfd is unused by the normal external/REL probes.  Mark a
++    // side exit caused by a statically proven pure RAM poll so the standalone
++    // runtime may park until the next VI/AI/DSP/DI/timer event instead of
++    // immediately re-entering the same native spin loop.
++    builder_.CreateStore(builder_.getInt8(0xfdu),
++                         bytePtr(offsetof(CPUState, external_rid)));
++  }
+   sideExit(pc);
+   builder_.SetInsertPoint(run);
+ }

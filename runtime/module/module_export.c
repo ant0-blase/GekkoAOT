@@ -6,6 +6,14 @@
 #include <cpuid.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define GEKKOAOT_LIKELY(x) __builtin_expect(!!(x), 1)
+#define GEKKOAOT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define GEKKOAOT_LIKELY(x) (!!(x))
+#define GEKKOAOT_UNLIKELY(x) (!!(x))
+#endif
+
 #if defined(DOLRECOMP_MODULE_HAVE_X86_64_V3)
 static int host_has_x86_64_v3(void) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
@@ -24,7 +32,7 @@ static int host_has_x86_64_v3(void) {
 }
 #endif
 
-static int selected_dispatch(CPUState* ctx, u32 address) {
+static inline int selected_dispatch(CPUState* ctx, u32 address) {
 #if defined(DOLRECOMP_MODULE_HAVE_X86_64_V3)
   // CPUID/XGETBV used to run at every guest dispatch. That turns an otherwise
   // tiny indexed AOT dispatch into a serializing host-CPU query on every edge.
@@ -40,6 +48,7 @@ static int selected_dispatch(CPUState* ctx, u32 address) {
 
 #define GEKKOAOT_GLOBAL_INDIRECT_QUERY 0xFFFFFFF9u
 #define GEKKOAOT_GLOBAL_INDIRECT_PENDING 0xFCu
+#define GEKKOAOT_AOT_POLL_PARK_MARKER 0xFDu
 
 void dolrecomp_indirect_dispatch(CPUState* ctx, u32 address) {
   if (selected_dispatch(ctx,address)) return;
@@ -78,18 +87,28 @@ static uint64_t module_charged_cycles(const CPUState* ctx) {
 }
 
 static int module_dispatch(CPUState* ctx, uint32_t address) {
-  if (!ctx) return 0;
-  const uint64_t horizon = ctx->cycle_budget > 0 ? (uint64_t)ctx->cycle_budget : 0u;
-  if (horizon == 0u) return selected_dispatch(ctx,address);
+  if (GEKKOAOT_UNLIKELY(!ctx)) return 0;
 
-  enum { kMaxNativeChain = 1024 };
+  // v183: cycle_budget=0 is the compatibility/default path used by retail
+  // titles.  Keep that path to one predictable branch plus the native AOT
+  // dispatch; do not materialize the superchain horizon or enter any of its
+  // bookkeeping unless chaining was explicitly requested.
+  if (GEKKOAOT_LIKELY(ctx->cycle_budget <= 0))
+    return selected_dispatch(ctx,address);
+  const uint64_t horizon = (uint64_t)ctx->cycle_budget;
+
+  // v159: host/MMIO epochs and the cycle horizon are the real safety
+  // boundaries. A 1024-hop cap made branch-heavy native code bounce through
+  // HostRuntime even when no observable event occurred. Keep a defensive cap,
+  // but make it large enough for a normal quantum to stay inside the DSO.
+  enum { kMaxNativeChain = 4096 };
   uint32_t pc = address;
   unsigned hops = 0;
   int progressed = 0;
 
   while (hops++ < kMaxNativeChain) {
-    const uint8_t read_epoch = ctx->external_read_count;
-    const uint8_t write_epoch = ctx->external_write_count;
+    const uint16_t host_epoch =
+        ((uint16_t)ctx->external_read_count << 8) | ctx->external_write_count;
     const int64_t before_downcount = ctx->downcount;
     const uint32_t before_pc = ctx->pc;
 
@@ -98,8 +117,17 @@ static int module_dispatch(CPUState* ctx, uint32_t address) {
     progressed = 1;
 
     if (ctx->exception != 0u || ctx->pc == 0u) break;
-    if (ctx->external_read_count != read_epoch ||
-        ctx->external_write_count != write_epoch) break;
+    // Structural AOT poll loops use external_rid=0xFD to request an immediate
+    // return to HostRuntime::ConsumeAotPollPark(). Without this barrier a
+    // non-zero superchain horizon can redispatch the same poll loop until the
+    // full cycle budget expires, starving VI/PI/DEC/device progress and even
+    // preventing titles from booting.
+    if (ctx->external_rid == GEKKOAOT_AOT_POLL_PARK_MARKER) break;
+    // A saturated event counter no longer changes on another host event.
+    // Never interpret equality at saturation as proof that chaining is safe.
+    if (ctx->external_read_count == 255u || ctx->external_write_count == 255u) break;
+    if ((((uint16_t)ctx->external_read_count << 8) |
+          ctx->external_write_count) != host_epoch) break;
     if (module_charged_cycles(ctx) >= horizon) break;
 
     // Defensive backstop for a malformed native wrapper that reports success
@@ -138,6 +166,8 @@ static const GekkoAOTModuleDesc s_desc = {
 #endif
 
 // Optional capability query keeps the v3 module descriptor layout stable.
+#include "native_hardware_shims.inc"
+
 // Cached modules built before memory-restart support lack this symbol and
 // remain on the legacy SDK VM compatibility aperture.
 GEKKOAOT_EXPORT uint32_t gekkoaot_module_capabilities(void) {

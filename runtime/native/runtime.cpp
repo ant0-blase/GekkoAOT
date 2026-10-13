@@ -1,10 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "sdk/dvd_fst_service.h"
+#include "sdk/gx_array_service.h"
 #include "native/runtime.h"
+#include "native/sdk_autoresolver.h"
+#include "native/rel_identity.h"
 #if defined(GEKKOAOT_NATIVE_SDL_INPUT)
 #include "platform/sdl_input.h"
 #endif
 
 #include "core/time.h"
+#include "gx/frustum_assist.h"
+#include "os/sdk_idle_poll.h"
+#include "NativeHW/SI/native_si.h"
+#include "NativeHW/DI/native_di.h"
+#include "NativeHW/VI/native_vi.h"
+#include "NativeHW/AI/native_ai.h"
+#include "NativeHW/PI/native_pi.h"
+#include "NativeHW/MI/native_mi.h"
+#include "NativeHW/CP/native_cp.h"
+#include "NativeHW/DSP/native_dsp.h"
+#include "NativeHW/events.h"
 #include "video/native_vp6.h"
 
 #ifdef GEKKOAOT_HAVE_NOD
@@ -12,7 +27,9 @@
 #endif
 
 #include <algorithm>
+#include <unordered_map>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <csignal>
 #include <cstring>
@@ -35,6 +52,50 @@ namespace {
 constexpr std::uint32_t kNativeRegionProbe = 0xfffffffcu;
 constexpr std::uint32_t kRelAddressProbe = 0xfffffffau;
 constexpr std::uint32_t kGlobalIndirectProbe = 0xfffffff9u;
+// v274: asked by generated mtmsr code when MSR[EE] is set (DolRecomp patch
+// gekkoaot-ee-pending-query-v274); true means "leave AOT code now".
+constexpr std::uint32_t kEeEnableQuery = 0xfffffff4u;
+
+bool RelGprTraceEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GEKKOAOT_REL_GPR_TRACE");
+    return value && value[0] == '1' && value[1] == '\0';
+  }();
+  return enabled;
+}
+
+void TraceRelGprs(const char* phase,
+                  std::uint32_t runtime_address,
+                  std::uint32_t linked_address,
+                  const CPUState& cpu) {
+  if (!RelGprTraceEnabled()) return;
+
+  static std::atomic<unsigned> sequence{0u};
+  // Once the bounded trace is full, avoid millions of locked increments.
+  if (sequence.load(std::memory_order_relaxed) >= 256u) return;
+  const unsigned seq =
+      sequence.fetch_add(1u, std::memory_order_relaxed);
+
+  if (seq >= 256u) return;
+
+  std::fprintf(stderr,
+               "GEKKOAOT_REL_GPR_TRACE_V209=1 seq=%u phase=%s "
+               "runtime=%08x linked=%08x pc=%08x lr=%08x ctr=%08x "
+               "r27=%08x r28=%08x r29=%08x r30=%08x r31=%08x\n",
+               seq, phase,
+               runtime_address, linked_address,
+               cpu.pc, cpu.lr, cpu.ctr,
+               cpu.gpr[27], cpu.gpr[28], cpu.gpr[29],
+               cpu.gpr[30], cpu.gpr[31]);
+}
+
+
+// v277: REL/native-region dispatch scratch belongs to one HostRuntime/CPU, not
+// to the host thread. Keeping it in thread_local storage forced the hot
+// secondary-dispatch path through __tls_get_addr on ELF/glibc builds. The
+// state now lives in HostRuntime itself, which also makes nested save/restore
+// explicit and avoids process-global coupling between runtime instances.
+
 // v70 compile-time SDK lowering.  DolRecomp emits these synthetic host-call
 // tokens only for entrypoints proven by the immutable build-time SDK manifest.
 // They bypass guest-address lookup while keeping the same native service ABI.
@@ -42,6 +103,10 @@ constexpr std::uint32_t kStaticDirectOsBase = 0xfffd0000u;
 constexpr std::uint32_t kStaticDirectSimpleBase = 0xfffc0000u;
 constexpr std::uint32_t kStaticDirectMask = 0xffffff00u;
 constexpr std::uint8_t kRelAddressHandled = 0xfeu;
+// DolRecomp v41 writes this host-scratch byte only when a statically proven
+// pure RAM polling loop exhausts its short guard. It is consumed immediately
+// after the native dispatch and never exposed to guest code.
+constexpr std::uint8_t kAotPollParkMarker = 0xfdu;
 constexpr std::uint32_t kPpcPrimaryX = 31u;
 constexpr std::uint32_t kGekkoPvr = 0x00083214u;
 constexpr std::uint32_t kInitialHid0 = 0x0011c464u;
@@ -127,6 +192,17 @@ bool RuntimeEnvBool(const char* name, bool fallback) {
          std::strcmp(text, "off") != 0 && std::strcmp(text, "no") != 0;
 }
 
+// v320: per-call environment scans on hot service/DI paths (each getenv walks
+// the whole environment). These switches are process policy: read them once.
+bool EnvNativeVfs() { static const bool value = RuntimeEnvBool("GEKKOAOT_NATIVE_VFS", true); return value; }
+bool EnvTraceDvd() { static const bool value = RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false); return value; }
+bool EnvVfsGcTiming() { static const bool value = RuntimeEnvBool("GEKKOAOT_VFS_GC_TIMING", false); return value; }
+bool EnvFastDisc() { static const bool value = RuntimeEnvBool("GEKKOAOT_FAST_DISC", false); return value; }
+bool EnvNativeDvdFst() { static const bool value = RuntimeEnvBool("GEKKOAOT_NATIVE_DVD_FST", true); return value; }
+bool EnvNativePad() { static const bool value = RuntimeEnvBool("GEKKOAOT_NATIVE_PAD", true); return value; }
+bool EnvGxMatrixHle() { static const bool value = RuntimeEnvBool("GEKKOAOT_GX_MATRIX_HLE", true); return value; }
+bool EnvNativeGxNormalMatrix() { static const bool value = RuntimeEnvBool("GEKKOAOT_NATIVE_GX_NORMAL_MATRIX", true); return value; }
+
 std::uint32_t RuntimeEnvU32(const char* name, std::uint32_t fallback,
                             std::uint32_t maximum) {
   const char* text = std::getenv(name);
@@ -162,11 +238,14 @@ std::int64_t SafeNativeChainCycleBudget() {
   // still far below a frame/VI timescale, while reducing HostRuntime/module ABI
   // crossings on draw-heavy titles. MMIO/HLE/exceptions remain immediate
   // barriers through the host-event epochs in module_dispatch().
-  // v153: correctness-first default.  A value of zero returns to HostRuntime
-  // after every AOT dispatch so PI/VI/DEC and other asynchronous events are
-  // observed at a deterministic host boundary.  Users may opt back into a
-  // bounded chain through GEKKOAOT_SAFE_CHAIN_CYCLES.
-  constexpr std::uint64_t kDefault = 0u;
+  // v277: keep safe-host-boundary mode bounded, but do not bounce through the
+  // runtime after every tiny AOT function. 4096 Gekko cycles are only ~8.4 us,
+  // well below the runtime's 125 us host-clock service quantum. MMIO/HLE,
+  // exceptions, poll-park markers and host-effect epochs still terminate the
+  // chain immediately, so this coalesces pure CPU/MEM1 work rather than hiding
+  // observable device transitions. GEKKOAOT_SAFE_CHAIN_CYCLES=0 restores the
+  // old single-dispatch compatibility mode.
+  constexpr std::uint64_t kDefault = 4096u;
   constexpr std::uint64_t kMaximum = 65536u;
   const char* text = std::getenv("GEKKOAOT_SAFE_CHAIN_CYCLES");
   if (!text || !*text) return static_cast<std::int64_t>(kDefault);
@@ -183,6 +262,49 @@ inline void BumpHostReadEpoch(CPUState* cpu) {
 
 inline void BumpHostWriteEpoch(CPUState* cpu) {
   if (cpu && cpu->external_write_count != 0xffu) ++cpu->external_write_count;
+}
+
+// v301: GEKKOAOT_NATIVE_SERVICE_DISABLE=memset,strlen,... (or "all") makes the
+// named SDK leaf services decline so the original AOT guest body runs instead.
+// A compatibility/bisect switch that needs no recompile of the module.
+std::uint64_t DisabledSimpleServices() {
+  static const std::uint64_t mask = [] {
+    std::uint64_t bits = 0u;
+    const char* list = std::getenv("GEKKOAOT_NATIVE_SERVICE_DISABLE");
+    if (!list || !*list) return bits;
+    std::string_view rest(list);
+    while (!rest.empty()) {
+      const auto comma = rest.find(',');
+      const auto name = rest.substr(0, comma);
+      for (unsigned kind = 0; kind < static_cast<unsigned>(SimpleHleKind::Count); ++kind)
+        if (name == "all" || name == SimpleServiceName(kind)) bits |= std::uint64_t{1} << kind;
+      if (comma == std::string_view::npos) break;
+      rest.remove_prefix(comma + 1u);
+    }
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_SERVICE_DISABLE_V301=1 mask=%016llx\n",
+                 static_cast<unsigned long long>(bits));
+    return bits;
+  }();
+  return mask;
+}
+
+// v301: static-direct libc tokens whose only effects are guest GPRs and plain
+// guest memory (no clock, cache/FIFO publication, code, device or scheduler
+// state).
+bool IsChainTransparentLeaf(std::uint32_t token) {
+  if ((token & kStaticDirectMask) != kStaticDirectSimpleBase) return false;
+  switch (static_cast<SimpleHleKind>(token & 0xffu)) {
+  case SimpleHleKind::Memcpy: case SimpleHleKind::Memmove: case SimpleHleKind::Memset:
+  case SimpleHleKind::Memcmp: case SimpleHleKind::Bzero: case SimpleHleKind::Strlen:
+  case SimpleHleKind::Strcmp: case SimpleHleKind::Strncmp: case SimpleHleKind::Strcpy:
+  case SimpleHleKind::Strncpy: case SimpleHleKind::Strcat: case SimpleHleKind::Strchr:
+  case SimpleHleKind::Strrchr: case SimpleHleKind::Memchr: case SimpleHleKind::Strstr:
+  case SimpleHleKind::Strncat: case SimpleHleKind::Strnlen: case SimpleHleKind::Strcspn:
+  case SimpleHleKind::Strpbrk:
+    return true;
+  default:
+    return false;
+  }
 }
 
 std::uint32_t ReadGuestBE32(const std::uint8_t* bytes) {
@@ -260,15 +382,17 @@ constexpr std::uint32_t kPpcExcAlignment = 0x00000004u;
 constexpr std::uint32_t kPpcExcSystemCall = 0x00000008u;
 constexpr std::uint32_t kPpcExcMachineCheck = 0x00000010u;
 constexpr std::uint32_t kPpcExcFpUnavailable = 0x00000020u;
+constexpr std::uint32_t kPpcExcExternalUnwind = 0x00000040u;
 constexpr std::uint32_t kExceptionVectorSpan = 0x100u;
 
-bool IsLowExceptionVectorAddress(std::uint32_t physical) {
-  static constexpr std::uint32_t kVectors[] = {
-      0x0100u, 0x0200u, 0x0300u, 0x0400u, 0x0500u, 0x0600u, 0x0700u, 0x0800u,
-      0x0900u, 0x0c00u, 0x0d00u, 0x0f00u, 0x1300u, 0x1400u, 0x1700u};
-  for (const std::uint32_t vector : kVectors)
-    if (physical >= vector && physical < vector + kExceptionVectorSpan) return true;
-  return false;
+constexpr bool IsLowExceptionVectorAddress(std::uint32_t physical) {
+  // v182: this is queried before almost every normal AOT dispatch, while an
+  // actual low-memory vector is exceptional.  The old implementation walked
+  // fifteen ranges.  Exception vectors are 0x100-byte pages, so represent the
+  // exact same set as a compile-time page mask.
+  constexpr std::uint32_t kVectorPageMask = 0x0098b3feu;
+  if (physical < 0x0100u || physical >= 0x1800u) return false;
+  return (kVectorPageMask & (1u << (physical >> 8u))) != 0u;
 }
 
 void AcknowledgeSynchronousExceptionVector(CPUState* cpu, std::uint32_t physical) {
@@ -281,6 +405,7 @@ void AcknowledgeSynchronousExceptionVector(CPUState* cpu, std::uint32_t physical
   // that pending bit must be consumed. Leaving it set makes helpers such as
   // mftb immediately return after their `if (ctx->exception)` guard forever.
   switch (physical) {
+  case 0x0500u: cpu->exception &= ~kPpcExcExternalUnwind; break;
   case 0x0200u: cpu->exception &= ~kPpcExcMachineCheck; break;
   case 0x0300u: cpu->exception &= ~kPpcExcDsi; break;
   case 0x0600u: cpu->exception &= ~kPpcExcAlignment; break;
@@ -299,6 +424,9 @@ enum : std::uint8_t {
   kCacheDcbf = 1,
   kCacheDcbi = 2,
   kCacheIcbi = 3,
+  // Private HostRuntime extension used by the patched DolRecomp tlbie helper.
+  // The renderer never receives this operation.
+  kCacheTlbie = 4,
 };
 
 bool DecodeCacheControl(std::uint32_t raw, CPUState* cpu, std::uint8_t* operation,
@@ -516,7 +644,33 @@ const char* RunStatusName(RunStatus status) {
 }
 
 HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_) {
+  if (native_hw_.EXI()) {
+    native_exi_host_.Enable();
+    GekkoAOT::HW::EXI::NativeEXI::DeviceHooks exi_hooks{};
+    exi_hooks.user = this;
+    exi_hooks.select = &HostRuntime::NativeExiSelect;
+    exi_hooks.present = &HostRuntime::NativeExiPresent;
+    exi_hooks.immediate = &HostRuntime::NativeExiImmediate;
+    exi_hooks.dma = &HostRuntime::NativeExiDma;
+    exi_.SetDeviceHooks(exi_hooks);
+  }
+  runtime_parallel_workers_ = RuntimeEnvBool("GEKKOAOT_RUNTIME_PARALLEL", false);
+  debug_fifo_overrun_ = RuntimeEnvBool("GEKKOAOT_DEBUG_FIFO_OVERRUN", false);
+  fifo_irq_fence_enabled_ = RuntimeEnvBool("GEKKOAOT_FIFO_IRQ_FENCE", true);
+  fast_wgpipe_enabled_ = RuntimeEnvBool("GEKKOAOT_FAST_WGPIPE", true);
+  if (native_hw_.CP() && std::getenv("GEKKOAOT_FAST_WGPIPE") == nullptr)
+    fast_wgpipe_enabled_ = true;
+  fast_time_probe_enabled_ = RuntimeEnvBool("GEKKOAOT_FAST_TIME_PROBE", true);
   compat_diagnostics_enabled_ = RuntimeEnvBool("GEKKOAOT_COMPAT_DIAGNOSTICS", false);
+  std::fprintf(stderr,
+               "GEKKOAOT_RUNTIME_HOTPATHS_V172=1 wgpipe=%u time-probe=%u policy=backend-neutral-exact-fallback env=GEKKOAOT_FAST_WGPIPE,GEKKOAOT_FAST_TIME_PROBE\n",
+               fast_wgpipe_enabled_ ? 1u : 0u, fast_time_probe_enabled_ ? 1u : 0u);
+  std::fprintf(stderr,
+               "GEKKOAOT_RUNTIME_PERF_V219=1 wgpipe-partial=1,2,4,8 paged-vmem=single-page-direct semantics=unchanged\n");
+  if (native_hw_.Enabled()) {
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_HW_MAX_V4=1 di=vfs-event exi=host-card+sram+rtc si=deadline-autopoll+transfer-refresh vi=host-present+irq+frame-deadline ai=host-clock+pending-irq pi=host-irq-aggregate mi=host-address-space cp=aurora-direct-safe dsp=ax+jaudio+pending-irq router=page-cache poll=event-park\n");
+  }
   std::fprintf(stderr,
                "GEKKOAOT_MEMORY_BOUNDS_V143=1 mem1-reported=%u mem1-backing=%u backing-end=%08x fakevmem=%08x+%u mem2=%u policy=dolphin-compatible-tail\n",
                AddressSpace::ReportedMem1Size(),
@@ -524,15 +678,20 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
                0x80000000u + static_cast<unsigned>(memory_.Mem1().size()),
                AddressSpace::FakeVmemBase, AddressSpace::RetailFakeVmemSize,
                static_cast<unsigned>(memory_.Mem2().size()));
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_ADDRESS_WINDOW_V279=1 enabled=%u virtual_bytes=%llu backing=shared-ram-aliases guard=mmio+unmapped translation=checked\n",
+               memory_.NativeAddressBase() ? 1u : 0u,
+               static_cast<unsigned long long>(memory_.NativeAddressBase() ? GuestAddressWindow::Size : 0u));
   safe_host_boundaries_enabled_ = RuntimeEnvBool("GEKKOAOT_SAFE_HOST_BOUNDARIES", true);
   compat_break_on_fault_ = RuntimeEnvBool("GEKKOAOT_COMPAT_BREAK_ON_FAULT", false);
 
   // v47: AOT execution itself is never throttled. The GameCube-visible clock
   // domain comes from steady_clock, while presentation has an independent cap.
   host_fps_limit_hz_ = RuntimeEnvU32("GEKKOAOT_HOST_FPS_LIMIT", 120u, 1000u);
-  if (host_fps_limit_hz_ != 0u && host_fps_limit_hz_ < 30u) host_fps_limit_hz_ = 30u;
-  frame_interpolation_enabled_ = RuntimeEnvBool("GEKKOAOT_FRAME_INTERPOLATION", true);
+  frame_interpolation_enabled_ = false;
   perf_metrics_enabled_ = RuntimeEnvBool("GEKKOAOT_PERF_METRICS", true);
+  widescreen_frustum_assist_enabled_ =
+      RuntimeEnvBool("GEKKOAOT_WIDESCREEN_FRUSTUM", true);
   cp_idle_breakpoint_recovery_enabled_ =
       RuntimeEnvBool("GEKKOAOT_CP_IDLE_BREAKPOINT_RECOVERY", false);
   if (const char* user_dir = std::getenv("GEKKOAOT_USER_DIR"); user_dir && *user_dir)
@@ -559,16 +718,19 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
                "GEKKOAOT_PERF_METRICS_V49=%u fields=vps,guest_fps,present_fps,interp_fps,speed,target,drops\n",
                perf_metrics_enabled_ ? 1u : 0u);
   std::fprintf(stderr,
+               "GEKKOAOT_WIDESCREEN_FRUSTUM_V177=%u mode=projection-correlated policy=gx-camera-signature+unique-ram-pair hardcode=none env=GEKKOAOT_WIDESCREEN_FRUSTUM,GEKKOAOT_WIDESCREEN_FRUSTUM_ASPECT_ADDR\n",
+               widescreen_frustum_assist_enabled_ ? 1u : 0u);
+  std::fprintf(stderr,
                "GEKKOAOT_NATIVE_INTERCEPT_INDEX_V10=1 policy=compile-time-pruned+sorted-exact\n");
   std::fprintf(stderr,
-               "GEKKOAOT_NATIVE_EVENT_HORIZON_V2=1 cycles=%lld max-chain=1024 barriers=mmio+hle\n",
+               "GEKKOAOT_NATIVE_EVENT_HORIZON_V2=1 cycles=%lld max-chain=4096 barriers=mmio+hle+exceptions+host-epoch\n",
                static_cast<long long>(cpu_.cycle_budget));
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_VI_IRQ_TRACE_V81=1 stages=vi-latch+vi-ack+pi-level+pi-mask+ee+vector500 limit=bounded\n");
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_OS_READY_FASTPATH_V82=1 thread-snapshot=single-pointer active-next=batched ready=compact semantics=unchanged\n");
   std::fprintf(stderr,
-               "GEKKOAOT_FIXED_EXEC_ROUTER_V87=1 identity=guest-chunk+neighborhood active-image=persistent cross-module-indirect=host-routed rel=oslink\n");
+               "GEKKOAOT_FIXED_EXEC_ROUTER_V178=1 identity=guest-chunk+neighborhood active-image=persistent route-cache=direct-8192-page+epoch negative-pc-cache=1024 cross-module-indirect=host-routed rel=oslink\n");
   std::fprintf(stderr,
                "GEKKOAOT_CACHE_COHERENCY_V87=1 dc=host-coherent icbi=fixed-image-route-invalidate gx-cache=guest-commands\n");
   std::fprintf(stderr,
@@ -584,6 +746,26 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
   std::fprintf(stderr,
                "GEKKOAOT_RUNTIME_FASTPATH_V65=1 clock-sampling=batched-125us metrics=125ms "
                "native-os-bootstrap=once context-fp=host-shadow hle-inline=1\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_UNIVERSAL_NATIVE_V32_SAFE=1 cpu=v28b-exact-default+directfp31-optin nativeos=direct-mem "
+               "libc=mem+string gx-fifo-burst=4096 vfs=nod-file-lru audio=bulk-noheap "
+#if defined(GEKKOAOT_HAVE_FFMPEG_SWSCALE)
+               "vp6-rgba=libswscale\n");
+#else
+               "vp6-rgba=scalar-fallback\n");
+#endif
+  std::fprintf(stderr,
+               "GEKKOAOT_DEBUG_CORPUS_NATIVE_V33=1 signatures=32 sdk-cache-range=batch32 "
+               "libc=strstr+strncat+strnlen+strcspn+strpbrk vfs=host-file-lru resolver=direct-target-exact-hash\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_SFA_SMB_UNIVERSAL_V34=1 psq=raw-f32-pair64 gx-matrix=native-sdk "
+               "texture-hash=stable-rebind-only directfp=optin-safe\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_RUNTIME_WORKERS_V36=1 policy=%s cpu=aot+nativeos+mmio+irq "
+               "gx=%s dsp=cpu-ordered host-audio=async io=%s\n",
+               runtime_parallel_workers_ ? "parallel" : "serial",
+               runtime_parallel_workers_ ? "parser-worker+aurora-render-worker" : "inline-parser+aurora-render-worker",
+               runtime_parallel_workers_ ? "async-disc" : "inline-disc");
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_OS_SDK_COMPAT_V71=1 context=native-sdk-ppc "
                "waitq=priority+guest-import runqueue-hint=persistent reschedule=selectthread\n");
@@ -606,6 +788,9 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_FAKE_VMEM_V77=1 base=7e000000 size=02000000 "
                "policy=flat-until-nonzero-sdr1 mmio=excluded\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_DTLB_V212=1 entries=128 ways=2 sets=64 "
+               "fill=hpt-miss invalidate=tlbie-both-ways cbit=hpt-rewalk-v216 policy=real-visibility-boundary\n");
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_VP6_V70=%u backend=%s mode=codec-service ea-abi=frontend-required "
                "texture-sampling=aurora-separate\n",
@@ -630,6 +815,9 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
     std::fprintf(stderr,
                  "GEKKOAOT_NATIVE_INPUT_CLOCK_V53B=1 hz=120 source=hardware-realtime "
                  "buffer_reads=latched vi=decoupled\n");
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_SI_V4=1 mode=deadline-autopoll host-sample=120hz "
+                 "explicit-transfer=refresh sipoll-latch=retained idle-wake=si-deadline\n");
   } else {
     std::fprintf(stderr,
                  "GEKKOAOT_STANDALONE_INPUT_V38=0 backend=SDL3 reason=init-failed\n");
@@ -641,18 +829,32 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
 }
 
 HostRuntime::~HostRuntime() {
+  QuiesceDiscIo();
   // Graphics owns asynchronous host callbacks, so quiesce it while guest
   // memory and the other host services are still alive. The explicit call in
   // native-run normally does this earlier; this is the idempotent fallback.
   ShutdownNativeGX();
   DetachDiscImage();
+  if (native_low_vector_enabled_)
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_EXCEPTION_VECTOR_V294_STATS executions=%llu proofs=%llu cache=instruction-publication\n",
+                 static_cast<unsigned long long>(native_low_vector_executions_),
+                 static_cast<unsigned long long>(native_low_vector_proofs_));
 #if defined(GEKKOAOT_NATIVE_SDL_INPUT)
-  if (native_input_ready_) GekkoAOT::Input::HostInput().Shutdown();
+  if (native_input_ready_) {
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_SI_V4_STATS samples=%llu auto_polls=%llu transfer_samples=%llu\n",
+                 static_cast<unsigned long long>(native_input_samples_),
+                 static_cast<unsigned long long>(native_si_auto_polls_),
+                 static_cast<unsigned long long>(native_si_transfer_samples_));
+    GekkoAOT::Input::HostInput().Shutdown();
+  }
 #endif
 }
 
 void HostRuntime::WireCpuCallbacks() {
   cp_.SetReadBurstCallback(&HostRuntime::ConsumeGpuFifoBurst, this);
+  cp_.SetReadBurstBatchCallback(&HostRuntime::ConsumeGpuFifoBurstBatch, this);
   cpu_.ram = memory_.Mem1().data();
   cpu_.ram_size = static_cast<std::uint32_t>(memory_.Mem1().size());
   cpu_.exram = memory_.Mem2().empty() ? nullptr : memory_.Mem2().data();
@@ -671,6 +873,7 @@ void HostRuntime::WireCpuCallbacks() {
 }
 
 void HostRuntime::Reset() {
+  QuiesceDiscIo();
   memory_.Clear();
   cpu_ = {};
   // Compatibility diagnostics and v79 safe-host-boundary mode intentionally
@@ -689,6 +892,8 @@ void HostRuntime::Reset() {
   compat_breadcrumb_next_ = 0;
   compat_breadcrumbs_.fill({});
   spr_state_.fill(0);
+  ClearDataTlb();
+  data_tlb_hits_ = data_tlb_fills_ = data_tlb_invalidations_ = 0;
   memory_.SetPagedVmem(false);
   spr_state_[kSprDec] = 0xffffffffu;
   spr_state_[kSprPvr] = kGekkoPvr;
@@ -703,11 +908,14 @@ void HostRuntime::Reset() {
   spr_state_[kSprDbat0l] = 0x00000002u;
   spr_state_[kSprDbat1u] = 0xc0001fffu;
   spr_state_[kSprDbat1l] = 0x0000002au;
+  RefreshVmemBatModes();
   InvalidateLowInstructionCache();
   timebase_cycle_remainder_ = 0u;
   decrementer_cycle_remainder_ = 0u;
   decrementer_pending_ = false;
+  pe_notification_irq_active_ = false;
   timed_irq_sync_cycles_ = 0u;
+  native_audio_effective_hz_ = 0u;
   cp_idle_breakpoint_frames_ = 0u;
   cp_idle_breakpoint_address_ = 0u;
   cp_idle_breakpoint_recoveries_ = 0u;
@@ -729,6 +937,7 @@ void HostRuntime::Reset() {
   perf_hardware_cycles_total_ = 0u;
   perf_vi_boundaries_total_ = 0u;
   perf_guest_frames_total_ = 0u;
+  native_vi_last_queued_frame_ = 0u;
   perf_last_hardware_cycles_ = 0u;
   perf_last_vi_boundaries_ = 0u;
   perf_last_guest_frames_ = 0u;
@@ -736,6 +945,24 @@ void HostRuntime::Reset() {
   perf_last_interpolated_ = 0u;
   perf_last_dropped_ = 0u;
   perf_metrics_poll_cycles_ = 0u;
+  widescreen_frustum_manual_ = false;
+  widescreen_frustum_ambiguous_logged_ = false;
+  widescreen_frustum_selected_logged_ = false;
+  widescreen_frustum_aspect_address_ = 0u;
+  widescreen_frustum_fov_address_ = 0u;
+  widescreen_frustum_pending_aspect_address_ = 0u;
+  widescreen_frustum_pending_fov_address_ = 0u;
+  widescreen_frustum_pending_confirm_frames_ = 0u;
+  widescreen_frustum_scan_frames_ = 0u;
+  widescreen_frustum_scan_offset_ = 0u;
+  widescreen_frustum_scan_candidate_count_ = 0u;
+  widescreen_frustum_scan_candidate_aspect_ = 0u;
+  widescreen_frustum_scan_candidate_fov_ = 0u;
+  widescreen_frustum_next_scan_frame_ = 30u;
+  widescreen_frustum_last_target_aspect_ = 4.0f / 3.0f;
+  widescreen_frustum_original_aspect_ = 4.0f / 3.0f;
+  widescreen_frustum_observed_fov_ = 0.0f;
+  widescreen_frustum_observed_aspect_ = 4.0f / 3.0f;
   produced_frame_seen_ = false;
   interpolation_pair_valid_ = false;
   produced_frame_period_ = std::chrono::nanoseconds(16666667);
@@ -747,19 +974,43 @@ void HostRuntime::Reset() {
   hle_fast_cache_.fill({});
   ppc_halt_pcs_.clear();
   active_rel_sections_.clear();
+  rel_mapping_dirty_ = true;
+  native_region_probe_capture_ = false;
+  native_region_last_blocked_start_ = 0u;
+  native_region_retry_start_ = 0u;
+  native_region_secondary_owner_ = nullptr;
   secondary_dispatches_ = 0;
   fixed_exec_route_cache_ = {};
+  fixed_exec_page_routes_.fill({});
+  fixed_exec_route_epoch_ = 1u;
+  ++fixed_exec_structure_epoch_;
+  dispatch_code_probe_epoch_ = 0u;
+  for (auto& [_, proof] : native_hook_code_proofs_) proof.epoch = 0u;
+  native_region_probe_cache_.fill({});
+  fixed_exec_page_cache_hits_ = 0u;
+  fixed_exec_page_cache_fills_ = 0u;
   fixed_exec_active_descriptor_ = nullptr;
+  fixed_exec_negative_pcs_.fill(0u);
+  fixed_exec_route_memo_.fill({});
+  fixed_exec_negative_cache_hits_ = 0;
   fixed_exec_route_switches_ = 0;
   global_indirect_dispatches_ = 0;
   icbi_route_invalidations_ = 0;
+  icbi_targeted_invalidations_ = 0;
+  sdk_idle_probe_pcs_.clear();
+  idle_loop_ = {};
+  idle_pages_.clear();
   rel_mapping_refreshes_ = 0;
   rel_address_translations_ = 0;
   rel_address_misses_ = 0;
+  idle_event_waits_ = 0u;
+  idle_event_requested_cycles_ = 0u;
   rel_last_canonical_ = 0;
   rel_last_runtime_ = 0;
   lc_.Reset();
   cp_.Reset();
+  cp_.SetDeferredRegisterDrain(RuntimeEnvBool("GEKKOAOT_CP_DEFER_REGISTER_DRAIN", true));
+  si_.SetTransferEvents(RuntimeEnvBool("GEKKOAOT_NATIVE_SI_TRANSFER_EVENTS", false));
   pe_.Reset();
   pi_.Reset();
   mi_.Reset();
@@ -780,10 +1031,30 @@ void HostRuntime::Reset() {
   vi_.Reset();
   dsp_.BindMemory(&memory_);
   dsp_.Reset();
+  dsp_.SetAuxiliaryAudioSource(&HostRuntime::MixDiscAudio, this);
   hle_calls_ = 0;
   last_mmio_read_ = 0;
   mmio_reads_ = 0;
   same_mmio_read_streak_ = 0;
+  ee_pending_barrier_enabled_ = RuntimeEnvBool("GEKKOAOT_EE_PENDING_BARRIER", true);
+  native_low_vector_enabled_ = RuntimeEnvBool("GEKKOAOT_NATIVE_EXCEPTION_VECTOR", false);
+  native_low_vector_executions_ = native_low_vector_proofs_ = 0u;
+  native_address_base_enabled_ = RuntimeEnvBool("GEKKOAOT_NATIVE_ADDRESS_BASE", true);
+  native_flat_vmem_enabled_ = RuntimeEnvBool("GEKKOAOT_NATIVE_FLAT_VMEM", true);
+  native_paged_view_enabled_ = RuntimeEnvBool("GEKKOAOT_NATIVE_PAGED_VIEW", true);
+  native_locked_cache_enabled_ = RuntimeEnvBool("GEKKOAOT_NATIVE_LOCKED_CACHE",true);
+  native_sdk_gx_packets_enabled_ = RuntimeEnvBool("GEKKOAOT_NATIVE_GX_SDK_PACKETS", true);
+  native_sdk_gx_arrays_enabled_ = RuntimeEnvBool("GEKKOAOT_NATIVE_GX_ARRAY_SERVICE", true);
+  native_sdk_gx_packets_ = 0u;
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_SDK_V306=1 gx_packets=%u normal_matrix=%u dvd_fst=%u pe_ordered=%u fallback=guest-aot+hardware\n",
+               native_sdk_gx_packets_enabled_ ? 1u : 0u,
+               EnvNativeGxNormalMatrix()?1u:0u,
+               EnvNativeDvdFst()?1u:0u,
+               RuntimeEnvBool("GEKKOAOT_GX_ORDERED_PE_IRQ",true)?1u:0u);
+  native_address_publication_enabled_ = RuntimeEnvBool("GEKKOAOT_NATIVE_ADDRESS_PUBLICATION", false);
+  published_native_address_base_ = native_address_base_enabled_ ? memory_.NativeAddressBase() : nullptr;
+  std::fprintf(stderr, "GEKKOAOT_NATIVE_ADDRESS_PUBLICATION_V298=%u default=off owner=runtime republish=reset cpu-abi=unchanged\n",
+               native_address_publication_enabled_ ? 1u : 0u);
   cpu_fifo_gather_.fill(0);
   cpu_fifo_gather_size_ = 0;
   cpu_fifo_gather_base_ = 0;
@@ -792,6 +1063,8 @@ void HostRuntime::Reset() {
   cpu_fifo_capture_logged_ = false;
   gpu_fifo_gather_.fill(0);
   gpu_fifo_gather_size_ = 0;
+  atomic_fifo_service_ = false;
+  fifo_irq_fences_ = 0;
   gpu_fifo_first_pc_ = 0;
   gpu_fifo_bursts_ = 0;
   gpu_fifo_burst_logged_ = false;
@@ -813,6 +1086,21 @@ ModuleStatus HostRuntime::LoadModule(const std::filesystem::path& path,
                                      const char* expected_game_id) {
   const auto status = module_.Open(path, expected_game_id);
   if (status != ModuleStatus::Ok) return status;
+  if (module_.BindNativeHardware(NativeHardwareServices()))
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_HARDWARE_BIND_V243=1 scope=primary binding=available cpu-abi=unchanged\n");
+  if (module_.BindNativeWgpipeTry(NativeWgpipeTryServices()))
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_WGPIPE_TRY_BIND_V244=1 scope=primary binding=available cpu-abi=unchanged\n");
+  if (module_.BindNativeStableMmio(NativeStableMmioServices()))
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_STABLE_MMIO_BIND_V280=1 scope=primary devices=cp+pe+pi publication=epoch-only fallback=ordered\n");
+  if (module_.BindNativeAddressWindow(NativeAddressWindowServices(native_address_publication_enabled_)))
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_ADDRESS_BIND_V287=1 scope=primary cpu-abi=unchanged window=%d\n", native_address_base_enabled_ && memory_.NativeAddressBase() ? 1 : 0);
+  if (module_.BindNativeFlatVmem(NativeFlatVmemServices())) {
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_FLAT_VMEM_V304=%u base=7e000000 paging=revocable fallback=original cpu-abi=unchanged\n", native_flat_vmem_enabled_ ? 1u : 0u);
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_PAGED_VIEW_V322=%u source=dtlb-mirror lru=shared-mru\n",
+                 native_flat_vmem_enabled_ && native_paged_view_enabled_ ? 1u : 0u);
+  }
+  if (module_.BindNativeLockedCache(NativeLockedCacheServices()))
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_LOCKED_CACHE_V308=%u scope=primary base=e0000000 bytes=262144 dma=shared fallback=original\n",native_locked_cache_enabled_?1u:0u);
   const auto* descriptor = module_.Descriptor();
   cpu_.pc = descriptor->entry_point;
   if (descriptor->on_state_loaded) descriptor->on_state_loaded(&cpu_);
@@ -831,10 +1119,32 @@ ModuleStatus HostRuntime::LoadSecondaryModule(const std::filesystem::path& path,
     secondary_module_last_error_ = ModuleStatusName(ModuleStatus::MemoryRestartRequired);
     return ModuleStatus::MemoryRestartRequired;
   }
+  if (library->BindNativeHardware(NativeHardwareServices()))
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_HARDWARE_BIND_V243=1 scope=secondary binding=available cpu-abi=unchanged\n");
+  (void)library->BindNativeWgpipeTry(NativeWgpipeTryServices());
+  (void)library->BindNativeStableMmio(NativeStableMmioServices());
+  (void)library->BindNativeAddressWindow(NativeAddressWindowServices(native_address_publication_enabled_));
+  (void)library->BindNativeFlatVmem(NativeFlatVmemServices());
+  (void)library->BindNativeLockedCache(NativeLockedCacheServices());
   const auto* descriptor = library->Descriptor();
   if (descriptor->on_state_loaded) descriptor->on_state_loaded(&cpu_);
+  if (descriptor->num_rel_modules == 0u && descriptor->chunk_hashes) {
+    has_fixed_secondary_modules_ = true;
+    // Adding a fixed executable changes the overlap candidate set. Drop all
+    // epoch-local routing decisions so the next dispatch re-identifies the
+    // live image with the expanded descriptor set.
+    fixed_exec_route_cache_ = {};
+    ++fixed_exec_route_epoch_;
+    ++fixed_exec_structure_epoch_;
+    ++dispatch_code_probe_generation_;
+    fixed_exec_active_descriptor_ = nullptr;
+    fixed_exec_negative_pcs_.fill(0u);
+  }
+  secondary_module_caps_[descriptor] = library->Capabilities();
+  cached_secondary_caps_owner_ = nullptr;
   secondary_modules_.push_back(std::move(library));
   active_rel_sections_.clear();
+  rel_mapping_dirty_ = true;
   secondary_module_last_error_.clear();
   return ModuleStatus::Ok;
 }
@@ -847,6 +1157,9 @@ GameCubeBootResult HostRuntime::InitializeGameCube(
 GameCubeBootResult HostRuntime::InitializeGameCube(
     const std::vector<std::uint8_t>& boot_bin, const GameCubeBootConfig& config) {
   const auto result = InitializeGameCubeBoot(memory_, cpu_, boot_bin, config);
+  // The IPL has already configured DVD audio when a retail DOL starts. Games
+  // query streaming status without necessarily emitting E4 themselves.
+  di_.ConfigureAudioBuffer(boot_bin[8] != 0, boot_bin[9]);
   vi_.Reset(result.ntsc);
   hardware_clock_started_ = false;
   hardware_clock_remainder_ = 0u;
@@ -882,7 +1195,18 @@ GameCubeBi2Result HostRuntime::LoadGameCubeBi2(const std::vector<std::uint8_t>& 
   return InitializeGameCubeBi2(memory_, bi2);
 }
 
+void HostRuntime::QuiesceDiscIo() {
+  if (!di_io_inflight_) return;
+  if (di_io_future_.valid()) {
+    // Detach/cancel is a rare control path. Waiting here is preferable to
+    // letting a worker retain nod/ifstream/VFS state past its lifetime.
+    (void)di_io_future_.get();
+  }
+  di_io_inflight_ = false;
+}
+
 void HostRuntime::DetachDiscImage() {
+  QuiesceDiscIo();
   native_vfs_.Reset();
 #ifdef GEKKOAOT_HAVE_NOD
   if (disc_image_uses_nod_ && nod_disc_image_)
@@ -957,7 +1281,8 @@ bool HostRuntime::AttachDiscImage(const std::filesystem::path& image_path) {
   disc_image_uses_nod_ = true;
   disc_media_backend_ = "nod-direct";
 
-  if (RuntimeEnvBool("GEKKOAOT_NATIVE_VFS", true)) {
+  if (GekkoAOT::NativeHW::DI::PreferVfs(
+          native_hw_.DI(), EnvNativeVfs())) {
     const char* root = std::getenv("GEKKOAOT_VFS_ROOT");
     const char* overlay = std::getenv("GEKKOAOT_VFS_OVERLAY");
     const bool mounted = native_vfs_.Mount(
@@ -1000,22 +1325,25 @@ bool HostRuntime::AttachDiscImage(const std::filesystem::path& image_path) {
 #endif
 
   di_.SetDiscPresent(true);
-  di_.SetDeviceHooks({this, &HostRuntime::DiscCommand});
+  di_.SetDeviceHooks({this, &HostRuntime::DiscCommand, &HostRuntime::DiscAudioRead});
   return true;
 }
 
 bool HostRuntime::ReadDiscImage(std::uint64_t offset, void* destination, std::uint32_t size) {
+  std::lock_guard<std::mutex> io_lock(disc_io_mutex_);
   if (!destination) return false;
   if (offset > disc_image_size_ || size > disc_image_size_ - offset) return false;
   if (size == 0u) return true;
 
-  if (RuntimeEnvBool("GEKKOAOT_NATIVE_VFS", true) && native_vfs_.Ready()) {
+  if (GekkoAOT::NativeHW::DI::PreferVfs(
+          native_hw_.DI(), EnvNativeVfs()) &&
+      native_vfs_.Ready()) {
     const char* source = nullptr;
     if (native_vfs_.ReadDiscRange(offset, destination, size, &source)) {
       ++vfs_reads_;
       vfs_read_bytes_ += size;
       static unsigned vfs_logs = 0u;
-      if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && vfs_logs++ < 256u)
+      if (EnvTraceDvd() && vfs_logs++ < 256u)
         std::fprintf(stderr,
                      "GEKKOAOT_NATIVE_VFS_V154=1 phase=read offset=%08llx bytes=%u source=%s reads=%llu\n",
                      static_cast<unsigned long long>(offset), size,
@@ -1097,6 +1425,26 @@ std::uint64_t GameCubeDiLatencyCycles(std::uint64_t offset, std::uint32_t length
 }
 } // namespace
 
+bool HostRuntime::DiscAudioRead(void* user, std::uint64_t offset,
+                                void* destination, std::uint32_t size) {
+  auto* self = static_cast<HostRuntime*>(user);
+  return self && self->ReadDiscImage(offset, destination, size);
+}
+
+void HostRuntime::MixDiscAudio(void* user, std::int16_t* pcm, std::size_t frames,
+                               std::uint32_t output_hz) {
+  auto* self = static_cast<HostRuntime*>(user);
+  if (!self || !self->ai_.IsPlaying() || !self->di_.AudioStreaming()) return;
+  static unsigned start_logs = 0;
+  if (start_logs++ < 8u)
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_DTK_MIX_V1=1 output_hz=%u stream_hz=%u volume=%04x position=%08llx\n",
+                 output_hz, self->ai_.StreamSampleRateHz(), self->ai_.Volume(),
+                 static_cast<unsigned long long>(self->di_.AudioPosition()));
+  self->di_.MixAudio(pcm, frames, output_hz,
+                      self->ai_.StreamSampleRateHz(), self->ai_.Volume());
+}
+
 GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
     void* user, const GekkoAOT::HW::DI::NativeDI::CommandRequest& request) {
   using Response = GekkoAOT::HW::DI::NativeDI::CommandResponse;
@@ -1149,12 +1497,27 @@ GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
       response.error_code = 0x00031100u;
       return response;
     }
-    self->di_async_staging_.resize(transfer);
-    if (!self->ReadDiscImage(offset, self->di_async_staging_.data(), transfer)) {
-      self->di_async_staging_.clear();
-      ++self->di_read_failures_;
-      response.error_code = 0x00031100u;
-      return response;
+    self->di_async_staging_.clear();
+    static const bool async_disc_io = RuntimeEnvBool("GEKKOAOT_ASYNC_DISC_IO", true);
+    const bool async_host_io =
+        async_disc_io && self->runtime_parallel_workers_ && transfer >= 4096u;
+    if (async_host_io) {
+      self->di_io_inflight_ = true;
+      self->di_io_future_ = std::async(std::launch::async, [self, offset, transfer]() {
+        DiscIoResult result;
+        result.bytes.resize(transfer);
+        result.ok = self->ReadDiscImage(offset, result.bytes.data(), transfer);
+        if (!result.ok) result.bytes.clear();
+        return result;
+      });
+    } else {
+      self->di_async_staging_.resize(transfer);
+      if (!self->ReadDiscImage(offset, self->di_async_staging_.data(), transfer)) {
+        self->di_async_staging_.clear();
+        ++self->di_read_failures_;
+        response.error_code = 0x00031100u;
+        return response;
+      }
     }
 
     ++self->di_reads_;
@@ -1165,15 +1528,17 @@ GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
     // state machines outrun retail hardware by orders of magnitude.
     self->di_async_completion_pending_ = true;
     const bool native_vfs_timing =
-        RuntimeEnvBool("GEKKOAOT_NATIVE_VFS", true) && self->native_vfs_.Ready() &&
-        !RuntimeEnvBool("GEKKOAOT_VFS_GC_TIMING", false);
+        GekkoAOT::NativeHW::DI::PreferVfs(
+            self->native_hw_.DI(), EnvNativeVfs()) &&
+        self->native_vfs_.Ready() &&
+        (self->native_hw_.DI() || !EnvVfsGcTiming());
     if (native_vfs_timing) {
       // NativeVFS is a host filesystem service, not an optical-drive timing
       // model. Keep completion deferred until the next host hardware boundary
       // so DVDReadAsyncPrio cannot callback reentrantly from the initiating
       // MMIO write, but add no artificial seek/rotation/transfer delay.
       self->di_async_cycles_remaining_ = 0u;
-    } else if (RuntimeEnvBool("GEKKOAOT_FAST_DISC", false)) {
+    } else if (EnvFastDisc()) {
       self->di_async_cycles_remaining_ =
           std::clamp<std::uint64_t>(static_cast<std::uint64_t>(transfer) * 2u,
                                     8192u, 1048576u);
@@ -1190,14 +1555,15 @@ GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
     const auto sequence = request.sequence;
 
     static unsigned schedule_logs = 0u;
-    if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && schedule_logs++ < 256u)
+    if (EnvTraceDvd() && schedule_logs++ < 256u)
       std::fprintf(stderr,
-                   "GEKKOAOT_NATIVE_DI_PARITY_V143=1 phase=schedule seq=%llu offset=%08llx dma=%08x bytes=%u delay_cycles=%llu mode=%s visibility=completion\n",
+                   "GEKKOAOT_NATIVE_DI_PARITY_V35=1 phase=schedule seq=%llu offset=%08llx dma=%08x bytes=%u delay_cycles=%llu mode=%s host_io=%s visibility=completion\n",
                    static_cast<unsigned long long>(sequence),
                    static_cast<unsigned long long>(offset), request.dma_address, transfer,
                    static_cast<unsigned long long>(self->di_async_cycles_remaining_),
                    native_vfs_timing ? "native-vfs" :
-                       (RuntimeEnvBool("GEKKOAOT_FAST_DISC", false) ? "fast-optin" : "gc-drive"));
+                       (EnvFastDisc() ? "fast-optin" : "gc-drive"),
+                   async_host_io ? "worker" : "inline");
 
     response.result = 0; // pending: NativeDI keeps TSTART asserted
     response.bytes_transferred = transfer;
@@ -1231,6 +1597,7 @@ GekkoAOT::HW::DI::NativeDI::CommandResponse HostRuntime::DiscCommand(
         0x41, 0x00, 0x00, 0x00,
     };
     std::memcpy(target, kInquiryWords, sizeof(kInquiryWords));
+    self->native_gx_.NotifyMemoryWrite(request.dma_address, kInquiryLength);
     response.result = 1;
     response.bytes_transferred = kInquiryLength;
     response.error_code = 0;
@@ -1279,6 +1646,7 @@ DolLoadResult HostRuntime::LoadDolImage(const std::vector<std::uint8_t>& image) 
 void HostRuntime::RegisterOsHook(GekkoAOT::NativeOS::Kind kind, std::uint32_t address) {
   if (!address) return;
   os_hooks_[address] = kind;
+  RegisterNativeHookCodeProof(address);
   RebuildNativeInterceptIndex();
   const auto slot = ((address >> 2u) ^ (address >> 14u)) &
                     (kHostCallNegativeCacheSize - 1u);
@@ -1292,6 +1660,7 @@ void HostRuntime::RegisterOsHook(GekkoAOT::NativeOS::Kind kind, std::uint32_t ad
 void HostRuntime::RegisterSimpleHle(SimpleHleKind kind, std::uint32_t address) {
   if (!address) return;
   simple_hle_hooks_[address] = kind;
+  RegisterNativeHookCodeProof(address);
   RebuildNativeInterceptIndex();
   const auto slot = ((address >> 2u) ^ (address >> 14u)) &
                     (kHostCallNegativeCacheSize - 1u);
@@ -1306,8 +1675,11 @@ bool HostRuntime::InitializeNativeGX(const std::filesystem::path& bridge_path) {
   // NativeVI remains the guest timing authority. Optionally let a completed
   // retail GXCopyDisp drive host presentation instead of waiting for VI.
   native_gx_.SetCyclePresentEnabled(false);
+  // A GX copy can be a render target that VI has not selected. Presenting it
+  // directly exposed gray intermediate buffers in HPCOS; NativeHW VI follows
+  // only completed images selected by the game's VI registers.
   const bool requested_copy_present =
-      RuntimeEnvBool("GEKKOAOT_NATIVE_GX_PRESENT_ON_COPY", false);
+      !native_hw_.VI() && RuntimeEnvBool("GEKKOAOT_NATIVE_GX_PRESENT_ON_COPY", false);
   gx_present_on_copy_ = requested_copy_present && native_gx_.HasFrameReadySignal();
   gx_present_fallback_vi_ =
       RuntimeEnvBool("GEKKOAOT_NATIVE_GX_PRESENT_FALLBACK_VI", true);
@@ -1328,9 +1700,17 @@ bool HostRuntime::InitializeNativeGX(const std::filesystem::path& bridge_path) {
                "GEKKOAOT_FRAME_INTERPOLATION_V48=%u mode=temporal-gpu-blend target_hz=%u abi=%u guest_clock=unchanged\n",
                frame_interpolation_enabled_ ? 1u : 0u, host_fps_limit_hz_,
                interpolation_abi ? 1u : 0u);
-  native_gx_.SetPeEventSink(&HostRuntime::NativeGXPeEvent, this);
+  // In parallel mode Aurora parses FIFO commands on the GX worker.  Install
+  // the atomic-mailbox PE policy before the worker starts so no callback can
+  // race a sink transition.  Serial mode keeps the old direct event sink.
+  if (runtime_parallel_workers_)
+    native_gx_.SetPeEventSink(nullptr, nullptr);
+  else
+    native_gx_.SetPeEventSink(&HostRuntime::NativeGXPeEvent, this);
+  native_gx_.SetFrameReadyFence(frame_interpolation_enabled_);
+  native_gx_.SetAsyncWritesEnabled(runtime_parallel_workers_);
   // Preserve any event produced during renderer initialization before the sink
-  // was installed, then stay fully event-driven for normal execution.
+  // policy was installed.
   SyncNativeGXInterrupts();
   return true;
 }
@@ -1346,6 +1726,9 @@ void HostRuntime::ShutdownNativeGX() {
 void HostRuntime::NativeGXPeEvent(void* user, std::uint32_t reg, std::uint32_t value) {
   auto* self = static_cast<HostRuntime*>(user);
   if (!self) return;
+  static const bool trace_pe=RuntimeEnvBool("GEKKOAOT_TRACE_PE",false);
+  static unsigned trace_pe_count=0;
+  if(trace_pe && trace_pe_count++<128u) std::fprintf(stderr,"GEKKOAOT_TRACE_PE event=consume reg=%02x value=%06x control=%x pc=%08x lr=%08x\n",reg,value,self->pe_.Control(),self->cpu_.pc,self->cpu_.lr);
   switch (reg) {
   case 0x45u: // BPMEM_SETDRAWDONE
     if ((value & 0xffu) == 0x02u) self->pe_.SetFinish();
@@ -1521,13 +1904,53 @@ void HostRuntime::RefreshNativeInput(bool poll_si) {
 #if defined(GEKKOAOT_NATIVE_SDL_INPUT)
   if (!native_input_ready_) return;
   GekkoAOT::Input::HostInput().Poll(native_pads_);
+  ++native_input_samples_;
   if (poll_si) {
     si_.PollNow();
+    ++native_si_auto_polls_;
     SyncNativeSIInterrupt();
   }
 #else
   (void)poll_si;
 #endif
+}
+
+bool HostRuntime::NativeExiSelect(void* user, std::uint32_t channel,
+                                  std::uint8_t chip_select) {
+  auto* self = static_cast<HostRuntime*>(user);
+  if (self && self->native_hw_.EXI())
+    return self->native_exi_host_.Select(channel, chip_select);
+  return false;
+}
+
+bool HostRuntime::NativeExiPresent(void* user, std::uint32_t channel,
+                                   std::uint8_t chip_select) {
+  auto* self = static_cast<HostRuntime*>(user);
+  return self && self->native_hw_.EXI() &&
+         self->native_exi_host_.Present(channel, chip_select);
+}
+
+bool HostRuntime::NativeExiImmediate(void* user, std::uint32_t channel,
+                                     std::uint8_t chip_select,
+                                     std::uint8_t direction, std::uint8_t length,
+                                     std::uint32_t* data) {
+  auto* self = static_cast<HostRuntime*>(user);
+  return self && self->native_hw_.EXI() &&
+         self->native_exi_host_.Immediate(channel, chip_select, direction, length, data);
+}
+
+bool HostRuntime::NativeExiDma(void* user, std::uint32_t channel,
+                               std::uint8_t chip_select, std::uint8_t direction,
+                               std::uint32_t guest_address, std::uint32_t length) {
+  auto* self = static_cast<HostRuntime*>(user);
+  if (!self || !self->native_hw_.EXI()) return false;
+  auto* bytes = self->memory_.Resolve(guest_address, length);
+  if (!bytes) return false;
+  const bool handled = self->native_exi_host_.Dma(channel, chip_select,
+                                                  direction, bytes, length);
+  if (handled && direction == 0u)
+    self->native_gx_.NotifyMemoryWrite(guest_address, length);
+  return handled;
 }
 
 bool HostRuntime::NativePadPoll(void* user, std::uint32_t channel,
@@ -1547,7 +1970,17 @@ int HostRuntime::NativePadBuffer(void* user, std::uint32_t channel, std::uint8_t
   auto* self = static_cast<HostRuntime*>(user);
   if (!self || !buffer || request_length == 0u || channel >= self->native_pads_.size()) return -1;
 
-  // A transfer must consume the already-latched SI state. Sampling SDL here
+  if (GekkoAOT::NativeHW::SI::RefreshOnTransfer(
+          self->native_hw_.SI(), self->native_input_ready_)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (self->native_si_last_transfer_sample_ == std::chrono::steady_clock::time_point{} ||
+        now - self->native_si_last_transfer_sample_ >= std::chrono::milliseconds(1)) {
+      self->RefreshNativeInput(false);
+      ++self->native_si_transfer_samples_;
+      self->native_si_last_transfer_sample_ = now;
+    }
+  }
+  // The compatibility path consumes the already-latched SI state. Sampling SDL here
   // makes the host device cadence proportional to uncapped guest PAD traffic,
   // so one physical press can be observed as several fresh samples before the
   // next GameCube hardware tick. The hardware-time sampler in
@@ -1601,10 +2034,178 @@ void HostRuntime::NativePadDirect(void* user, std::uint32_t channel,
 #endif
 }
 
-PageTranslation HostRuntime::TranslateVmemAddress(std::uint32_t address, bool write) {
+void HostRuntime::ClearDataTlb() {
+  for (auto& set : data_tlb_)
+    for (auto& way : set) way = {};
+  data_tlb_stamp_ = 0;
+  ClearPagedView();
+  auto mru = memory_.PagedViewMru();
+  std::fill(mru.begin(), mru.end(), std::uint8_t{0});
+}
+
+void HostRuntime::InvalidateDataTlb(std::uint32_t address) {
+  // Gekko tlbie selects a 2-way TLB set with EA[14:19] and invalidates both
+  // ways.  A 64-call sweep therefore invalidates all 128 data-TLB entries.
+  auto& set = data_tlb_[(address >> 12u) & 0x3fu];
+  DropPagedView(set[0]);
+  DropPagedView(set[1]);
+  set[0].valid = false;
+  set[1].valid = false;
+  ++data_tlb_invalidations_;
+}
+
+// v322: generated code reads resident VM-aperture translations from this
+// mirror instead of calling ExternalRead/Write for every paged access. It is
+// exactly the modeled DTLB: published when an entry is filled (or hit again
+// after a stale drop), removed when the entry is evicted or tlbie'd, and the
+// write bit appears only once the PTE C bit has been set by the slow path.
+void HostRuntime::ClearPagedView() {
+  auto pages = memory_.PagedViewPagesTable();
+  std::fill(pages.begin(), pages.end(), 0u);
+}
+
+void HostRuntime::DropPagedView(const DataTlbEntry& entry) {
+  if (!entry.valid || !AddressSpace::IsVmem(entry.ea_page) ||
+      entry.vsid != (memory_.PagedViewSr() & 0x00ffffffu))
+    return;
+  memory_.PagedViewPagesTable()[(entry.ea_page - AddressSpace::FakeVmemBase) >> 12u] = 0u;
+}
+
+void HostRuntime::PublishPagedView(const DataTlbEntry& entry, unsigned way) {
+  if (!entry.valid || !native_flat_vmem_enabled_ || !native_paged_view_enabled_ ||
+      !AddressSpace::IsVmem(entry.ea_page) ||
+      (cpu_.msr & (kPpcMsrPr | 0x10u)) != 0x10u || (vmem_bat_modes_ & 2u) != 0u)
+    return;
+  const std::uint32_t segment = cpu_.sr[AddressSpace::FakeVmemBase >> 28u];
+  if ((segment & 0x80000000u) != 0u || entry.vsid != (segment & 0x00ffffffu)) return;
+  if (segment != memory_.PagedViewSr()) {
+    ClearPagedView();
+    memory_.SetPagedViewSr(segment);
+  }
+  const auto mem1 = memory_.Mem1().size();
+  if (mem1 < 0x1000u || entry.physical_page > mem1 - 0x1000u) return;
+  // Supervisor access (PR=0 is required by the generated-code admission).
+  const bool key = (segment & 0x40000000u) != 0u;
+  const unsigned pp = entry.pte_lower & 3u;
+  const bool readable = !key || pp != 0u;
+  const bool writable = pp == 2u || (!key && pp != 3u);
+  memory_.PagedViewPagesTable()[(entry.ea_page - AddressSpace::FakeVmemBase) >> 12u] =
+      readable ? (entry.physical_page | 1u |
+                  ((writable && (entry.pte_lower & 0x80u) != 0u) ? 2u : 0u) | (way << 2u))
+               : 0u;
+}
+
+void HostRuntime::RefreshVmemBatModes() {
+  constexpr std::uint32_t aperture_variable_bits = AddressSpace::RetailFakeVmemSize - 1u;
+  std::uint8_t modes = 0;
+  for (unsigned index = 0; index < 4; ++index) {
+    const auto upper = spr_state_[536u + index * 2u];
+    const auto offset_mask = ((upper & 0x1ffcu) << 15u) | 0x1ffffu;
+    const auto compared_bits = ~offset_mask & ~aperture_variable_bits;
+    // Only bits fixed across the complete aligned VM aperture can exclude a
+    // BAT. This stays conservative for partial overlaps and unusual BL masks.
+    if (((upper ^ AddressSpace::FakeVmemBase) & compared_bits) == 0u)
+      modes |= static_cast<std::uint8_t>(upper & 3u);
+  }
+  vmem_bat_modes_ = modes;
+  // A supervisor BAT over the aperture takes precedence over the page table;
+  // the generated-code DTLB mirror does not model BATs, so withdraw it.
+  if ((modes & 2u) != 0u) ClearPagedView();
+}
+
+HostRuntime::DataAddressTranslation HostRuntime::TranslatePagedDataAddress(std::uint32_t address, bool write) {
+  using Status = PageTranslation::Status;
+  const bool user = (cpu_.msr & kPpcMsrPr) != 0u;
+  const std::uint32_t segment = cpu_.sr[address >> 28u];
+  if (segment & 0x80000000u) return {Status::DirectStore};
+  const std::uint32_t vsid = segment & 0x00ffffffu;
+  const std::uint32_t ea_page = address & 0xfffff000u;
+  const std::uint32_t set_index = (address >> 12u) & 0x3fu;
+  auto& set = data_tlb_[set_index];
+  for (unsigned way = 0; way < 2u; ++way) {
+    auto& entry = set[way];
+    if (!entry.valid || entry.ea_page != ea_page || entry.vsid != vsid) continue;
+    ++data_tlb_hits_;
+    entry.stamp = ++data_tlb_stamp_;
+    // 2-way LRU state, shared with generated-code mirror hits.
+    memory_.PagedViewMru()[set_index] = static_cast<std::uint8_t>(way);
+    if (AddressSpace::IsVmem(address) &&
+        memory_.PagedViewPagesTable()[(ea_page - AddressSpace::FakeVmemBase) >> 12u] == 0u)
+      PublishPagedView(entry, way);
+    const bool key = (segment & (user ? 0x20000000u : 0x40000000u)) != 0u;
+    const unsigned pp = entry.pte_lower & 3u;
+    const bool readable = !key || pp != 0u;
+    const bool writable = pp == 2u || (!key && pp != 3u);
+    if (!readable || (write && !writable)) return {Status::Protection};
+
+    // A read fill already set R in the backing PTE.  C is different: on a
+    // first store through a resident C=0 entry, Gekko re-walks the HPT so the
+    // page-table C bit becomes architecturally visible.  If software removed
+    // the PTE before that store, the stale TLB entry must not silently dirty
+    // the old physical frame; the access takes the normal page fault instead.
+    //
+    // Dolphin models this as TLBLookupResult::UpdateC followed by a page-table
+    // walk.  CoD Finest Hour's VM pager depends on the same boundary when it
+    // evicts allocator pages to ARAM: losing C lets a dirty page be discarded
+    // and later restored with stale heap links.
+    if (write && (entry.pte_lower & 0x80u) == 0u) {
+      return WalkPagedDataAddress(address, true, &entry);
+    }
+
+    return {Status::Mapped, entry.physical_page | (address & 0xfffu)};
+  }
+
+  return WalkPagedDataAddress(address, write);
+}
+
+// Keep the rich PTE result and its stack temporary out of the resident DTLB
+// path. Table walks and first-write C updates retain the same architectural
+// effects, but ordinary cached loads/stores only return two host register words.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+HostRuntime::DataAddressTranslation HostRuntime::WalkPagedDataAddress(
+    std::uint32_t address, bool write, DataTlbEntry* changed_entry) {
+  using Status = PageTranslation::Status;
+  const bool user = (cpu_.msr & kPpcMsrPr) != 0u;
+  const std::uint32_t segment = cpu_.sr[address >> 28u];
+  auto result = TranslatePage(memory_, address, segment, spr_state_[25u], user,
+                              write ? PageAccess::Write : PageAccess::Read);
+  if (changed_entry) {
+    if (result.status == Status::Mapped) {
+      changed_entry->pte_lower |= 0x180u;
+      auto& changed_set = data_tlb_[(address >> 12u) & 0x3fu];
+      PublishPagedView(*changed_entry, changed_entry == &changed_set[0] ? 0u : 1u);
+    }
+    return {result.status, result.physical};
+  }
+  if (result.status != Status::Mapped || result.pte_address == 0u)
+    return {result.status, result.physical};
+
+  const std::uint32_t vsid = segment & 0x00ffffffu;
+  const std::uint32_t ea_page = address & 0xfffff000u;
+  const std::uint32_t set_index = (address >> 12u) & 0x3fu;
+  auto& set = data_tlb_[set_index];
+  auto& mru = memory_.PagedViewMru()[set_index];
+  unsigned way = !set[0].valid ? 0u : !set[1].valid ? 1u : (mru ^ 1u) & 1u;
+  DataTlbEntry* victim = &set[way];
+  DropPagedView(*victim);
+  *victim = {true, ea_page, vsid, result.physical & 0xfffff000u,
+             result.pte_address, result.pte_upper, result.pte_lower, ++data_tlb_stamp_};
+  mru = static_cast<std::uint8_t>(way);
+  PublishPagedView(*victim, way);
+  ++data_tlb_fills_;
+  return {result.status, result.physical};
+}
+
+HostRuntime::DataAddressTranslation HostRuntime::TranslateVmemAddress(std::uint32_t address, bool write) {
   using Status = PageTranslation::Status;
   if ((cpu_.msr & 0x10u) == 0u) return {Status::Mapped, address};
   const bool user = (cpu_.msr & kPpcMsrPr) != 0u;
+  if ((vmem_bat_modes_ & (user ? 1u : 2u)) == 0u && AddressSpace::IsVmem(address))
+    return TranslatePagedDataAddress(address, write);
   // BAT translation takes precedence over the hashed page table.
   for (unsigned index = 0; index < 4; ++index) {
     const auto upper = spr_state_[536u + index * 2u];
@@ -1616,8 +2217,7 @@ PageTranslation HostRuntime::TranslateVmemAddress(std::uint32_t address, bool wr
     if (pp == 0u || (write && pp != 2u)) return {Status::Protection};
     return {Status::Mapped, (lower & 0xfffe0000u & ~offset_mask) | (address & offset_mask)};
   }
-  return TranslatePage(memory_, address, cpu_.sr[address >> 28u], spr_state_[25u],
-                       user, write ? PageAccess::Write : PageAccess::Read);
+  return TranslatePagedDataAddress(address, write);
 }
 
 bool HostRuntime::AccessPagedVmem(std::uint32_t address, std::uint64_t* value,
@@ -1627,35 +2227,130 @@ bool HostRuntime::AccessPagedVmem(std::uint32_t address, std::uint64_t* value,
     SetFault(write ? FaultKind::InvalidMemoryWrite : FaultKind::InvalidMemoryRead, address, size);
     return true;
   }
-  // Preflight both pages of a scalar before writing any data. Contiguous
-  // virtual pages need not have adjacent physical frames.
+
+  using Status = PageTranslation::Status;
+  const auto translation_fault = [&](std::uint32_t ea, Status status) {
+    if (status == Status::InvalidTable) {
+      SetFault(write ? FaultKind::InvalidMemoryWrite : FaultKind::InvalidMemoryRead,
+               ea, spr_state_[25u]);
+      return;
+    }
+    const auto old_msr = cpu_.msr;
+    last_dsi_pc_ = cpu_.pc;
+    last_dsi_lr_ = cpu_.lr;
+    last_dsi_msr_ = old_msr;
+    // v321: with MSR[RI]=0 the SDK vector routes the DSI to
+    // OSDefaultExceptionHandler ("Non-recoverable Exception 2"), which is fatal.
+    if ((old_msr & 0x2u) == 0u && nonrecoverable_dsi_reports_ < 8u) {
+      ++nonrecoverable_dsi_reports_;
+      std::fprintf(stderr,
+                   "GEKKOAOT_VM_DSI_NONRECOVERABLE_V321=1 pc=%08x lr=%08x msr=%08x ea=%08x write=%u r1=%08x\n",
+                   cpu_.pc, cpu_.lr, old_msr, ea, write ? 1u : 0u, cpu_.gpr[1]);
+    }
+    cpu_.dar = ea;
+    cpu_.dsisr = (write ? 0x02000000u : 0u) |
+        (status == Status::Missing ? 0x40000000u :
+         status == Status::DirectStore ? 0x04000000u : 0x08000000u);
+    cpu_.srr0 = cpu_.pc;
+    cpu_.srr1 = old_msr & kPpcMsrRfiMask;
+    cpu_.msr = ((old_msr & ~kPpcMsrLe) |
+                ((old_msr & kPpcMsrIle) ? kPpcMsrLe : 0u)) &
+               ~kPpcExceptionEntryClearMask;
+    cpu_.pc = (old_msr & 0x40u) ? 0xfff00300u : 0x300u;
+    cpu_.exception |= kPpcExcDsi;
+    NoteDsiTrace('R', last_dsi_pc_, cpu_.exception);
+    BumpHostReadEpoch(&cpu_);
+  };
+
+  // v219: scalar VM traffic overwhelmingly stays inside one 4 KiB page.  The
+  // old generic path built an array of up to eight host byte pointers and then
+  // copied the value one byte at a time even after translation had already
+  // proven the physical frame contiguous.  Keep the cross-page preflight below
+  // for the rare boundary case, but make ordinary 1/2/4/8-byte accesses one
+  // translation + one compact endian load/store.
+  if (size <= 0x1000u - (address & 0xfffu)) {
+    const auto translation = TranslateVmemAddress(address, write);
+    if (translation.status != Status::Mapped) {
+      translation_fault(address, translation.status);
+      return true;
+    }
+    if (translation.physical >= memory_.Mem1().size() ||
+        size > memory_.Mem1().size() - translation.physical) {
+      SetFault(write ? FaultKind::InvalidMemoryWrite : FaultKind::InvalidMemoryRead,
+               address, translation.physical);
+      return true;
+    }
+
+    auto* p = memory_.Mem1().data() + translation.physical;
+    if (write) {
+      const std::uint64_t v = *value;
+      switch (size) {
+      case 1u:
+        p[0] = static_cast<std::uint8_t>(v);
+        break;
+      case 2u:
+        p[0] = static_cast<std::uint8_t>(v >> 8u);
+        p[1] = static_cast<std::uint8_t>(v);
+        break;
+      case 4u:
+        p[0] = static_cast<std::uint8_t>(v >> 24u);
+        p[1] = static_cast<std::uint8_t>(v >> 16u);
+        p[2] = static_cast<std::uint8_t>(v >> 8u);
+        p[3] = static_cast<std::uint8_t>(v);
+        break;
+      case 8u:
+        p[0] = static_cast<std::uint8_t>(v >> 56u);
+        p[1] = static_cast<std::uint8_t>(v >> 48u);
+        p[2] = static_cast<std::uint8_t>(v >> 40u);
+        p[3] = static_cast<std::uint8_t>(v >> 32u);
+        p[4] = static_cast<std::uint8_t>(v >> 24u);
+        p[5] = static_cast<std::uint8_t>(v >> 16u);
+        p[6] = static_cast<std::uint8_t>(v >> 8u);
+        p[7] = static_cast<std::uint8_t>(v);
+        break;
+      }
+    } else {
+      switch (size) {
+      case 1u:
+        *value = p[0];
+        break;
+      case 2u:
+        *value = (std::uint64_t(p[0]) << 8u) | std::uint64_t(p[1]);
+        break;
+      case 4u:
+        *value = (std::uint64_t(p[0]) << 24u) |
+                 (std::uint64_t(p[1]) << 16u) |
+                 (std::uint64_t(p[2]) << 8u) |
+                 std::uint64_t(p[3]);
+        break;
+      case 8u:
+        *value = (std::uint64_t(p[0]) << 56u) |
+                 (std::uint64_t(p[1]) << 48u) |
+                 (std::uint64_t(p[2]) << 40u) |
+                 (std::uint64_t(p[3]) << 32u) |
+                 (std::uint64_t(p[4]) << 24u) |
+                 (std::uint64_t(p[5]) << 16u) |
+                 (std::uint64_t(p[6]) << 8u) |
+                 std::uint64_t(p[7]);
+        break;
+      }
+    }
+    return true;
+  }
+
+  // A scalar that straddles a page boundary must preflight every participating
+  // page before the first store. Adjacent virtual pages need not map to
+  // adjacent physical frames, and a fault on page two must leave page one
+  // untouched.
   std::array<std::uint8_t*, 8> bytes{};
   for (unsigned offset = 0; offset < size;) {
     const auto ea = address + offset;
     const auto translation = TranslateVmemAddress(ea, write);
-    using Status = PageTranslation::Status;
     if (translation.status != Status::Mapped) {
-      if (translation.status == Status::InvalidTable) {
-        SetFault(write ? FaultKind::InvalidMemoryWrite : FaultKind::InvalidMemoryRead, ea, spr_state_[25u]);
-        return true;
-      }
-      const auto old_msr = cpu_.msr;
-      cpu_.dar = ea;
-      cpu_.dsisr = (write ? 0x02000000u : 0u) |
-          (translation.status == Status::Missing ? 0x40000000u :
-           translation.status == Status::DirectStore ? 0x04000000u : 0x08000000u);
-      cpu_.srr0 = cpu_.pc;
-      cpu_.srr1 = old_msr & kPpcMsrRfiMask;
-      cpu_.msr = ((old_msr & ~kPpcMsrLe) |
-                  ((old_msr & kPpcMsrIle) ? kPpcMsrLe : 0u)) & ~kPpcExceptionEntryClearMask;
-      cpu_.pc = (old_msr & 0x40u) ? 0xfff00300u : 0x300u;
-      cpu_.exception |= kPpcExcDsi;
-      BumpHostReadEpoch(&cpu_);
+      translation_fault(ea, translation.status);
       return true;
     }
     const unsigned count = std::min<unsigned>(size - offset, 0x1000u - (ea & 0xfffu));
-    // Page tables describe physical MEM1 frames. Do not admit cached aliases,
-    // device apertures or the old fake backing as physical RAM.
     if (translation.physical >= memory_.Mem1().size() ||
         count > memory_.Mem1().size() - translation.physical) {
       SetFault(write ? FaultKind::InvalidMemoryWrite : FaultKind::InvalidMemoryRead,
@@ -1667,7 +2362,8 @@ bool HostRuntime::AccessPagedVmem(std::uint32_t address, std::uint64_t* value,
     offset += count;
   }
   if (write) {
-    for (unsigned i = 0; i < size; ++i) *bytes[i] = std::uint8_t(*value >> ((size - 1u - i) * 8u));
+    for (unsigned i = 0; i < size; ++i)
+      *bytes[i] = std::uint8_t(*value >> ((size - 1u - i) * 8u));
   } else {
     *value = 0;
     for (unsigned i = 0; i < size; ++i) *value = (*value << 8u) | *bytes[i];
@@ -1675,69 +2371,396 @@ bool HostRuntime::AccessPagedVmem(std::uint32_t address, std::uint64_t* value,
   return true;
 }
 
+const GekkoAOTNativeHardware& HostRuntime::NativeHardwareServices() {
+  static const GekkoAOTNativeHardware services{
+      1u, sizeof(GekkoAOTNativeHardware), NativeCPRead16, NativeVIRead16,
+      NativePIWrite32, NativeWgpipeWrite};
+  return services;
+}
+
+const GekkoAOTNativeAddressWindow& HostRuntime::NativeAddressWindowServices(bool published) {
+  static const GekkoAOTNativeAddressWindow services{1u, sizeof(GekkoAOTNativeAddressWindow), NativeAddressBase};
+  static const GekkoAOTNativeAddressWindow direct{1u, sizeof(GekkoAOTNativeAddressWindow), PublishedNativeAddressBase};
+  return published ? direct : services;
+}
+std::uint8_t* HostRuntime::NativeAddressBase(CPUState* cpu) {
+  auto* self = Self(cpu);
+  return self && self->native_address_base_enabled_ ? self->memory_.NativeAddressBase() : nullptr;
+}
+std::uint8_t* HostRuntime::PublishedNativeAddressBase(CPUState* cpu) {
+  auto* self = Self(cpu);
+  return self ? self->published_native_address_base_ : nullptr;
+}
+
+const GekkoAOTNativeLockedCache& HostRuntime::NativeLockedCacheServices() {
+  static const GekkoAOTNativeLockedCache services{1u,sizeof(GekkoAOTNativeLockedCache),NativeLockedCacheBase};
+  return services;
+}
+std::uint8_t* HostRuntime::NativeLockedCacheBase(CPUState* cpu) {
+  auto* self=Self(cpu);
+  return self && self->native_locked_cache_enabled_ ?
+      static_cast<std::uint8_t*>(self->lc_.Pointer(HW::LC::NativeLC::Base,HW::LC::NativeLC::Size)):nullptr;
+}
+
+const GekkoAOTNativeFlatVmem& HostRuntime::NativeFlatVmemServices() {
+  static const GekkoAOTNativeFlatVmem services{2u, sizeof(GekkoAOTNativeFlatVmem), NativeFlatVmemView};
+  return services;
+}
+const GekkoAOTFlatVmemView* HostRuntime::NativeFlatVmemView(CPUState* cpu) {
+  auto* self = Self(cpu);
+  return self && self->native_flat_vmem_enabled_ ? self->memory_.FlatVmemView() : nullptr;
+}
+
+const GekkoAOTNativeStableMmio& HostRuntime::NativeStableMmioServices() {
+  static const GekkoAOTNativeStableMmio services{
+      1u, sizeof(GekkoAOTNativeStableMmio), NativeTryStableMmioRead};
+  return services;
+}
+
+std::uint64_t HostRuntime::NativeTryStableMmioRead(CPUState* cpu, std::uint32_t address,
+                                                std::uint8_t size) {
+  auto* self = Self(cpu);
+  const auto physical = AddressSpace::ToPhysical(address);
+  // v300: only CP/PE reads observe GP progress; PI INTSR/INTMR need just the
+  // already-published PE events (PeEventPending sends them to the slow path).
+  const bool gp_progress = physical < 0x0c002000u;
+  if (!self || !self->native_hw_.Enabled() || cpu->exception ||
+      self->fault_.kind != FaultKind::None ||
+      (gp_progress && self->native_gx_.WritesPending()) || self->native_gx_.PeEventPending() ||
+      self->native_gx_.PeEventOverflow() || self->cp_.RegisterDrainPending()) return 0u;
+  std::uint64_t value = 0u;
+  bool handled = false;
+  if (size == 2u && !(physical & 1u)) {
+    if (self->native_hw_.CP() && physical >= 0x0c000000u && physical < 0x0c001000u) {
+      handled = self->cp_.Read(address, size, &value);
+      if (handled) self->SyncNativeCPInterrupt();
+    } else if (physical >= 0x0c001000u && physical <= 0x0c00100eu) {
+      // PE config/control/token are scalar mirrors. Bounding box and EFB
+      // accesses need GPU work and cannot enter this state-free service.
+      handled = self->pe_.Read(address, size, &value);
+      if (handled) self->SyncNativePEInterrupts();
+    }
+  } else if (size == 4u && self->native_hw_.PI() &&
+             (physical == 0x0c003000u || physical == 0x0c003004u)) {
+    handled = self->pi_.Read(address, size, &value);
+  }
+  if (!handled) return 0u;
+  self->CountHostEffect();
+  self->RecordMmioRead(address);
+  BumpHostReadEpoch(cpu);
+  return (std::uint64_t{1} << 63u) | value;
+}
+
+std::uint64_t HostRuntime::NativeCPRead16(CPUState* cpu, std::uint32_t address,
+                                         std::uint8_t size) {
+  auto* self = Self(cpu);
+  if (self) self->CountHostEffect();
+  if (!self || size != 2u || (address & 1u) != 0u || !self->cp_.Handles(address))
+    return ExternalRead(cpu, address, size);
+  // Same CP/PE visibility boundary, event epoch, telemetry and IRQ as the bus.
+  (void)self->native_gx_.FlushWrites(GX::HostBridge::SyncReason::MmioRead);
+  self->SyncNativeGXInterrupts();
+  BumpHostReadEpoch(cpu);
+  self->RecordMmioRead(address);
+  std::uint64_t value = 0u;
+  if (self->cp_.Read(address, size, &value)) {
+    self->SyncNativeCPInterrupt();
+    return value;
+  }
+  self->SetFault(FaultKind::MmioRead, address);
+  return 0u;
+}
+
+std::uint64_t HostRuntime::NativeVIRead16(CPUState* cpu, std::uint32_t address,
+                                         std::uint8_t size) {
+  auto* self = Self(cpu);
+  if (self) self->CountHostEffect();
+  const auto offset = AddressSpace::ToPhysical(address) - HW::VI::NativeVI::BasePhysical;
+  if (!self || size != 2u || (offset & 1u) != 0u || offset > 0x74u)
+    return ExternalRead(cpu, address, size);
+  BumpHostReadEpoch(cpu);
+  self->ServiceTimedMmioPoll(address);
+  self->RecordMmioRead(address);
+  std::uint64_t value = 0u;
+  if (self->vi_.Read(address, size, &value)) return value;
+  self->SetFault(FaultKind::MmioRead, address);
+  return 0u;
+}
+
+void HostRuntime::NativePIWrite32(CPUState* cpu, std::uint32_t address,
+                                  std::uint64_t value, std::uint8_t size) {
+  auto* self = Self(cpu);
+  if (self) self->CountHostEffect();
+  if (!self || size != 4u || (address & 3u) != 0u || !self->pi_.Handles(address)) {
+    ExternalWrite(cpu, address, value, size);
+    return;
+  }
+  (void)self->native_gx_.FlushWrites(GX::HostBridge::SyncReason::MmioWrite);
+  self->SyncNativeGXInterrupts();
+  BumpHostWriteEpoch(cpu);
+  if (self->pi_.Write(address, value, size)) return;
+  self->SetFault(FaultKind::MmioWrite, address, static_cast<std::uint32_t>(value));
+}
+
+void HostRuntime::ServiceTimedMmioPoll(std::uint32_t address,bool counter) {
+  const auto timed_mmio_physical = AddressSpace::ToPhysical(address);
+  // Do not hit the host clock on every load.  Tight guest poll loops execute
+  // this branch extremely often, so 1/64 reads is still far above any
+  // GameCube device cadence while keeping the fix cheap.
+  static std::uint32_t timed_mmio_poll_divider = 0u;
+  // Native performance-counter reads are also time-visible boundaries. A
+  // tiny elapsed-time wait can stay entirely inside one AOT function; leaving
+  // its counter frozen until that function exits needlessly burns the core.
+  const bool sample=counter ? (++native_counter_sample_divider_&7u)==0u :
+                             (++timed_mmio_poll_divider&63u)==0u;
+  if (sample) {
+    constexpr std::uint64_t kTimedPollSampleCredit =
+        (GekkoAOT::HW::VI::NativeVI::CpuClockHz / 16000u) + 1u;
+    const std::uint64_t timed_cycles =
+        TakeRealtimeHardwareCycles(kTimedPollSampleCredit, true);
+
+    if (timed_cycles != 0u) {
+      perf_hardware_cycles_total_ += timed_cycles;
+
+      // Keep CPU timers and asynchronous DVD completion moving even if the
+      // generated function never reaches a normal HostRuntime boundary.
+      ServiceDiscCompletion(timed_cycles);
+      AdvanceCpuTimers(timed_cycles);
+
+      si_.AdvanceCycles(timed_cycles);
+      SyncNativeSIInterrupt();
+
+      vi_.AdvanceCycles(timed_cycles);
+      if (vi_.ConsumeInterruptUpdate())
+        SyncNativeVIInterrupt();
+
+      // NativeSI has no per-cycle advance method.  Match the runtime's
+      // existing ~120 Hz host-input cadence and publish a fresh SI sample.
+      static std::uint64_t timed_si_phase = 0u;
+      timed_si_phase += timed_cycles;
+      constexpr std::uint64_t kTimedSiPollCycles =
+          GekkoAOT::HW::VI::NativeVI::CpuClockHz / 120u;
+      if (timed_si_phase >= kTimedSiPollCycles) {
+        timed_si_phase %= kTimedSiPollCycles;
+#if defined(GEKKOAOT_NATIVE_SDL_INPUT)
+        if (native_input_ready_)
+          RefreshNativeInput(true);
+        else {
+          si_.PollNow();
+          SyncNativeSIInterrupt();
+        }
+#else
+        si_.PollNow();
+        SyncNativeSIInterrupt();
+#endif
+      }
+
+      // Nemo's hot loop polls AI from inside one AOT wrapper.  Advancing
+      // these two domains here lets the sample counter / IRQ state change
+      // without waiting for that wrapper to return.
+      dsp_.AdvanceCycles(timed_cycles);
+      ai_.AdvanceCycles(timed_cycles);
+      SyncNativeDSPInterrupt();
+      SyncNativeAIInterrupt();
+
+      static unsigned timed_mmio_logs = 0u;
+      if (!counter && timed_mmio_logs++ < 64u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_TIMED_MMIO_POLL_V203=1 ea=%08x physical=%08x cycles=%llu pc=%08x lr=%08x action=advance-realtime-devices-inside-aot-poll\n",
+                     address, timed_mmio_physical,
+                     static_cast<unsigned long long>(timed_cycles),
+                     cpu_.pc, cpu_.lr);
+      if(counter && runtime_profile_enabled_) {
+        static unsigned counter_samples=0;
+        if(counter_samples++<16u)
+          std::fprintf(stderr,"GEKKOAOT_NATIVE_COUNTER_CLOCK_V318=1 pc=%08x elapsed_cycles=%llu source=host-monotonic within=aot\n",
+            address,static_cast<unsigned long long>(timed_cycles));
+      }
+    }
+  }
+}
+
+void HostRuntime::RecordMmioRead(std::uint32_t address) {
+  ++mmio_reads_;
+  if (address == last_mmio_read_)
+    ++same_mmio_read_streak_;
+  else {
+    last_mmio_read_ = address;
+    same_mmio_read_streak_ = 1;
+  }
+}
+
 std::uint64_t HostRuntime::ExternalRead(CPUState* cpu, std::uint32_t address, std::uint8_t size) {
   if (auto* self = Self(cpu)) {
+    self->CountHostEffect();
+    if (self->runtime_profile_enabled_) {
+      ++self->external_reads_[ExternalClass(address)];
+      self->NoteExternalOther(address, false);
+    }
     std::uint64_t value = 0;
-    if (self->AccessPagedVmem(address, &value, size, false)) return value;
+    const std::uint32_t physical = AddressSpace::ToPhysical(address);
+    const bool flipper_mmio = physical >= 0x0c000000u && physical < 0x0c007000u;
+    // v159: ExternalRead is overwhelmingly Flipper MMIO in retail hot loops.
+    // Once the physical page is in the fixed hardware aperture it cannot alias
+    // MEM1/MEM2, paged VMEM or locked cache, so skip those generic probes.
+    if (!flipper_mmio) {
+      if (self->AccessPagedVmem(address, &value, size, false)) return value;
 
-    // DolRecomp resolves the normal cached/uncached MEM1 aliases directly,
-    // but low physical addresses used by Nintendo's exception/OS code fall
-    // through to the external bus.  Treat any address that the standalone
-    // AddressSpace can actually resolve as RAM before trying hardware MMIO.
-    // This is especially important for the physical OSContext pointer stored
-    // at low-memory 0xC0: first-level vectors run through the RAM executor,
-    // then compiled handlers continue accessing that physical pointer.
-    if (ReadAddressSpaceValue(self->memory_, address, size, &value)) return value;
+      // DolRecomp resolves the normal cached/uncached MEM1 aliases directly,
+      // but low physical addresses used by Nintendo's exception/OS code fall
+      // through to the external bus. Treat any address that the standalone
+      // AddressSpace can actually resolve as RAM before trying hardware MMIO.
+      if (ReadAddressSpaceValue(self->memory_, address, size, &value)) return value;
+    }
+
+    // v161 WGPIPE host batching may defer renderer parsing for a handful of
+    // completed gather lines. Guest reads of CP/PE are ordering points: a
+    // token, draw-done or FIFO status produced by those commands must be
+    // visible before the load completes. VI/AI/etc do not depend on renderer
+    // command consumption and therefore do not force a flush.
+    //
+    // v300: PI reads are not GP progress observations. INTSR/INTMR show the
+    // interrupts already raised (PE events published by the GX worker are
+    // folded in by SyncNativeGXInterrupts) and the CPU-FIFO pointers are host
+    // state. The OS external-interrupt dispatcher reads INTSR on every VI/AI/
+    // DSP/SI interrupt; draining the whole GX queue there stalled the guest
+    // for ~1 ms a few hundred times per second.
+    if (flipper_mmio) {
+      const auto page = physical & 0xfffff000u;
+      if (page == HW::CP::NativeCP::BasePhysical ||
+          page == HW::PE::NativePE::BasePhysical) {
+        (void)self->native_gx_.FlushWrites(GX::HostBridge::SyncReason::MmioRead);
+        self->SyncNativeGXInterrupts();
+      } else if (page == HW::PI::NativePI::BasePhysical) {
+        self->SyncNativeGXInterrupts();
+      }
+    }
 
     // Any access that leaves ordinary MEM1/MEM2 is a timing-visible host
     // boundary.  The in-module superchain checks this epoch after the current
     // native wrapper returns and yields to HostRuntime before chaining again.
     BumpHostReadEpoch(cpu);
 
+    // v203: a compiled PPC function can contain an entire MMIO polling loop.
+    // In that case the wrapper never returns to AdvanceRuntimeCycles(), so the
+    // realtime device the guest is waiting for never advances.  Nemo hits this
+    // on AI sample/status polling; Rayman 3 can sit on SI status polling.
+    //
+    // Sample host time from inside time-driven MMIO loops and advance only the
+    // standalone devices whose state is allowed to change with elapsed time.
+    // TakeRealtimeHardwareCycles() remains the single owner of the host clock,
+    // so the next normal runtime boundary observes only the remaining delta
+    // (no double advancement).
+    const std::uint32_t timed_mmio_physical = AddressSpace::ToPhysical(address);
+    const bool timed_mmio_poll =
+        // VI beam / retrace / interrupt state.
+        (timed_mmio_physical >= 0x0c002000u &&
+         timed_mmio_physical <  0x0c003000u) ||
+        // DSP/ARAM/audio-DMA state.
+        (timed_mmio_physical >= 0x0c005000u &&
+         timed_mmio_physical <  0x0c005100u) ||
+        // DI deferred command completion.
+        (timed_mmio_physical >= 0x0c006000u &&
+         timed_mmio_physical <  0x0c006028u) ||
+        // SI controller/status polling.
+        (timed_mmio_physical >= 0x0c006400u &&
+         timed_mmio_physical <  0x0c006500u) ||
+        // AI control/sample counter/interrupt timing.
+        (timed_mmio_physical >= 0x0c006c00u &&
+         timed_mmio_physical <  0x0c006c10u);
+
+    if (timed_mmio_poll) self->ServiceTimedMmioPoll(address);
+
     // Keep low-cost polling telemetry for black-screen diagnosis.  A tight
     // SDK hardware wait is valid guest code, so never terminate it here; the
     // final run result merely reports which MMIO register dominated the tail.
-    ++self->mmio_reads_;
-    if (address == self->last_mmio_read_)
-      ++self->same_mmio_read_streak_;
-    else {
-      self->last_mmio_read_ = address;
-      self->same_mmio_read_streak_ = 1;
-    }
+    self->RecordMmioRead(address);
 
-    if (self->lc_.Read(address, size, &value)) return value;
-    if (self->cp_.Read(address, size, &value)) {
-      self->SyncNativeCPInterrupt();
-      return value;
+    if (!flipper_mmio && self->lc_.Read(address, size, &value)) return value;
+
+    // v159: Flipper MMIO blocks are non-overlapping fixed physical windows.
+    // The old generic path asked every device whether it owned each address,
+    // which turned hot CP/VI/PI polling into 6-10 range checks plus calls per
+    // guest load. Decode the 4 KiB hardware page once and only enter the owner.
+    switch (physical & 0xfffff000u) {
+    case HW::CP::NativeCP::BasePhysical:
+      if (self->cp_.Read(address, size, &value)) {
+        self->SyncNativeCPInterrupt();
+        return value;
+      }
+      break;
+    case HW::PE::NativePE::BasePhysical:
+      // SDK IRQ handlers consume a single notification before acknowledging
+      // it. Repeated token polling with EE disabled instead observes the
+      // renderer's latest register, without requiring interrupt delivery.
+      if (physical == 0x0c00100eu && self->same_mmio_read_streak_ > 1u &&
+          !(cpu->msr & kPpcMsrEe) && !self->pe_notification_irq_active_)
+        self->SyncNativeGXInterrupts(true);
+      if (physical >= 0x0c001010u && physical <= 0x0c001016u &&
+          ((size == 2u && (physical & 1u) == 0u) ||
+           (size == 4u && (physical & 3u) == 0u))) {
+        std::array<std::uint16_t, 4> bounds;
+        if (self->native_gx_.ReadBoundingBox(&bounds)) self->pe_.SetBoundingBox(bounds);
+      }
+      if (self->pe_.Read(address, size, &value)) {
+        static const bool trace_pe=RuntimeEnvBool("GEKKOAOT_TRACE_PE",false);
+        static unsigned reads=0;
+        if(trace_pe&&physical==0x0c00100eu&&reads++<64u)
+          std::fprintf(stderr,"GEKKOAOT_TRACE_PE event=read-token value=%llx pc=%08x lr=%08x\n",static_cast<unsigned long long>(value),cpu->pc,cpu->lr);
+        self->SyncNativePEInterrupts();
+        return value;
+      }
+      break;
+    case HW::VI::NativeVI::BasePhysical:
+      if (self->vi_.Read(address, size, &value)) return value;
+      break;
+    case HW::PI::NativePI::BasePhysical:
+      if (self->pi_.Read(address, size, &value)) return value;
+      break;
+    case HW::MI::NativeMI::BasePhysical:
+      if (self->mi_.Read(address, size, &value)) return value;
+      break;
+    case DSP::NativeDSP::BasePhysical:
+      if (self->dsp_.Read(address, size, &value)) {
+        self->SyncNativeDSPInterrupt();
+        return value;
+      }
+      break;
+    case 0x0c006000u:
+      // DI/SI/EXI/AI share the final Flipper MMIO page but occupy disjoint
+      // sub-windows. Use the high byte within the page as a second-level key.
+      switch (physical & 0x00000f00u) {
+      case 0x000u:
+        if (self->di_.Read(address, size, &value)) {
+          self->SyncNativeDIInterrupt();
+          return value;
+        }
+        break;
+      case 0x400u:
+        if (self->si_.Read(address, size, &value)) {
+          self->SyncNativeSIInterrupt();
+          return value;
+        }
+        break;
+      case 0x800u:
+        if (self->exi_.ReadRegister(address, size, &value)) {
+          self->SyncNativeEXIInterrupt();
+          return value;
+        }
+        break;
+      case 0xc00u:
+        if (self->ai_.Read(address, size, &value)) {
+          self->SyncNativeAIInterrupt();
+          return value;
+        }
+        break;
+      default:
+        break;
+      }
+      break;
+    default:
+      break;
     }
-    if (self->pe_.Read(address, size, &value)) {
-      self->SyncNativePEInterrupts();
-      return value;
-    }
-    if (self->pi_.Read(address, size, &value)) return value;
-    if (self->mi_.Read(address, size, &value)) return value;
-    if (self->vi_.Read(address, size, &value)) return value;
-    if (self->ai_.Read(address, size, &value)) {
-      self->SyncNativeAIInterrupt();
-      return value;
-    }
-    if (self->di_.Read(address, size, &value)) {
-      self->SyncNativeDIInterrupt();
-      return value;
-    }
-    if (self->exi_.ReadRegister(address, size, &value)) {
-      self->SyncNativeEXIInterrupt();
-      return value;
-    }
-    if (self->si_.Read(address, size, &value)) {
-      self->SyncNativeSIInterrupt();
-      return value;
-    }
-    if (self->dsp_.Read(address, size, &value)) {
-      self->SyncNativeDSPInterrupt();
-      return value;
-    }
-    const std::uint32_t physical = AddressSpace::ToPhysical(address);
     if (physical >= 0x08000000u && physical < 0x0c000000u) {
       // CPU-visible EFB aperture, matching the Flipper/Dolphin address layout:
       //   x = (addr & 0xfff) >> 2, y = (addr >> 12) & 0x3ff
@@ -1889,39 +2912,170 @@ bool HostRuntime::ConsumeGpuFifoBurst(void* user, std::uint32_t address) {
   return true;
 }
 
+bool HostRuntime::ConsumeGpuFifoBurstBatch(void* user, std::uint32_t address,
+                                               std::uint32_t burst_count) {
+  auto* self = static_cast<HostRuntime*>(user);
+  if (!self || burst_count == 0u) return false;
+  if (!self->native_gx_.Ready()) return true;
+
+  // v161: NativeCP guarantees that a batch never crosses the guest FIFO wrap
+  // point and is never used while a CP breakpoint is active.  That makes the
+  // corresponding MEM1 span contiguous and lets the renderer consume up to
+  // 4096 bytes with one DSO transition / parser entry instead of one per line.
+  constexpr std::uint32_t kBurstBytes = 32u;
+  constexpr std::uint32_t kMaxBatchBursts = 128u;
+  const std::uint32_t count = std::min(burst_count, kMaxBatchBursts);
+  const std::uint32_t bytes_count = count * kBurstBytes;
+  const auto* bytes = self->memory_.Resolve(address, bytes_count);
+  if (!bytes || !self->native_gx_.WriteBurst(bytes, bytes_count, self->cpu_.pc)) {
+    self->SetFault(FaultKind::MmioWrite, address, bytes_count);
+    return false;
+  }
+  return true;
+}
+
 bool HostRuntime::QueueGpuFifoGather(std::uint64_t value, std::uint8_t size,
                                      std::uint32_t guest_pc) {
   if (size != 1u && size != 2u && size != 4u && size != 8u) return false;
   if (!native_gx_.Ready()) return false;
   if (gpu_fifo_gather_size_ == 0u) gpu_fifo_first_pc_ = guest_pc;
 
+  // v172: backend-neutral WGPIPE append fast path. Only consume a store when it
+  // is guaranteed to remain strictly inside the current 32-byte gather line.
+  // The store that completes a line (or could straddle it) always falls through
+  // to the original path below, preserving PI/CP visibility, breakpoints, burst
+  // accounting, renderer submission and host-write epoch semantics exactly.
+  if (fast_wgpipe_enabled_) {
+    const std::size_t room = gpu_fifo_gather_.size() - gpu_fifo_gather_size_;
+    if (size == 4u && room > 4u) {
+      auto* out = gpu_fifo_gather_.data() + gpu_fifo_gather_size_;
+      const auto word = static_cast<std::uint32_t>(value);
+      out[0] = static_cast<std::uint8_t>(word >> 24u);
+      out[1] = static_cast<std::uint8_t>(word >> 16u);
+      out[2] = static_cast<std::uint8_t>(word >> 8u);
+      out[3] = static_cast<std::uint8_t>(word);
+      gpu_fifo_gather_size_ += 4u;
+      return true;
+    }
+    if (size == 8u && room > 8u) {
+      auto* out = gpu_fifo_gather_.data() + gpu_fifo_gather_size_;
+      out[0] = static_cast<std::uint8_t>(value >> 56u);
+      out[1] = static_cast<std::uint8_t>(value >> 48u);
+      out[2] = static_cast<std::uint8_t>(value >> 40u);
+      out[3] = static_cast<std::uint8_t>(value >> 32u);
+      out[4] = static_cast<std::uint8_t>(value >> 24u);
+      out[5] = static_cast<std::uint8_t>(value >> 16u);
+      out[6] = static_cast<std::uint8_t>(value >> 8u);
+      out[7] = static_cast<std::uint8_t>(value);
+      gpu_fifo_gather_size_ += 8u;
+      return true;
+    }
+  }
+
   // Materialize the big-endian store once, then copy contiguous spans into the
   // 32-byte gather line. This removes the branch/shift/store loop from the
   // common 32/64-bit WGPIPE path while preserving line-straddling stores.
   std::uint8_t ordered[8];
-  for (std::uint8_t i = 0; i < size; ++i)
-    ordered[i] = static_cast<std::uint8_t>(value >> ((size - 1u - i) * 8u));
+  // v159: 32-bit WGPIPE stores dominate retail GX traffic. Avoid the generic
+  // shift loop on that path; the compiler can fold these fixed shifts into one
+  // register sequence and the following memcpy becomes a single 32-bit store.
+  if (size == 4u) {
+    const auto word = static_cast<std::uint32_t>(value);
+    ordered[0] = static_cast<std::uint8_t>(word >> 24u);
+    ordered[1] = static_cast<std::uint8_t>(word >> 16u);
+    ordered[2] = static_cast<std::uint8_t>(word >> 8u);
+    ordered[3] = static_cast<std::uint8_t>(word);
+  } else if (size == 8u) {
+    ordered[0] = static_cast<std::uint8_t>(value >> 56u);
+    ordered[1] = static_cast<std::uint8_t>(value >> 48u);
+    ordered[2] = static_cast<std::uint8_t>(value >> 40u);
+    ordered[3] = static_cast<std::uint8_t>(value >> 32u);
+    ordered[4] = static_cast<std::uint8_t>(value >> 24u);
+    ordered[5] = static_cast<std::uint8_t>(value >> 16u);
+    ordered[6] = static_cast<std::uint8_t>(value >> 8u);
+    ordered[7] = static_cast<std::uint8_t>(value);
+  } else if (size == 2u) {
+    ordered[0] = static_cast<std::uint8_t>(value >> 8u);
+    ordered[1] = static_cast<std::uint8_t>(value);
+  } else {
+    ordered[0] = static_cast<std::uint8_t>(value);
+  }
 
-  std::uint8_t consumed = 0u;
+  return QueueGpuFifoBytes(ordered,size,guest_pc);
+}
+
+bool HostRuntime::QueueGpuFifoBytes(const std::uint8_t* ordered,std::size_t size,
+                                    std::uint32_t guest_pc) {
+  if (!ordered || !size || !native_gx_.Ready()) return false;
+  if (gpu_fifo_gather_size_ == 0u) gpu_fifo_first_pc_ = guest_pc;
+  std::size_t consumed = 0u;
   while (consumed < size) {
     const std::size_t room = gpu_fifo_gather_.size() - gpu_fifo_gather_size_;
     const std::size_t chunk = std::min<std::size_t>(room, size - consumed);
     std::memcpy(gpu_fifo_gather_.data() + gpu_fifo_gather_size_, ordered + consumed, chunk);
     gpu_fifo_gather_size_ += static_cast<std::uint32_t>(chunk);
-    consumed += static_cast<std::uint8_t>(chunk);
+    consumed += chunk;
     if (gpu_fifo_gather_size_ != gpu_fifo_gather_.size()) continue;
 
     if (pi_.FifoBase() != 0u || pi_.FifoEnd() != 0u) {
       const auto destination = pi_.FifoWritePointer();
+      if (cp_.GPLinkEnabled() && cp_.FifoEnd() >= cp_.FifoBase() &&
+          cp_.FifoReadWriteDistance() >= cp_.FifoEnd() - cp_.FifoBase() + 32u &&
+          debug_fifo_overrun_) {
+        std::fprintf(stderr,
+                     "GEKKOAOT_FIFO_OVERRUN pc=%08x msr=%08x read=%08x write=%08x "
+                     "distance=%08x control=%04x status=%04x pi_cause=%08x pi_mask=%08x "
+                     "pe_token=%04x action=stop-before-overwrite\n",
+                     guest_pc, cpu_.msr, cp_.FifoReadPointer(), destination,
+                     cp_.FifoReadWriteDistance(), unsigned(cp_.Control()), unsigned(cp_.Status()),
+                     pi_.InterruptCauseValue(), pi_.InterruptMaskValue(), unsigned(pe_.Token()));
+        gpu_fifo_gather_size_ = 0u;
+        SetFault(FaultKind::MmioWrite, destination, 32u);
+        return true;
+      }
       auto* bytes = memory_.Resolve(destination, gpu_fifo_gather_.size());
       if (!bytes) {
         gpu_fifo_gather_size_ = 0u;
         SetFault(FaultKind::MmioWrite, destination, 32u);
         return true;
       }
+      const bool direct_cp = GekkoAOT::NativeHW::CP::CanDirectSubmit(
+          native_hw_.CP(), native_gx_.Ready(), cp_.GPLinkEnabled(), cp_.GPReadEnabled(),
+          cp_.BreakpointActiveForHost() || cp_.RegisterDrainPending(), cp_.FifoReadWriteDistance(),
+          cp_.FifoReadPointer() == cp_.FifoWritePointer());
+
+      // Keep the guest FIFO mirror exact even on the direct path. That makes
+      // GX diagnostics/display-list tools and unusual guest reads observe the
+      // same RAM bytes while avoiding the normal write->resolve->read callback
+      // round trip into Aurora for the overwhelmingly common empty-FIFO case.
       std::memcpy(bytes, gpu_fifo_gather_.data(), gpu_fifo_gather_.size());
       pi_.AdvanceCpuFifoWritePointer();
-      if (cp_.NotifyGatherWrite(32u)) SyncNativeCPInterrupt();
+
+      if (direct_cp) {
+        if (!native_gx_.WriteBurst(gpu_fifo_gather_.data(), 32u, gpu_fifo_first_pc_)) {
+          gpu_fifo_gather_size_ = 0u;
+          SetFault(FaultKind::MmioWrite, destination, 32u);
+          return true;
+        }
+        if (!cp_.NotifyDirectGatherWrite(32u)) {
+          // State changed between policy evaluation and accounting. This is a
+          // single-threaded guest boundary, but fail closed rather than silently
+          // desynchronizing CP. The exact path handles the next gather line.
+          SetFault(FaultKind::MmioWrite, destination, 32u);
+          gpu_fifo_gather_size_ = 0u;
+          return true;
+        }
+        SyncNativeCPInterrupt();
+        static bool direct_cp_logged = false;
+        if (!direct_cp_logged) {
+          direct_cp_logged = true;
+          std::fprintf(stderr,
+                       "GEKKOAOT_NATIVE_HW_CP_DIRECT_V2=1 mode=wgpipe->aurora mirror=guest-fifo fallback=backlog+breakpoint\n");
+        }
+      } else if (cp_.NotifyGatherWrite(32u)) {
+        SyncNativeCPInterrupt();
+        if (cp_.BreakpointActiveForHost()) (void)native_gx_.FlushWrites();
+      }
     } else {
       if (!native_gx_.WriteBurst(gpu_fifo_gather_.data(), 32u, gpu_fifo_first_pc_)) {
         gpu_fifo_gather_size_ = 0u;
@@ -1941,15 +3095,148 @@ bool HostRuntime::QueueGpuFifoGather(std::uint64_t value, std::uint8_t size,
   return true;
 }
 
+#if defined(_MSC_VER)
+__forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline)) inline
+#endif
+bool HostRuntime::TryGatherPartial(std::uint64_t value, std::uint8_t size, std::uint32_t pc) {
+  if (!fast_wgpipe_enabled_ || !native_gx_.Ready() || cpu_fifo_gather_size_ != 0u ||
+      !CpuFifoTargetsGpu() ||
+      (size != 1u && size != 2u && size != 4u && size != 8u) ||
+      gpu_fifo_gather_size_ + size >= gpu_fifo_gather_.size() ||
+      (size == 4u && (value == 0xc274d554u ||
+                     (pc == 0x800228c0u && value == 0x80000000u))))
+    return false;
+  if (gpu_fifo_gather_size_ == 0u) gpu_fifo_first_pc_ = pc;
+  auto* out = gpu_fifo_gather_.data() + gpu_fifo_gather_size_;
+  switch (size) {
+  case 1u:
+    out[0] = static_cast<std::uint8_t>(value);
+    break;
+  case 2u:
+    out[0] = static_cast<std::uint8_t>(value >> 8u);
+    out[1] = static_cast<std::uint8_t>(value);
+    break;
+  case 4u:
+    out[0] = static_cast<std::uint8_t>(value >> 24u);
+    out[1] = static_cast<std::uint8_t>(value >> 16u);
+    out[2] = static_cast<std::uint8_t>(value >> 8u);
+    out[3] = static_cast<std::uint8_t>(value);
+    break;
+  case 8u:
+    out[0] = static_cast<std::uint8_t>(value >> 56u);
+    out[1] = static_cast<std::uint8_t>(value >> 48u);
+    out[2] = static_cast<std::uint8_t>(value >> 40u);
+    out[3] = static_cast<std::uint8_t>(value >> 32u);
+    out[4] = static_cast<std::uint8_t>(value >> 24u);
+    out[5] = static_cast<std::uint8_t>(value >> 16u);
+    out[6] = static_cast<std::uint8_t>(value >> 8u);
+    out[7] = static_cast<std::uint8_t>(value);
+    break;
+  }
+  gpu_fifo_gather_size_ += size;
+  return true;
+}
+
+bool HostRuntime::QueueSdkFifoPacket(const std::uint8_t* bytes,std::size_t size) {
+  if (!native_gx_.Ready() || !bytes || size==0u || size>53u) return false;
+  ++native_sdk_gx_packets_;
+  const auto bump_lines=[&](std::uint64_t before,std::uint64_t after) {
+    while (before++<after) BumpHostWriteEpoch(&cpu_);
+  };
+  if (!CpuFifoTargetsGpu()) {
+    for (std::size_t off=0;off<size;) {
+      const auto remaining=size-off;
+      const std::uint8_t chunk=remaining>=8u?8u:remaining>=4u?4u:remaining>=2u?2u:1u;
+      std::uint64_t word=0u;
+      for (unsigned i=0;i<chunk;++i) word=(word<<8u)|bytes[off+i];
+      const auto before=cpu_fifo_capture_bursts_;
+      if (!CaptureWriteGatherToCpuFifo(word,chunk)) return false;
+      bump_lines(before,cpu_fifo_capture_bursts_);
+      if (fault_.kind!=FaultKind::None) return false;
+      off+=chunk;
+    }
+    return true;
+  }
+  if (cpu_fifo_gather_size_) {
+    if (gpu_fifo_gather_size_) {
+      SetFault(FaultKind::MmioWrite,0xcc008000u,cpu_fifo_gather_size_);return false;
+    }
+    std::copy_n(cpu_fifo_gather_.begin(),cpu_fifo_gather_size_,gpu_fifo_gather_.begin());
+    gpu_fifo_gather_size_=cpu_fifo_gather_size_;gpu_fifo_first_pc_=cpu_.pc;
+    cpu_fifo_gather_size_=0u;
+  }
+  const auto before=gpu_fifo_bursts_;
+  const auto accepted=QueueGpuFifoBytes(bytes,size,cpu_.pc);
+  bump_lines(before,gpu_fifo_bursts_);
+  return accepted && fault_.kind==FaultKind::None;
+}
+
+const GekkoAOTNativeWgpipeTry& HostRuntime::NativeWgpipeTryServices() {
+  static const GekkoAOTNativeWgpipeTry services{
+      1u, sizeof(GekkoAOTNativeWgpipeTry), NativeTryWgpipeWrite};
+  return services;
+}
+
+std::uint32_t HostRuntime::NativeTryWgpipeWrite(CPUState* cpu, std::uint32_t address,
+    std::uint64_t value, std::uint8_t size, std::uint32_t pc) {
+  auto* self = Self(cpu);
+  if (self) self->CountHostEffect();
+  if (!self || cpu->exception != 0u ||
+      !GekkoAOT::GX::HostBridge::IsWriteGatherPipe(address)) return 0u;
+  // Only owner and pending-exception fields are read; there is no state publication.
+  // In particular the current instruction's PC is an explicit argument.
+  return self->TryGatherPartial(value, size, pc) ? 1u : 0u;
+}
+
+template<bool ProvenWgpipe>
+void HostRuntime::WriteGatherOrExternal(CPUState* cpu, std::uint32_t address, std::uint64_t value,
+                                      std::uint8_t size) {
+  auto* self = Self(cpu);
+  if (self) self->CountHostEffect();
+  if (self && (ProvenWgpipe || GekkoAOT::GX::HostBridge::IsWriteGatherPipe(address)) &&
+      self->TryGatherPartial(value, size, cpu->pc)) return;
+  ExternalWriteSlow(cpu, address, value, size);
+}
+
 void HostRuntime::ExternalWrite(CPUState* cpu, std::uint32_t address, std::uint64_t value,
                                 std::uint8_t size) {
+  WriteGatherOrExternal<false>(cpu, address, value, size);
+}
+
+void HostRuntime::NativeWgpipeWrite(CPUState* cpu, std::uint32_t address,
+                                    std::uint64_t value, std::uint8_t size) {
+  // The LLVM proof admits only scalar stores in the fixed WG aperture.
+  // Queue completion, RAM display-list capture and IRQ restart use the exact
+  // slow path. No paired-store atomicity or quantisation is assumed here.
+  WriteGatherOrExternal<true>(cpu, address, value, size);
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+void HostRuntime::ExternalWriteSlow(CPUState* cpu, std::uint32_t address, std::uint64_t value,
+                                std::uint8_t size) {
   if (auto* self = Self(cpu)) {
+    if (self->runtime_profile_enabled_) {
+      ++self->external_writes_[ExternalClass(address)];
+      self->NoteExternalOther(address, true);
+    }
     // v136b hot path: WGPIPE is a fixed MMIO aperture and cannot alias MEM1,
     // MEM2, paged VMEM or locked cache. Most draw-heavy ExternalWrite calls
     // land here, so handle it before generic address-space probes.
     // Partial lines remain inside the native superchain; only a complete
     // 32-byte gather line becomes a host-visible CP/GPU boundary.
     if (GekkoAOT::GX::HostBridge::IsWriteGatherPipe(address)) {
+      // The generated memory-service boundary has materialized the current
+      // instruction and all dirty state. Exit BEFORE accepting any bytes so
+      // RFI retries exactly this store, retaining the partial physical gather.
+      if (self->fifo_irq_fence_enabled_ &&
+          self->cp_.FifoReadWriteDistance() > self->cp_.FifoHiWatermark() &&
+          self->TryTakeFifoWriteInterrupt()) return;
       if (size == 4u && value == 0xc274d554u &&
           std::getenv("GEKKOAOT_GX_DIAG_GLYPH_PC"))
         std::fprintf(stderr, "GEKKOAOT_GX_DIAG_GLYPH_PC pc=%08x value=%08llx gather=%u pi_write=%08x\n",
@@ -2010,6 +3297,55 @@ void HostRuntime::ExternalWrite(CPUState* cpu, std::uint32_t address, std::uint6
         self->cpu_fifo_gather_size_ = 0u;
       }
 
+      // v184: the overwhelmingly common retail GX store is a 32-bit WGPIPE
+      // write that does not complete the current 32-byte gather line. Keep
+      // that partial-line case in this already-hot ExternalWrite path instead
+      // of entering the much larger QueueGpuFifoGather() helper. The store
+      // that completes the line still uses the authoritative helper below, so
+      // PI/CP visibility, host-write epochs, breakpoints and renderer ordering
+      // remain byte-for-byte identical.
+      if (self->fast_wgpipe_enabled_ && self->native_gx_.Ready() &&
+          (size == 1u || size == 2u || size == 4u || size == 8u)) {
+        const std::size_t room =
+            self->gpu_fifo_gather_.size() - self->gpu_fifo_gather_size_;
+        if (room > size) {
+          if (self->gpu_fifo_gather_size_ == 0u) self->gpu_fifo_first_pc_ = cpu->pc;
+          auto* out = self->gpu_fifo_gather_.data() + self->gpu_fifo_gather_size_;
+          // v219: CoD Finest Hour's hottest renderer loop uses `sth` to the
+          // write-gather pipe.  The old v184 shortcut only covered 32-bit
+          // writes, sending every 8/16/64-bit partial store through the larger
+          // QueueGpuFifoGather() path. Keep each scalar width branchless after
+          // selection so the existing 32-bit path does not regress.
+          switch (size) {
+          case 1u:
+            out[0] = static_cast<std::uint8_t>(value);
+            break;
+          case 2u:
+            out[0] = static_cast<std::uint8_t>(value >> 8u);
+            out[1] = static_cast<std::uint8_t>(value);
+            break;
+          case 4u:
+            out[0] = static_cast<std::uint8_t>(value >> 24u);
+            out[1] = static_cast<std::uint8_t>(value >> 16u);
+            out[2] = static_cast<std::uint8_t>(value >> 8u);
+            out[3] = static_cast<std::uint8_t>(value);
+            break;
+          case 8u:
+            out[0] = static_cast<std::uint8_t>(value >> 56u);
+            out[1] = static_cast<std::uint8_t>(value >> 48u);
+            out[2] = static_cast<std::uint8_t>(value >> 40u);
+            out[3] = static_cast<std::uint8_t>(value >> 32u);
+            out[4] = static_cast<std::uint8_t>(value >> 24u);
+            out[5] = static_cast<std::uint8_t>(value >> 16u);
+            out[6] = static_cast<std::uint8_t>(value >> 8u);
+            out[7] = static_cast<std::uint8_t>(value);
+            break;
+          }
+          self->gpu_fifo_gather_size_ += size;
+          return;
+        }
+      }
+
       const std::uint64_t before = self->gpu_fifo_bursts_;
       if (self->QueueGpuFifoGather(value, size, cpu->pc)) {
         // A complete write-gather line is the actual hardware visibility
@@ -2018,65 +3354,125 @@ void HostRuntime::ExternalWrite(CPUState* cpu, std::uint32_t address, std::uint6
         return;
       }
     }
-    if (self->AccessPagedVmem(address, &value, size, true)) return;
-    // See ExternalRead(): compiled OS interrupt handlers may carry physical
-    // MEM1 pointers out of the low-memory vector while address translation is
-    // being restored.  Keep those accesses in RAM instead of misclassifying
-    // them as MMIO writes.
-    if (WriteAddressSpaceValue(self->memory_, address, value, size)) return;
-    if (self->lc_.Write(address, value, size)) {
-      BumpHostWriteEpoch(cpu);
-      return;
+    const std::uint32_t physical = AddressSpace::ToPhysical(address);
+    const bool flipper_mmio = physical >= 0x0c000000u && physical < 0x0c007000u;
+    // v159: fixed Flipper MMIO pages cannot alias guest RAM or locked cache.
+    // Skip three generic mapping probes on every CP/PE/VI/PI/MI/DSP/DI/SI/EXI/AI write.
+    if (!flipper_mmio) {
+      if (self->AccessPagedVmem(address, &value, size, true)) return;
+      // See ExternalRead(): compiled OS interrupt handlers may carry physical
+      // MEM1 pointers out of the low-memory vector while translation is restored.
+      if (WriteAddressSpaceValue(self->memory_, address, value, size)) return;
+      if (self->lc_.Write(address, value, size)) {
+        BumpHostWriteEpoch(cpu);
+        return;
+      }
+    }
+
+    if (flipper_mmio) {
+      const auto page = physical & 0xfffff000u;
+      if (page == HW::CP::NativeCP::BasePhysical ||
+          page == HW::PE::NativePE::BasePhysical ||
+          page == HW::PI::NativePI::BasePhysical) {
+        (void)self->native_gx_.FlushWrites(GX::HostBridge::SyncReason::MmioWrite);
+        self->SyncNativeGXInterrupts();
+      }
     }
 
     BumpHostWriteEpoch(cpu);
-    if (self->cp_.Write(address, value, size)) {
-      self->SyncNativeCPInterrupt();
-      return;
-    }
-    if (self->pe_.Write(address, value, size)) {
-      self->SyncNativePEInterrupts();
-      return;
-    }
-    if (self->pi_.Write(address, value, size)) return;
-    if (self->mi_.Write(address, value, size)) return;
-    if (self->vi_.Write(address, value, size)) {
-      if (self->vi_.ConsumeInterruptUpdate()) self->SyncNativeVIInterrupt();
-      return;
-    }
-    if (self->ai_.Write(address, value, size)) {
-      self->SyncNativeAIInterrupt();
-      return;
-    }
-    if (self->di_.Write(address, value, size)) {
-      if (self->di_async_completion_pending_ &&
-          (self->di_.DMAControl() & 1u) == 0u) {
-        self->di_async_completion_pending_ = false;
-        self->di_async_cycles_remaining_ = 0u;
-        self->di_async_staging_.clear();
-        static unsigned cancel_logs = 0u;
-        if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && cancel_logs++ < 32u)
-          std::fprintf(stderr,
-                       "GEKKOAOT_NATIVE_DI_ASYNC_V98=1 phase=cancel-immediate seq=%llu pc=%08x\n",
-                       static_cast<unsigned long long>(self->di_async_sequence_), cpu->pc);
+    switch (physical & 0xfffff000u) {
+    case HW::CP::NativeCP::BasePhysical:
+      if (self->cp_.Write(address, value, size)) {
+        self->SyncNativeCPInterrupt();
+        return;
       }
-      self->SyncNativeDIInterrupt();
-      return;
+      break;
+    case HW::PE::NativePE::BasePhysical:
+      if (self->pe_.Write(address, value, size)) {
+        self->SyncNativePEInterrupts();
+        return;
+      }
+      break;
+    case HW::VI::NativeVI::BasePhysical:
+      if (self->vi_.Write(address, value, size)) {
+        if (self->vi_.ConsumeInterruptUpdate()) self->SyncNativeVIInterrupt();
+        return;
+      }
+      break;
+    case HW::PI::NativePI::BasePhysical:
+      if (self->pi_.Write(address, value, size)) return;
+      break;
+    case HW::MI::NativeMI::BasePhysical:
+      if (self->mi_.Write(address, value, size)) return;
+      break;
+    case DSP::NativeDSP::BasePhysical:
+      if (self->dsp_.Write(address, value, size)) {
+        self->SyncNativeDSPInterrupt();
+        return;
+      }
+      break;
+    case 0x0c006000u:
+      switch (physical & 0x00000f00u) {
+      case 0x000u:
+        if (self->di_.Write(address, value, size)) {
+          if (self->di_async_completion_pending_ &&
+              (self->di_.DMAControl() & 1u) == 0u) {
+            self->di_async_completion_pending_ = false;
+            self->di_async_cycles_remaining_ = 0u;
+            self->di_async_staging_.clear();
+            static unsigned cancel_logs = 0u;
+            if (EnvTraceDvd() && cancel_logs++ < 32u)
+              std::fprintf(stderr,
+                           "GEKKOAOT_NATIVE_DI_ASYNC_V98=1 phase=cancel-immediate seq=%llu pc=%08x\n",
+                           static_cast<unsigned long long>(self->di_async_sequence_), cpu->pc);
+          }
+          self->SyncNativeDIInterrupt();
+          return;
+        }
+        break;
+      case 0x400u:
+        if (self->si_.Write(address, value, size)) {
+          self->SyncNativeSIInterrupt();
+          return;
+        }
+        break;
+      case 0x800u:
+        if (self->exi_.WriteRegister(address, value, size)) {
+          self->SyncNativeEXIInterrupt();
+          return;
+        }
+        break;
+      case 0xc00u:
+        if (self->ai_.Write(address, value, size)) {
+          self->SyncNativeAIInterrupt();
+          return;
+        }
+        break;
+      default:
+        break;
+      }
+      break;
+    default:
+      break;
     }
-    if (self->exi_.WriteRegister(address, value, size)) {
-      self->SyncNativeEXIInterrupt();
-      return;
-    }
-    if (self->si_.Write(address, value, size)) {
-      self->SyncNativeSIInterrupt();
-      return;
-    }
-    if (self->dsp_.Write(address, value, size)) {
-      self->SyncNativeDSPInterrupt();
-      return;
-    }
-    const std::uint32_t physical = AddressSpace::ToPhysical(address);
     if (physical >= 0x08000000u && physical < 0x0c000000u) {
+      if (size == 4u && (physical & 0x00800000u) == 0u &&
+          self->native_gx_.Ready()) {
+        const auto x = static_cast<std::uint16_t>((physical & 0xfffu) >> 2u);
+        const auto y = static_cast<std::uint16_t>((physical >> 12u) & 0x3ffu);
+        if (self->native_gx_.PokeEfb(x, y, static_cast<std::uint32_t>(value),
+                                     (physical & 0x00400000u) != 0u)) {
+          static unsigned efb_poke_logs = 0u;
+          if (efb_poke_logs++ < 16u)
+            std::fprintf(stderr,
+                         "GEKKOAOT_EFB_POKE_V164=1 ea=%08x x=%u y=%u depth=%u value=%08x pc=%08x\n",
+                         address, unsigned(x), unsigned(y),
+                         (physical & 0x00400000u) != 0u ? 1u : 0u,
+                         static_cast<std::uint32_t>(value), cpu->pc);
+          BumpHostWriteEpoch(cpu);
+          return;
+        }
+      }
       static unsigned efb_write_logs = 0;
       if (efb_write_logs++ < 32u)
         std::fprintf(stderr,
@@ -2123,6 +3519,7 @@ void HostRuntime::InstructionFallback(CPUState* cpu, std::uint32_t instruction,
                                       std::uint32_t address) {
   auto* self = Self(cpu);
   if (!self) return;
+  self->CountHostEffect();
 
   // Keep the standalone fallback useful as a correctness safety net for AOT
   // backends that emitted ppc_fallback_instruction() for floating-point memory
@@ -2305,7 +3702,39 @@ void HostRuntime::InstructionFallback(CPUState* cpu, std::uint32_t instruction,
   self->SetFault(FaultKind::InstructionFallback, address, instruction);
 }
 
+void HostRuntime::RegisterNativeHookCodeProof(std::uint32_t address) {
+  native_hook_code_proofs_.erase(address);
+  const auto* descriptor = module_.Descriptor();
+  std::uint32_t chunk = 0u;
+  if (!descriptor || !descriptor->chunk_hashes ||
+      !FindModuleChunk(descriptor, address, &chunk) ||
+      descriptor->chunk_hashes[chunk] == 0u) return;
+  const auto range = descriptor->chunk_ranges[chunk];
+  native_hook_code_proofs_[address] = {range.start, range.end,
+                                     descriptor->chunk_hashes[chunk], 0u, false};
+}
+
+bool HostRuntime::NativeHookCodeMatches(std::uint32_t address) {
+  if (!has_fixed_secondary_modules_) return true;
+  const auto found = native_hook_code_proofs_.find(address);
+  if (found == native_hook_code_proofs_.end()) return true;
+  auto& proof = found->second;
+  if (proof.epoch != fixed_exec_route_epoch_) {
+    const auto size = static_cast<std::size_t>(proof.end - proof.start);
+    const auto* bytes = memory_.Resolve(proof.start, size);
+    proof.active = bytes && Fnv1a64(bytes, size) == proof.hash;
+    proof.epoch = fixed_exec_route_epoch_;
+    static unsigned stale_hook_logs = 0u;
+    if (!proof.active && stale_hook_logs++ < 16u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_OVERLAY_HLE_CODE_PROOF=1 address=%08x active=0 reason=bootstrap-code-replaced\n",
+                   address);
+  }
+  return proof.active;
+}
+
 void HostRuntime::RebuildNativeInterceptIndex() {
+  native_region_probe_cache_.fill({});
   native_intercepts_.clear();
   native_intercepts_.reserve(os_hooks_.size() + simple_hle_hooks_.size());
   for (const auto& [address, _] : os_hooks_) native_intercepts_.push_back(address);
@@ -2317,6 +3746,12 @@ void HostRuntime::RebuildNativeInterceptIndex() {
 
 bool HostRuntime::DispatchOsHle(GekkoAOT::NativeOS::Kind kind, std::uint32_t address) {
   ++hle_calls_;
+  ++os_hle_kind_calls_[static_cast<std::size_t>(kind) & 63u];
+  static const bool trace_os_hle = RuntimeEnvBool("GEKKOAOT_TRACE_OS_HLE", false);
+  if (trace_os_hle && (hle_calls_ <= 64u || (hle_calls_ & (hle_calls_ - 1u)) == 0u))
+    std::fprintf(stderr, "GEKKOAOT_OS_HLE_ENTRY calls=%llu kind=%u address=%08x pc=%08x lr=%08x msr=%08x\n",
+                 static_cast<unsigned long long>(hle_calls_), static_cast<unsigned>(kind),
+                 address, cpu_.pc, cpu_.lr, cpu_.msr);
 
   // GEKKOAOT_NATIVE_OS_INTERRUPT_ENTRY_FENCE_V149:
   // A statically lowered NativeOS leaf can be entered from inside a compiled
@@ -2347,63 +3782,744 @@ bool HostRuntime::DispatchOsHle(GekkoAOT::NativeOS::Kind kind, std::uint32_t add
     return true;
   }
 
+  // v320: OSInitThreadQueue is two plain stores, and byte-identical game
+  // leaves exist (HPPOA initializes its own lists in paged VM through such a
+  // leaf). The native service rejects a pointer it cannot resolve before
+  // modifying anything, so run the original compiled body for exactly this
+  // call (one-shot region-probe admission) instead of failing the game.
+  if (kind == GekkoAOT::NativeOS::Kind::InitThreadQueue && cpu_.exception == 0u &&
+      cpu_.pc == address) {
+    hle_decline_entry_ = address;
+    ++hle_guest_declines_;
+    return false;
+  }
+
   // Native mode is fail-closed: there is no guest/Dolphin scheduler fallback.
   // Blocking with an empty run queue is handled by NativeOS::EnterIdle(); a
   // false return now means a genuine native scheduler/ABI failure.
+  std::fprintf(stderr,
+               "GEKKOAOT_OS_HLE_FAILURE kind=%u entry=%08x pc=%08x lr=%08x "
+               "r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x r9=%08x\n",
+               static_cast<unsigned>(kind), address, cpu_.pc, cpu_.lr,
+               cpu_.gpr[3], cpu_.gpr[4], cpu_.gpr[5], cpu_.gpr[6],
+               cpu_.gpr[7], cpu_.gpr[8], cpu_.gpr[9]);
   SetFault(FaultKind::HleFailure, address);
   return false;
 }
 
+HostRuntime::GuestRangeStatus HostRuntime::TranslateGuestRange(
+    std::uint32_t address, std::uint32_t size, bool write, std::vector<GuestSpan>& spans) {
+  spans.clear();
+  if (size == 0u) return GuestRangeStatus::Ok;
+  if (std::uint64_t(address) + size > 0x100000000ull) return GuestRangeStatus::Invalid;
+  std::uint32_t done = 0u;
+  while (done < size) {
+    const std::uint32_t ea = address + done;
+    const std::uint32_t remaining = size - done;
+    if (memory_.PagedVmem() && AddressSpace::IsVmem(ea)) {
+      const auto translation = TranslateVmemAddress(ea, write);
+      // v301: report, never raise -- the caller declines to the guest code,
+      // which takes the architectural DSI itself at the exact access.
+      if (translation.status != PageTranslation::Status::Mapped)
+        return GuestRangeStatus::NotResident;
+      const std::uint32_t bytes = std::min<std::uint32_t>(0x1000u - (ea & 0xfffu), remaining);
+      if (translation.physical >= memory_.Mem1().size() ||
+          bytes > memory_.Mem1().size() - translation.physical)
+        return GuestRangeStatus::Invalid;
+      spans.push_back({memory_.Mem1().data() + translation.physical, bytes});
+      done += bytes;
+      continue;
+    }
+    const std::size_t available = memory_.ContiguousAvailable(ea);
+    if (available == 0u) return GuestRangeStatus::Invalid;
+    const auto bytes = static_cast<std::uint32_t>(std::min<std::size_t>(remaining, available));
+    auto* host = memory_.Resolve(ea, bytes);
+    if (!host) return GuestRangeStatus::Invalid;
+    spans.push_back({host, bytes});
+    done += bytes;
+  }
+  return GuestRangeStatus::Ok;
+}
+
 bool HostRuntime::DispatchSimpleHle(SimpleHleKind kind, std::uint32_t address) {
+  if ((DisabledSimpleServices() >> static_cast<unsigned>(kind)) & 1u) {
+    hle_decline_entry_ = address;  // admit the guest body once (see probe)
+    ++hle_guest_declines_;
+    return false;
+  }
   ++hle_calls_;
+  ++simple_hle_kind_calls_[static_cast<std::size_t>(kind)];
   const auto finish=[&]() { cpu_.pc=cpu_.lr; return true; };
-  const auto pointer=[&](std::uint32_t guest,std::uint32_t size)->std::uint8_t* {
-    static std::uint8_t zero_length_sentinel=0;
-    return size==0 ? &zero_length_sentinel : memory_.Resolve(guest,size);
+  // Simple libc string HLEs may receive pointers in the SDK VM aperture.
+  // AddressSpace::Resolve() intentionally returns nullptr for paged VMEM, so
+  // treating every C string as one host-contiguous span makes valid calls such
+  // as CoD Finest Hour's strpbrk() fail as a native-HLE error. Keep a few
+  // per-dispatch scratch buffers so two-argument string helpers can hold both
+  // translated strings at once. The guest address remains authoritative for
+  // return values; the copied bytes are only a host view of the string.
+  std::array<std::vector<std::uint8_t>,4> c_string_scratch{};
+  std::size_t c_string_scratch_used=0u;
+  bool c_string_not_resident=false;
+  const auto c_string=[&](std::uint32_t guest,const std::uint8_t** data,std::size_t* length)->bool {
+    if(!data||!length)return false;
+    if(memory_.PagedVmem() && AddressSpace::IsVmem(guest)) {
+      if(c_string_scratch_used>=c_string_scratch.size()) return false;
+      auto& copy=c_string_scratch[c_string_scratch_used++];
+      std::uint32_t ea=guest;
+      const std::uint32_t vmem_end=
+          AddressSpace::FakeVmemBase+AddressSpace::RetailFakeVmemSize;
+      while(AddressSpace::IsVmem(ea) && ea<vmem_end) {
+        const auto translation=TranslateVmemAddress(ea,false);
+        if(translation.status!=PageTranslation::Status::Mapped) {
+          c_string_not_resident=true;  // v301: decline to the guest code
+          return false;
+        }
+        const std::uint32_t bytes=std::min<std::uint32_t>(
+            0x1000u-(ea&0xfffu),vmem_end-ea);
+        if(translation.physical>=memory_.Mem1().size() ||
+           bytes>memory_.Mem1().size()-translation.physical) return false;
+        const auto* begin=memory_.Mem1().data()+translation.physical;
+        const auto* end=static_cast<const std::uint8_t*>(std::memchr(begin,0,bytes));
+        copy.insert(copy.end(),begin,end ? end : begin+bytes);
+        if(end) {
+          copy.push_back(0u);
+          *data=copy.data();
+          *length=copy.size()-1u;
+          return true;
+        }
+        ea+=bytes;
+      }
+      return false;
+    }
+    const std::size_t available=memory_.ContiguousAvailable(guest);
+    if(available==0u)return false;
+    const auto* ptr=memory_.Resolve(guest,1u);
+    if(!ptr)return false;
+    const void* end=std::memchr(ptr,0,available);
+    if(!end)return false;
+    *data=ptr;
+    *length=static_cast<const std::uint8_t*>(end)-ptr;
+    return true;
+  };
+  // v301: a paged-VM operand is not resident. Nothing has been modified yet:
+  // admit the original AOT body for exactly this entry once (the generated
+  // static-HLE stub falls through to its region probe when the service
+  // declines) so the guest loop faults page by page with resumable state.
+  const auto decline_to_guest=[&]() -> bool {
+    hle_decline_entry_=address;
+    ++hle_guest_declines_;
+    return false;
+  };
+  const auto string_hle_failure=[&]() -> bool {
+    if(c_string_not_resident) return decline_to_guest();
+    SetFault(FaultKind::HleFailure,address);
+    return false;
+  };
+  // v300: VM-correct memory helpers (TranslateGuestRange).
+  const auto range_failure=[&](GuestRangeStatus status) -> bool {
+    if(status==GuestRangeStatus::NotResident) return decline_to_guest();
+    SetFault(FaultKind::HleFailure,address);
+    return false;
+  };
+  const auto gather=[](const std::vector<GuestSpan>& spans,std::uint8_t* out) {
+    for(const auto& span:spans){std::memcpy(out,span.host,span.length);out+=span.length;}
+  };
+  const auto scatter=[](const std::vector<GuestSpan>& spans,const std::uint8_t* in) {
+    for(const auto& span:spans){std::memmove(span.host,in,span.length);in+=span.length;}
+  };
+  // v301: bounded C-string read with guest access fidelity -- page by page,
+  // never touching a byte past the terminator or the limit. *length excludes
+  // the terminator; *terminated reports whether one was found within limit.
+  // A null buffer only measures.
+  const auto bounded_string=[&](std::uint32_t base,std::uint32_t limit,std::vector<std::uint8_t>* buf,
+                                std::uint32_t* length,bool* terminated)->GuestRangeStatus {
+    if(buf) buf->clear();
+    *length=0u; *terminated=false;
+    auto& span=hle_spans_[0];
+    while(*length<limit) {
+      const std::uint32_t ea=base+*length;
+      const std::uint32_t chunk=std::min<std::uint32_t>(limit-*length,0x1000u-(ea&0xfffu));
+      if(const auto st=TranslateGuestRange(ea,chunk,false,span);st!=GuestRangeStatus::Ok) return st;
+      for(const auto& piece:span) {
+        const auto* zero=static_cast<const std::uint8_t*>(std::memchr(piece.host,0,piece.length));
+        const std::uint32_t take=zero?static_cast<std::uint32_t>(zero-piece.host):piece.length;
+        if(buf) buf->insert(buf->end(),piece.host,piece.host+take);
+        *length+=take;
+        if(zero){*terminated=true;return GuestRangeStatus::Ok;}
+      }
+    }
+    return GuestRangeStatus::Ok;
   };
   switch(kind) {
-  case SimpleHleKind::OsGetTime: return GekkoAOT::Time::GetTime(&cpu_);
-  case SimpleHleKind::OsGetTick: return GekkoAOT::Time::GetTick(&cpu_);
-  case SimpleHleKind::Memcpy: {
-    const std::uint32_t dst_addr=cpu_.gpr[3],src_addr=cpu_.gpr[4],size=cpu_.gpr[5];
-    auto* dst=pointer(dst_addr,size); auto* src=pointer(src_addr,size);
-    if(!dst||!src){SetFault(FaultKind::HleFailure,address);return false;}
-    if(size) std::memcpy(dst,src,size);
-    cpu_.gpr[3]=dst_addr;
+  case SimpleHleKind::GxSetArray: {
+    bool leaf=false;
+    if(!native_sdk_gx_arrays_enabled_ ||
+       !GekkoAOTSdk::ProveGxSetArray(memory_.Resolve(address,140u),140u,&leaf)) return decline_to_guest();
+    std::array<std::uint8_t,12> packet{};
+    if(!GekkoAOTSdk::GxVertexArrayPacket(cpu_.gpr[3],cpu_.gpr[4],cpu_.gpr[5],packet,leaf)) return decline_to_guest();
+    if(!native_gx_.Ready()) return decline_to_guest();
+    const auto index=(cpu_.gpr[3]==25u?10u:cpu_.gpr[3])-9u;
+    const auto stride=cpu_.gpr[5]&0xffu;
+    const auto input_attribute=cpu_.gpr[3],input_base=cpu_.gpr[4];
+    if(TryTakeFifoWriteInterrupt(true)) return true;
+    struct AtomicService {
+      bool& active; bool previous;
+      explicit AtomicService(bool& f):active(f),previous(f){active=true;}
+      ~AtomicService(){active=previous;}
+    } atomic(atomic_fifo_service_);
+    if(native_sdk_gx_packets_enabled_) {
+      // v313: publish a typed host operation at its exact transport position.
+      // The guest FIFO mirror/accounting remain observable; the renderer skips
+      // decoding these two CP commands only after checking the transport and
+      // a complete-command boundary. Backlogged/breakpoint/custom paths retain
+      // their original decoder. No guest pointer or CPUState crosses this ABI.
+      const bool direct = CpuFifoTargetsGpu() &&
+          ((!pi_.FifoBase() && !pi_.FifoEnd()) || GekkoAOT::NativeHW::CP::CanDirectSubmit(
+            native_hw_.CP(), native_gx_.Ready(), cp_.GPLinkEnabled(), cp_.GPReadEnabled(),
+            cp_.BreakpointActiveForHost() || cp_.RegisterDrainPending(), cp_.FifoReadWriteDistance(),
+            cp_.FifoReadPointer() == cp_.FifoWritePointer()));
+      if(direct && native_gx_.HasTypedArrayCommands() &&
+          !native_gx_.StageArrayBinding(index,input_base,stride,cpu_fifo_gather_size_+gpu_fifo_gather_size_)) {
+        SetFault(FaultKind::MmioWrite,0xcc008000u,12u);return false;
+      }
+      if(!QueueSdkFifoPacket(packet.data(),packet.size())) return false;
+    } else {
+      for(unsigned off=0;off<12;off+=6) {
+        ExternalWrite(&cpu_,0xcc008000,packet[off],1);
+        ExternalWrite(&cpu_,0xcc008000,packet[off+1],1);
+        const auto word=(std::uint32_t(packet[off+2])<<24)|(std::uint32_t(packet[off+3])<<16)|
+                        (std::uint32_t(packet[off+4])<<8)|packet[off+5];
+        ExternalWrite(&cpu_,0xcc008000,word,4);
+        if(fault_.kind!=FaultKind::None || cpu_.exception)return false;
+      }
+    }
+    // Preserve even the leaf's volatile register/CR/XER effects. The admitted
+    // vertex path ends at bltlr after its second addic. (index - 12 < 0).
+    if(leaf) {
+      cpu_.gpr[0]=stride;cpu_.gpr[3]=index|0xb0u;cpu_.gpr[4]=input_base&0x3fffffffu;
+      cpu_.gpr[6]=0xcc010000u;cpu_.gpr[7]=8u;
+      cpu_.cr=(cpu_.cr&0x0fffffffu)|(input_attribute==25u?0x20000000u:0x80000000u)|((cpu_.xer&0x80000000u)>>3);
+    } else {
+      cpu_.gpr[0]=index-12u;cpu_.gpr[3]=0xcc010000u;cpu_.gpr[4]=stride;cpu_.gpr[6]=index;
+      cpu_.xer&=~0x20000000u;
+      cpu_.cr=(cpu_.cr&0x0fffffffu)|0x80000000u|((cpu_.xer&0x80000000u)>>3);
+    }
     return finish();
   }
+  case SimpleHleKind::DvdFastOpen: {
+    // Use the SDK's live SDA globals, not a guessed low-memory FST mirror.
+    // All reads/writes are admitted before mutation; paged/invalid/aliased
+    // operands decline to the original resumable AOT body.
+    if (!EnvNativeDvdFst()) return decline_to_guest();
+    const auto proof=GekkoAOTSdk::ProveDvdFastOpen(memory_.Resolve(address,116u),116u);
+    if (!proof) return decline_to_guest();
+    const auto entry=cpu_.gpr[3];
+    if (static_cast<std::int32_t>(entry)<0) {cpu_.gpr[3]=0;return finish();}
+    const auto count_addr=cpu_.gpr[13]+static_cast<std::uint32_t>(proof->count_offset);
+    const auto fst_addr=cpu_.gpr[13]+static_cast<std::uint32_t>(proof->fst_offset);
+    auto read_word=[&](std::uint32_t ea,std::uint32_t& word) {
+      auto& spans=hle_spans_[0];
+      if (TranslateGuestRange(ea,4u,false,spans)!=GuestRangeStatus::Ok) return false;
+      std::array<std::uint8_t,4> bytes{};gather(spans,bytes.data());
+      word=(std::uint32_t(bytes[0])<<24)|(std::uint32_t(bytes[1])<<16)|
+           (std::uint32_t(bytes[2])<<8)|bytes[3];return true;
+    };
+    std::uint32_t count=0,fst=0;
+    if (!read_word(count_addr,count)) return decline_to_guest();
+    if (entry>=count) {cpu_.gpr[3]=0;return finish();}
+    if (!read_word(fst_addr,fst) || entry>(UINT32_MAX-8u)/12u ||
+        fst>UINT32_MAX-entry*12u-8u) return decline_to_guest();
+    const auto item=fst+entry*12u;
+    std::uint32_t name=0,start=0,length=0;
+    if (!read_word(item,name)) return decline_to_guest();
+    if (name&0xff000000u) {cpu_.gpr[3]=0;return finish();}
+    if (!read_word(item+4u,start) || !read_word(item+8u,length)) return decline_to_guest();
+    const auto info=cpu_.gpr[4];
+    if (info>UINT32_MAX-0x3bu) return decline_to_guest();
+    std::array<std::vector<GuestSpan>,3> inputs;
+    for (unsigned i=0;i<3;++i) {
+      const auto src=i==0?count_addr:i==1?fst_addr:item;
+      if (TranslateGuestRange(src,i==2?12u:4u,false,inputs[i])!=GuestRangeStatus::Ok)
+        return decline_to_guest();
+    }
+    constexpr std::array<std::uint32_t,4> offsets{0x30,0x34,0x38,0x0c};
+    const std::array<std::uint32_t,4> values{start,length,0,0};
+    for (std::size_t i=0;i<4;++i) {
+      const auto dst=info+offsets[i];
+      const auto overlaps=[&](std::uint32_t src,std::uint32_t bytes) {
+        return std::uint64_t(dst)<std::uint64_t(src)+bytes && std::uint64_t(src)<std::uint64_t(dst)+4u;
+      };
+      if (overlaps(count_addr,4)||overlaps(fst_addr,4)||overlaps(item,12) ||
+          TranslateGuestRange(dst,4u,true,hle_spans_[i])!=GuestRangeStatus::Ok)
+        return decline_to_guest();
+      // Cached/uncached aliases and translated VM pages can overlap despite
+      // distinct EAs. Preserve the original leaf's write/re-read ordering.
+      for (const auto& out:hle_spans_[i]) {
+        const auto overlaps_host=[&](const GuestSpan& in) {
+          const auto a=reinterpret_cast<std::uintptr_t>(out.host);
+          const auto b=reinterpret_cast<std::uintptr_t>(in.host);
+          return a<b+in.length && b<a+out.length;
+        };
+        for (const auto& input:inputs)
+          for (const auto& in:input) if (overlaps_host(in)) return decline_to_guest();
+        for (std::size_t j=0;j<i;++j)
+          for (const auto& in:hle_spans_[j]) if (overlaps_host(in)) return decline_to_guest();
+      }
+    }
+    for (std::size_t i=0;i<4;++i) {
+      const auto v=values[i];
+      const std::array<std::uint8_t,4> bytes{std::uint8_t(v>>24),std::uint8_t(v>>16),std::uint8_t(v>>8),std::uint8_t(v)};
+      scatter(hle_spans_[i],bytes.data());
+    }
+    cpu_.gpr[3]=1;return finish();
+  }
+  case SimpleHleKind::PadRead: {
+    if (!EnvNativePad()) return decline_to_guest();
+    // v300 native PAD service: PADRead(PADStatus status[4]) from a host input
+    // snapshot taken at call time -- no SI poll/latch latency. Retail 12-byte
+    // layout and conventions (big-endian buttons, centred s8 sticks, err -1 for
+    // an absent controller) via Input::Encode; returns the motor-capable
+    // channel mask (PAD_CHAN0_BIT >> chan) as the SDK does.
+    auto& out=hle_spans_[1];
+    if(const auto st=TranslateGuestRange(cpu_.gpr[3],48u,true,out);st!=GuestRangeStatus::Ok) return range_failure(st);
+    std::array<std::uint8_t,48> status{};
+#if defined(GEKKOAOT_NATIVE_SDL_INPUT)
+    if(native_input_ready_) {
+      GekkoAOT::Input::HostInput().Poll(native_pads_);
+      ++native_input_samples_;
+    }
+    const std::uint32_t motor=GekkoAOT::Input::Encode(native_pads_,status.data());
+#else
+    const std::uint32_t motor=GekkoAOT::Input::Encode({},status.data());
+#endif
+    scatter(out,status.data());
+    ++native_pad_reads_;
+    cpu_.gpr[3]=motor;
+    return finish();
+  }
+  case SimpleHleKind::OsGetTime: NoteClockCall(true); return GekkoAOT::Time::GetTime(&cpu_);
+  case SimpleHleKind::OsGetTick: NoteClockCall(false); return GekkoAOT::Time::GetTick(&cpu_);
+  case SimpleHleKind::Memcpy:
   case SimpleHleKind::Memmove: {
+    // memmove semantics for both: an overlapping memcpy is undefined in C.
     const std::uint32_t dst_addr=cpu_.gpr[3],src_addr=cpu_.gpr[4],size=cpu_.gpr[5];
-    auto* dst=pointer(dst_addr,size); auto* src=pointer(src_addr,size);
-    if(!dst||!src){SetFault(FaultKind::HleFailure,address);return false;}
-    if(size) std::memmove(dst,src,size);
+    auto& src=hle_spans_[0]; auto& dst=hle_spans_[1];
+    if(const auto st=TranslateGuestRange(src_addr,size,false,src);st!=GuestRangeStatus::Ok) return range_failure(st);
+    if(const auto st=TranslateGuestRange(dst_addr,size,true,dst);st!=GuestRangeStatus::Ok) return range_failure(st);
+    if(src.size()<=1u && dst.size()<=1u) {
+      if(size) std::memmove(dst[0].host,src[0].host,size);
+    } else {
+      hle_scratch_.resize(size); gather(src,hle_scratch_.data()); scatter(dst,hle_scratch_.data());
+    }
     cpu_.gpr[3]=dst_addr;
     return finish();
   }
-  case SimpleHleKind::Memset: {
-    const std::uint32_t dst_addr=cpu_.gpr[3],size=cpu_.gpr[5]; auto* dst=pointer(dst_addr,size);
-    if(!dst){SetFault(FaultKind::HleFailure,address);return false;}
-    if(size) std::memset(dst,static_cast<int>(cpu_.gpr[4]&0xffu),size);
-    cpu_.gpr[3]=dst_addr; return finish();
+  case SimpleHleKind::Memset:
+  case SimpleHleKind::Bzero: {
+    const bool bzero=kind==SimpleHleKind::Bzero;
+    const std::uint32_t dst_addr=cpu_.gpr[3],size=bzero?cpu_.gpr[4]:cpu_.gpr[5];
+    const int value=bzero?0:static_cast<int>(cpu_.gpr[4]&0xffu);
+    auto& dst=hle_spans_[1];
+    if(const auto st=TranslateGuestRange(dst_addr,size,true,dst);st!=GuestRangeStatus::Ok) return range_failure(st);
+    for(const auto& span:dst) std::memset(span.host,value,span.length);
+    if(!bzero) cpu_.gpr[3]=dst_addr;
+    return finish();
   }
   case SimpleHleKind::Memcmp: {
     const std::uint32_t lhs_addr=cpu_.gpr[3],rhs_addr=cpu_.gpr[4],size=cpu_.gpr[5];
-    auto* lhs=pointer(lhs_addr,size); auto* rhs=pointer(rhs_addr,size);
-    if(!lhs||!rhs){SetFault(FaultKind::HleFailure,address);return false;}
-    std::int32_t result=0; if(size) result=std::memcmp(lhs,rhs,size);
+    auto& lhs=hle_spans_[0]; auto& rhs=hle_spans_[1];
+    if(const auto st=TranslateGuestRange(lhs_addr,size,false,lhs);st!=GuestRangeStatus::Ok) return range_failure(st);
+    if(const auto st=TranslateGuestRange(rhs_addr,size,false,rhs);st!=GuestRangeStatus::Ok) return range_failure(st);
+    const std::uint8_t *a=nullptr,*b=nullptr;
+    if(lhs.size()<=1u && rhs.size()<=1u) {
+      if(size){a=lhs[0].host;b=rhs[0].host;}
+    } else {
+      hle_scratch_.resize(std::size_t(size)*2u);
+      gather(lhs,hle_scratch_.data()); gather(rhs,hle_scratch_.data()+size);
+      a=hle_scratch_.data(); b=hle_scratch_.data()+size;
+    }
+    // Retail libc returns the difference of the first mismatching bytes.
+    std::int32_t result=0;
+    for(std::uint32_t i=0;i<size;++i) if(a[i]!=b[i]){result=int(a[i])-int(b[i]);break;}
     cpu_.gpr[3]=static_cast<std::uint32_t>(result); return finish();
   }
-  case SimpleHleKind::Bzero: {
-    const std::uint32_t dst_addr=cpu_.gpr[3],size=cpu_.gpr[4]; auto* dst=pointer(dst_addr,size);
-    if(!dst){SetFault(FaultKind::HleFailure,address);return false;}
-    if(size) std::memset(dst,0,size);
+  case SimpleHleKind::Strlen: {
+    const std::uint8_t* src=nullptr; std::size_t length=0;
+    if(!c_string(cpu_.gpr[3],&src,&length)) return string_hle_failure();
+    cpu_.gpr[3]=static_cast<std::uint32_t>(length); return finish();
+  }
+  case SimpleHleKind::Strcmp: {
+    const std::uint8_t *lhs=nullptr,*rhs=nullptr; std::size_t ll=0,rl=0;
+    if(!c_string(cpu_.gpr[3],&lhs,&ll)||!c_string(cpu_.gpr[4],&rhs,&rl)) return string_hle_failure();
+    std::size_t i=0; const std::size_t common=std::min(ll,rl);
+    for(;i<common&&lhs[i]==rhs[i];++i){}
+    const int result = int(lhs[i]) - int(rhs[i]);
+    cpu_.gpr[3]=static_cast<std::uint32_t>(static_cast<std::int32_t>(result)); return finish();
+  }
+  case SimpleHleKind::Strncmp: {
+    // Lockstep page walk over both strings: touches exactly the bytes the
+    // guest loop reads (up to the first difference or terminator), so paged
+    // VM operands raise the same DSI and RFI retries the whole call.
+    const std::uint32_t lhs_addr=cpu_.gpr[3],rhs_addr=cpu_.gpr[4],limit=cpu_.gpr[5];
+    auto& ls=hle_spans_[0]; auto& rs=hle_spans_[1];
+    std::int32_t result=0; bool done=false;
+    for(std::uint32_t i=0u;i<limit&&!done;) {
+      const std::uint32_t la=lhs_addr+i,ra=rhs_addr+i;
+      const std::uint32_t chunk=std::min({limit-i,0x1000u-(la&0xfffu),0x1000u-(ra&0xfffu)});
+      if(const auto st=TranslateGuestRange(la,chunk,false,ls);st!=GuestRangeStatus::Ok) return range_failure(st);
+      if(const auto st=TranslateGuestRange(ra,chunk,false,rs);st!=GuestRangeStatus::Ok) return range_failure(st);
+      const std::uint32_t n=std::min(ls[0].length,rs[0].length);
+      const std::uint8_t *a=ls[0].host,*b=rs[0].host;
+      for(std::uint32_t k=0u;k<n;++k) {
+        if(a[k]!=b[k]){result=int(a[k])-int(b[k]);done=true;break;}
+        if(a[k]==0u){done=true;break;}
+      }
+      i+=n;
+    }
+    cpu_.gpr[3]=static_cast<std::uint32_t>(result); return finish();
+  }
+  case SimpleHleKind::Strcpy: {
+    const std::uint32_t dst_addr=cpu_.gpr[3],src_addr=cpu_.gpr[4];
+    const std::uint8_t* src=nullptr; std::size_t length=0;
+    if(!c_string(src_addr,&src,&length)) return string_hle_failure();
+    if(length>=std::numeric_limits<std::uint32_t>::max()){SetFault(FaultKind::HleFailure,address);return false;}
+    auto& dst=hle_spans_[1];
+    if(const auto st=TranslateGuestRange(dst_addr,static_cast<std::uint32_t>(length+1u),true,dst);st!=GuestRangeStatus::Ok) return range_failure(st);
+    scatter(dst,src); cpu_.gpr[3]=dst_addr; return finish();
+  }
+  case SimpleHleKind::Strncpy: {
+    // Copy up to the terminator, then NUL-pad to exactly `limit` bytes.
+    const std::uint32_t dst_addr=cpu_.gpr[3],src_addr=cpu_.gpr[4],limit=cpu_.gpr[5];
+    std::uint32_t length=0u; bool terminated=false;
+    if(const auto st=bounded_string(src_addr,limit,&hle_scratch_,&length,&terminated);st!=GuestRangeStatus::Ok) return range_failure(st);
+    auto& dst=hle_spans_[1];
+    if(const auto st=TranslateGuestRange(dst_addr,limit,true,dst);st!=GuestRangeStatus::Ok) return range_failure(st);
+    hle_scratch_.resize(limit,0u);
+    scatter(dst,hle_scratch_.data()); cpu_.gpr[3]=dst_addr; return finish();
+  }
+  case SimpleHleKind::Strcat: {
+    const std::uint32_t dst_addr=cpu_.gpr[3],src_addr=cpu_.gpr[4];
+    const std::uint8_t *dst_ro=nullptr,*src=nullptr; std::size_t dl=0,sl=0;
+    if(!c_string(dst_addr,&dst_ro,&dl)||!c_string(src_addr,&src,&sl)) return string_hle_failure();
+    if(dl+sl+1u>=0x100000000ull){SetFault(FaultKind::HleFailure,address);return false;}
+    auto& dst=hle_spans_[1];
+    if(const auto st=TranslateGuestRange(dst_addr+static_cast<std::uint32_t>(dl),static_cast<std::uint32_t>(sl+1u),true,dst);st!=GuestRangeStatus::Ok) return range_failure(st);
+    scatter(dst,src); cpu_.gpr[3]=dst_addr; return finish();
+  }
+  case SimpleHleKind::Strchr:
+  case SimpleHleKind::Strrchr: {
+    const std::uint32_t src_addr=cpu_.gpr[3]; const std::uint8_t needle=static_cast<std::uint8_t>(cpu_.gpr[4]);
+    const std::uint8_t* src=nullptr; std::size_t length=0;
+    if(!c_string(src_addr,&src,&length)) return string_hle_failure();
+    const std::size_t count=length+1u; const std::uint8_t* found=nullptr;
+    if(kind==SimpleHleKind::Strchr){ found=static_cast<const std::uint8_t*>(std::memchr(src,needle,count)); }
+    else { for(std::size_t i=count;i>0u;--i)if(src[i-1u]==needle){found=src+i-1u;break;} }
+    cpu_.gpr[3]=found?src_addr+static_cast<std::uint32_t>(found-src):0u; return finish();
+  }
+  case SimpleHleKind::Memchr: {
+    // Page at a time: like the guest loop, never touch bytes past the match.
+    const std::uint32_t src_addr=cpu_.gpr[3],size=cpu_.gpr[5]; const std::uint8_t needle=static_cast<std::uint8_t>(cpu_.gpr[4]);
+    std::uint32_t done=0u;
+    while(done<size) {
+      const std::uint32_t ea=src_addr+done;
+      const std::uint32_t chunk=std::min<std::uint32_t>(size-done,0x1000u-(ea&0xfffu));
+      auto& span=hle_spans_[0];
+      if(const auto st=TranslateGuestRange(ea,chunk,false,span);st!=GuestRangeStatus::Ok) return range_failure(st);
+      std::uint32_t offset=0u;
+      for(const auto& piece:span) {
+        if(const auto* hit=static_cast<const std::uint8_t*>(std::memchr(piece.host,needle,piece.length))) {
+          cpu_.gpr[3]=ea+offset+static_cast<std::uint32_t>(hit-piece.host); return finish();
+        }
+        offset+=piece.length;
+      }
+      done+=chunk;
+    }
+    cpu_.gpr[3]=0u; return finish();
+  }
+  case SimpleHleKind::Strstr: {
+    const std::uint32_t hay_addr=cpu_.gpr[3],needle_addr=cpu_.gpr[4];
+    const std::uint8_t *hay=nullptr,*needle=nullptr; std::size_t hl=0,nl=0;
+    if(!c_string(needle_addr,&needle,&nl)) return string_hle_failure();
+    if(nl==0u){cpu_.gpr[3]=hay_addr;return finish();}
+    if(!c_string(hay_addr,&hay,&hl)) return string_hle_failure();
+    const auto* found=std::search(hay,hay+hl,needle,needle+nl);
+    cpu_.gpr[3]=found==hay+hl?0u:hay_addr+static_cast<std::uint32_t>(found-hay); return finish();
+  }
+  case SimpleHleKind::Strncat: {
+    // Append at most `limit` source bytes (stopping at its terminator) and
+    // always terminate, exactly like the retail loop.
+    const std::uint32_t dst_addr=cpu_.gpr[3],src_addr=cpu_.gpr[4],limit=cpu_.gpr[5];
+    const std::uint8_t* dst_ro=nullptr; std::size_t dl=0;
+    if(!c_string(dst_addr,&dst_ro,&dl)) return string_hle_failure();
+    if(dl>=0xffffffffull){SetFault(FaultKind::HleFailure,address);return false;}
+    std::uint32_t length=0u; bool terminated=false;
+    if(const auto st=bounded_string(src_addr,limit,&hle_scratch_,&length,&terminated);st!=GuestRangeStatus::Ok) return range_failure(st);
+    hle_scratch_.push_back(0u);
+    auto& dst=hle_spans_[1];
+    if(const auto st=TranslateGuestRange(dst_addr+static_cast<std::uint32_t>(dl),length+1u,true,dst);st!=GuestRangeStatus::Ok) return range_failure(st);
+    scatter(dst,hle_scratch_.data()); cpu_.gpr[3]=dst_addr; return finish();
+  }
+  case SimpleHleKind::Strnlen: {
+    std::uint32_t length=0u; bool terminated=false;
+    if(const auto st=bounded_string(cpu_.gpr[3],cpu_.gpr[4],nullptr,&length,&terminated);st!=GuestRangeStatus::Ok) return range_failure(st);
+    cpu_.gpr[3]=length; return finish();
+  }
+  case SimpleHleKind::Strcspn:
+  case SimpleHleKind::Strpbrk: {
+    const std::uint32_t src_addr=cpu_.gpr[3],set_addr=cpu_.gpr[4];
+    const std::uint8_t *src=nullptr,*set=nullptr; std::size_t sl=0,setl=0;
+    if(!c_string(src_addr,&src,&sl)||!c_string(set_addr,&set,&setl)) return string_hle_failure();
+    std::array<bool,256> table{}; for(std::size_t i=0;i<setl;++i)table[set[i]]=true;
+    std::size_t i=0; while(i<sl&&!table[src[i]])++i;
+    if(kind==SimpleHleKind::Strcspn) cpu_.gpr[3]=static_cast<std::uint32_t>(i);
+    else cpu_.gpr[3]=i<sl?src_addr+static_cast<std::uint32_t>(i):0u;
     return finish();
   }
+  case SimpleHleKind::DcFlushRange:
+  case SimpleHleKind::DcFlushRangeNoSync:
+  case SimpleHleKind::DcStoreRange:
+  case SimpleHleKind::DcStoreRangeNoSync:
+  case SimpleHleKind::DcInvalidateRange:
+  case SimpleHleKind::DcZeroRange:
+  case SimpleHleKind::DcTouchRange:
+  case SimpleHleKind::IcInvalidateRange: {
+    const std::uint32_t addr=cpu_.gpr[3],size=cpu_.gpr[4];
+    if(size==0u)return finish();
+    const std::uint64_t base=std::uint64_t(addr&~31u);
+    const std::uint64_t end=std::uint64_t(addr)+std::uint64_t(size);
+    if(end>0x100000000ull){SetFault(FaultKind::HleFailure,address);return false;}
+    const std::uint64_t rounded_end=(end+31ull)&~31ull;
+    if(rounded_end>0x100000000ull||rounded_end<base){SetFault(FaultKind::HleFailure,address);return false;}
+    const std::uint32_t range_addr=static_cast<std::uint32_t>(base);
+    const std::uint32_t range_size=static_cast<std::uint32_t>(rounded_end-base);
+
+    if(kind==SimpleHleKind::DcZeroRange){
+      auto& dst=hle_spans_[1];
+      if(const auto st=TranslateGuestRange(range_addr,range_size,true,dst);st!=GuestRangeStatus::Ok) return range_failure(st);
+      for(const auto& span:dst) std::memset(span.host,0,span.length);
+      native_gx_.NotifyMemoryWrite(range_addr,range_size);
+      return finish();
+    }
+    if(kind==SimpleHleKind::DcTouchRange) return finish(); // host prefetch is unnecessary
+    if(kind!=SimpleHleKind::IcInvalidateRange){
+      // Host RAM is coherent; the architectural D-cache operation is the
+      // publication boundary for Aurora's cached arrays/textures. Publish the
+      // whole SDK range in one DSO call rather than one callback per 32-byte line.
+      native_gx_.NotifyMemoryWrite(range_addr,range_size);
+      return finish();
+    }
+
+    // AOT instruction-cache invalidation: invalidate the low-memory I-cache
+    // lines that are actually modeled and drop executable/REL route caches once
+    // for the whole SDK range instead of once per guest icbi instruction.
+    InvalidateInstructionRange(range_addr,range_size);
+    return finish();
+  }
+  case SimpleHleKind::GxLoadPosMtxImm:
+  case SimpleHleKind::GxLoadNrmMtxImm:
+  case SimpleHleKind::GxLoadNrmMtxImm3x3:
+  case SimpleHleKind::GxLoadTexMtxImm: {
+    if (cpu_.gqr[0]!=0u || !(cpu_.msr&0x2000u) ||
+        !EnvGxMatrixHle()) return decline_to_guest();
+    const bool normal=kind==SimpleHleKind::GxLoadNrmMtxImm || kind==SimpleHleKind::GxLoadNrmMtxImm3x3;
+    if (normal && !EnvNativeGxNormalMatrix()) return decline_to_guest();
+    // An intercepted SDK packet has no resumable instruction for each chunk.
+    // Deliver an already pending overflow IRQ at its entry, then publish the
+    // entire bounded packet atomically with respect to this host-side fence.
+    if (TryTakeFifoWriteInterrupt(true)) return true;
+    struct AtomicFifoService {
+      bool& active;
+      bool previous;
+      explicit AtomicFifoService(bool& flag) : active(flag), previous(flag) { active = true; }
+      ~AtomicFifoService() { active = previous; }
+    } atomic_service(atomic_fifo_service_);
+    // v34: SFA, SMB and the debug ELF corpus all contain the same retail SDK
+    // matrix-upload leaves.  They do no CPU-visible work beyond writing an XF
+    // command and raw big-endian f32 matrix bytes to WGPIPE.  Feed those bytes
+    // into the existing gather/CP path directly so PI/CP breakpoints and FIFO
+    // accounting stay authoritative while removing the guest PSQ + MMIO call
+    // chain.
+    if(!native_gx_.Ready()){SetFault(FaultKind::HleFailure,address);return false;}
+    const std::uint32_t matrix_addr=cpu_.gpr[3];
+    const std::uint32_t id=cpu_.gpr[4];
+    std::uint32_t xf_addr=0u;
+    std::uint32_t payload_bytes=0u;
+    if(kind==SimpleHleKind::GxLoadPosMtxImm){
+      xf_addr=0x000b0000u|(id*4u); payload_bytes=48u;
+    }else if(normal){
+      xf_addr=0x00080000u|((id*3u)+0x400u);payload_bytes=36u;
+    }else{
+      const std::uint32_t type=cpu_.gpr[5];
+      if(type>1u){SetFault(FaultKind::HleFailure,address);return false;}
+      const std::uint32_t count=type==1u?8u:12u;
+      const std::uint32_t base=id>=64u?(id-64u)*4u+0x500u:id*4u;
+      xf_addr=base|((count-1u)<<16u); payload_bytes=count*4u;
+    }
+    // GX matrix sources may live in the Gekko locked-cache aperture. SMB1
+    // keeps its current position matrix at 0xE0000000, which ordinary MEM1
+    // resolution does not cover. Use the same guest-pointer resolver as the
+    // compiled CPU's external pointer path.
+    const auto source_bytes=kind==SimpleHleKind::GxLoadNrmMtxImm?44u:payload_bytes;
+    std::array<std::uint8_t,48> matrix_copy{};
+    const auto* matrix=static_cast<const std::uint8_t*>(lc_.Pointer(matrix_addr,source_bytes));
+    if (!matrix) {
+      auto& spans=hle_spans_[0];
+      if (TranslateGuestRange(matrix_addr,source_bytes,false,spans)!=GuestRangeStatus::Ok)
+        return decline_to_guest();
+      gather(spans,matrix_copy.data());matrix=matrix_copy.data();
+    }
+    std::array<std::uint8_t,53> fifo{};
+    std::size_t n=0u;
+    fifo[n++]=0x10u;
+    fifo[n++]=static_cast<std::uint8_t>(xf_addr>>24u);
+    fifo[n++]=static_cast<std::uint8_t>(xf_addr>>16u);
+    fifo[n++]=static_cast<std::uint8_t>(xf_addr>>8u);
+    fifo[n++]=static_cast<std::uint8_t>(xf_addr);
+    // WriteMTXPS4x3/4x2 use qr0 raw-f32 PSQ stores.  Reproduce the
+    // architectural raw-f32 load/store round trip: denormals flush to +0 and
+    // signaling NaNs are quieted; all ordinary matrix values remain bit exact.
+    for(std::uint32_t off=0;off<payload_bytes;off+=4u){
+      const auto src=kind==SimpleHleKind::GxLoadNrmMtxImm?(off/12u)*16u+off%12u:off;
+      std::uint32_t bits=(std::uint32_t(matrix[src])<<24u)|
+                         (std::uint32_t(matrix[src+1u])<<16u)|
+                         (std::uint32_t(matrix[src+2u])<<8u)|matrix[src+3u];
+      const std::uint32_t exponent=bits&0x7f800000u;
+      const std::uint32_t fraction=bits&0x007fffffu;
+      const bool scalar=normal && (kind==SimpleHleKind::GxLoadNrmMtxImm3x3 ? off==32u : off%12u==8u);
+      if(!scalar&&exponent==0u&&fraction!=0u) bits=0u;
+      else if(exponent==0x7f800000u&&fraction!=0u) bits|=0x00400000u;
+      fifo[n++]=static_cast<std::uint8_t>(bits>>24u);
+      fifo[n++]=static_cast<std::uint8_t>(bits>>16u);
+      fifo[n++]=static_cast<std::uint8_t>(bits>>8u);
+      fifo[n++]=static_cast<std::uint8_t>(bits);
+    }
+    if (native_sdk_gx_packets_enabled_) {
+      // v317: a recognized SDK matrix upload is an ordered native renderer
+      // operation. The compatibility mirror still receives the canonical bytes
+      // for guest FIFO reads/recording; the renderer does not decode XF packets.
+      const auto words=payload_bytes/4u;
+      const auto destination=xf_addr&0xffffu;
+      const bool direct = native_gx_.HasDirectMatrixCommands() &&
+          (xf_addr>>16u)+1u==words && GekkoAOT::GX::NativeMatrixRange(destination,words) &&
+          CpuFifoTargetsGpu() && ((!pi_.FifoBase() && !pi_.FifoEnd()) ||
+          GekkoAOT::NativeHW::CP::CanDirectSubmit(native_hw_.CP(),native_gx_.Ready(),
+            cp_.GPLinkEnabled(),cp_.GPReadEnabled(),
+            cp_.BreakpointActiveForHost()||cp_.RegisterDrainPending(),cp_.FifoReadWriteDistance(),
+            cp_.FifoReadPointer()==cp_.FifoWritePointer()));
+      if(direct && !native_gx_.StageMatrix(destination,words,
+                                         cpu_fifo_gather_size_+gpu_fifo_gather_size_)) {
+        SetFault(FaultKind::MmioWrite,0xcc008000u,n);return false;
+      }
+      if (!QueueSdkFifoPacket(fifo.data(),n)) return false;
+      return finish();
+    }
+    // Queue up to eight bytes at a time through the normal WGPIPE entrypoint.
+    // GXBeginDisplayList may have selected a CPU recording FIFO; submitting
+    // directly to the GPU queue would split one physical gather line between
+    // the CPU and GPU buffers and fault on the next guest store.
+    for(std::size_t off=0;off<n;){
+      const std::size_t remaining=n-off;
+      const std::uint8_t chunk=remaining>=8u?8u:remaining>=4u?4u:remaining>=2u?2u:1u;
+      std::uint64_t value=0u;
+      for(std::uint8_t i=0;i<chunk;++i)value=(value<<8u)|fifo[off+i];
+      ExternalWrite(&cpu_,0xcc008000u,value,chunk);
+      if(fault_.kind!=FaultKind::None || cpu_.exception!=0u)return false;
+      off+=chunk;
+    }
+    return finish();
+  }
+  case SimpleHleKind::Count: break;
   }
   return false;
 }
 
+bool HostRuntime::DispatchNativeRegionProbe() {
+  const std::uint32_t start = cpu_.external_addr, end = cpu_.external_value;
+
+  // v301: a native service declined this exact entry (non-resident paged-VM
+  // operand). The stub stored the entry PC before calling the service; admit
+  // the original guest body once so it faults page by page with exact state.
+  if (hle_decline_entry_ != 0u && cpu_.pc == hle_decline_entry_ &&
+      start <= hle_decline_entry_ && hle_decline_entry_ < end) {
+    hle_decline_entry_ = 0u;
+    cpu_.external_rid = 0xffu;
+    return false;
+  }
+
+  // v205d: when DolRecomp asks whether a native wrapper range is available
+  // from inside a secondary module, a range wholly owned by that same REL is
+  // already compiled guest code. Do not bounce to HostRuntime merely because
+  // a process-wide intercept numerically falls inside the range. A genuine
+  // import/main-DOL/HLE target leaves this descriptor's code ranges and still
+  // takes the normal host-routing path.
+  if (native_region_secondary_owner_ && start < end &&
+      AddressInRanges(native_region_secondary_owner_->code_ranges,
+                      native_region_secondary_owner_->num_code_ranges, start) &&
+      AddressInRanges(native_region_secondary_owner_->code_ranges,
+                      native_region_secondary_owner_->num_code_ranges, end - 1u)) {
+    cpu_.external_rid = 0xffu;
+    static unsigned rel_owned_guard_logs = 0u;
+    if (rel_owned_guard_logs++ < 64u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_REL_REGION_GUARD_V205D=1 start=%08x end=%08x pc=%08x action=allow-secondary-owned-aot\n",
+                   start, end, cpu_.pc);
+    return false;
+  }
+
+  // v204c: one-shot admission for the exact range that produced a proven
+  // zero-progress secondary dispatch.
+  if (native_region_retry_start_ != 0u &&
+      start == native_region_retry_start_) {
+    native_region_retry_start_ = 0u;
+    cpu_.external_rid = 0xffu;
+    static unsigned retry_probe_logs = 0u;
+    if (retry_probe_logs++ < 64u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_REL_REGION_RETRY_V204C=1 start=%08x end=%08x action=allow-one-shot-native-entry\n",
+                   start, end);
+    return false;
+  }
+
+  const std::size_t slot =
+      ((start >> 2u) ^ (start >> 13u) ^ (end >> 5u)) &
+      (kNativeRegionProbeCacheSize - 1u);
+  auto& cached = native_region_probe_cache_[slot];
+  bool blocked = false;
+  if (cached.valid && cached.start == start && cached.end == end &&
+      cached.epoch == fixed_exec_route_epoch_) {
+    blocked = cached.blocked;
+  } else {
+    auto it =
+        std::lower_bound(native_intercepts_.begin(), native_intercepts_.end(), start);
+    // Fixed ELF/DOL overlays reuse addresses from the bootstrap executable.
+    // A bootstrap SDK hook is applicable only while its original code still
+    // occupies that address. Otherwise it can reject an entire overlay chunk
+    // forever before a single guest instruction executes.
+    for (; start < end && it != native_intercepts_.end() && *it < end; ++it) {
+      if (NativeHookCodeMatches(*it)) { blocked = true; break; }
+    }
+    cached = {start, end, blocked, true, fixed_exec_route_epoch_};
+  }
+
+  if (blocked && native_region_probe_capture_)
+    native_region_last_blocked_start_ = start;
+
+  cpu_.external_rid = 0xffu;
+  return blocked;
+}
+
 bool HostRuntime::DispatchHostCall(std::uint32_t address) {
+  // v274: a handled real HLE call is a host-visible event for the idle-loop
+  // prover; admission, REL-translation and indirect-routing probes are not
+  // (the guest code an indirect route executes reports its own effects).
+  const bool handled = DispatchHostCallImpl(address);
+  if (handled && track_host_effects_ && address != kNativeRegionProbe &&
+      address != kRelAddressProbe && address != kGlobalIndirectProbe)
+    ++host_effects_;
+  return handled;
+}
+
+bool HostRuntime::DispatchHostCallImpl(std::uint32_t address) {
   // v70: resolved SDK calls can be lowered by DolRecomp straight to a stable
   // service token.  No runtime address map, interception query, or redispatch
   // through module_dispatch is required for the positive path.  cpu_.pc still
@@ -2416,7 +4532,7 @@ bool HostRuntime::DispatchHostCall(std::uint32_t address) {
   }
   if ((address & kStaticDirectMask) == kStaticDirectSimpleBase) {
     const auto raw = static_cast<std::uint8_t>(address & 0xffu);
-    if (raw <= static_cast<std::uint8_t>(SimpleHleKind::Bzero))
+    if (raw < static_cast<std::uint8_t>(SimpleHleKind::Count))
       return DispatchSimpleHle(static_cast<SimpleHleKind>(raw), cpu_.pc);
     return false;
   }
@@ -2431,6 +4547,10 @@ bool HostRuntime::DispatchHostCall(std::uint32_t address) {
 
   // REL side modules use this sentinel only for canonical->runtime translation.
   if (address == kRelAddressProbe) {
+    // REL-generated memory accesses can request canonical->runtime translation
+    // before control returns through ResolveSecondaryAddress().  Honor the same
+    // publication epoch here so they never translate through a stale OSLink map.
+    if (rel_mapping_dirty_) RefreshSecondaryRelMappings();
     const std::uint32_t canonical=cpu_.external_addr;
     std::uint32_t runtime=canonical;
     if(TranslateCanonicalRelAddress(canonical,&runtime)) {
@@ -2445,13 +4565,7 @@ bool HostRuntime::DispatchHostCall(std::uint32_t address) {
   // Static-intercept AOT removes this probe from every region that cannot
   // contain a native SDK/HLE entry. The few remaining guarded chunks use the
   // exact sorted entrypoint set, so there is no hot hash/cache layer anymore.
-  if (address == kNativeRegionProbe) {
-    const std::uint32_t start=cpu_.external_addr,end=cpu_.external_value;
-    const auto it=std::lower_bound(native_intercepts_.begin(), native_intercepts_.end(), start);
-    const bool blocked=start<end && it!=native_intercepts_.end() && *it<end;
-    cpu_.external_rid=0xffu;
-    return blocked;
-  }
+  if (address == kNativeRegionProbe) return DispatchNativeRegionProbe();
 
   // Exact direct-mapped positive cache. Hot OS/libc HLE no longer pays an
   // unordered_map lookup at every call; collisions simply fall through to the
@@ -2459,6 +4573,7 @@ bool HostRuntime::DispatchHostCall(std::uint32_t address) {
   const auto fast_slot=((address>>2u)^(address>>13u))&(kHleFastCacheSize-1u);
   const auto fast=hle_fast_cache_[fast_slot];
   if(fast.address==address) {
+    if (!NativeHookCodeMatches(address)) return false;
     if(fast.type==HleFastType::Os)
       return DispatchOsHle(static_cast<GekkoAOT::NativeOS::Kind>(fast.kind),address);
     if(fast.type==HleFastType::Simple)
@@ -2469,10 +4584,12 @@ bool HostRuntime::DispatchHostCall(std::uint32_t address) {
   if(hostcall_negative_cache_[negative_slot]==address) return false;
 
   if(auto it=os_hooks_.find(address);it!=os_hooks_.end()) {
+    if (!NativeHookCodeMatches(address)) return false;
     hle_fast_cache_[fast_slot]={address,HleFastType::Os,static_cast<std::uint8_t>(it->second)};
     return DispatchOsHle(it->second,address);
   }
   if(auto it=simple_hle_hooks_.find(address);it!=simple_hle_hooks_.end()) {
+    if (!NativeHookCodeMatches(address)) return false;
     hle_fast_cache_[fast_slot]={address,HleFastType::Simple,static_cast<std::uint8_t>(it->second)};
     return DispatchSimpleHle(it->second,address);
   }
@@ -2483,12 +4600,81 @@ bool HostRuntime::DispatchHostCall(std::uint32_t address) {
 bool HostRuntime::HostCall(CPUState* cpu, std::uint32_t address) {
   auto* self = Self(cpu);
   if (!self) return false;
+  // v274: idle-loop effects are counted by DispatchHostCall (real HLE only);
+  // admission, REL-translation and indirect-routing probes are not events.
+  // v232: clock getters are proven scalar SDK leaves in the static manifest.
+  // Keep the generated callback ABI and host-boundary epoch, but avoid entering
+  // the general SDK dispatcher and its libc/VM scratch-buffer machinery. The
+  // guest timebase stays authoritative; advancing events is still the runner's
+  // responsibility at the same boundary as before.
+  if (address == (kStaticDirectSimpleBase | static_cast<std::uint32_t>(SimpleHleKind::OsGetTick))) {
+    ++self->hle_calls_;
+    ++self->simple_hle_kind_calls_[static_cast<std::size_t>(SimpleHleKind::OsGetTick)];
+    self->NoteClockCall(false);
+    GekkoAOT::Time::GetTick(&self->cpu_);
+    BumpHostWriteEpoch(cpu);
+    return true;
+  }
+  if (address == (kStaticDirectSimpleBase | static_cast<std::uint32_t>(SimpleHleKind::OsGetTime))) {
+    ++self->hle_calls_;
+    ++self->simple_hle_kind_calls_[static_cast<std::size_t>(SimpleHleKind::OsGetTime)];
+    self->NoteClockCall(true);
+    GekkoAOT::Time::GetTime(&self->cpu_);
+    BumpHostWriteEpoch(cpu);
+    return true;
+  }
+  // v301: strcmp is a pure leaf that EA titles call ~1M times per second.
+  // With both strings in cached MEM1 compare in place: no dispatcher, no
+  // scratch copies, and no host-write epoch (nothing but r3/PC changes, so
+  // timer/interrupt state is unaffected). Anything else -- VM pages, other
+  // apertures, a string running off MEM1 -- takes the general VM-safe path.
+  static const bool strcmp_fast_path =
+      RuntimeEnvBool("GEKKOAOT_STRCMP_FAST_PATH", true) &&
+      !((DisabledSimpleServices() >> static_cast<unsigned>(SimpleHleKind::Strcmp)) & 1u);
+  if (address == (kStaticDirectSimpleBase | static_cast<std::uint32_t>(SimpleHleKind::Strcmp)) &&
+      strcmp_fast_path) {
+    const std::uint32_t a = self->cpu_.gpr[3], b = self->cpu_.gpr[4];
+    const auto& mem1 = self->memory_.Mem1();
+    if ((a & 0xc0000000u) == 0x80000000u && (b & 0xc0000000u) == 0x80000000u) {
+      const std::uint32_t oa = a & 0x3fffffffu, ob = b & 0x3fffffffu;
+      if (oa < mem1.size() && ob < mem1.size()) {
+        const std::size_t limit = mem1.size() - std::max(oa, ob);
+        const std::uint8_t* pa = mem1.data() + oa;
+        const std::uint8_t* pb = mem1.data() + ob;
+        for (std::size_t i = 0; i < limit; ++i) {
+          const std::uint8_t ca = pa[i], cb = pb[i];
+          if (ca != cb || ca == 0u) {
+            self->cpu_.gpr[3] = static_cast<std::uint32_t>(int(ca) - int(cb));
+            self->cpu_.pc = self->cpu_.lr;
+            ++self->hle_calls_;
+            ++self->simple_hle_kind_calls_[static_cast<std::size_t>(SimpleHleKind::Strcmp)];
+            return true;
+          }
+        }
+      }
+    }
+  }
+  if (address == kNativeRegionProbe) return self->DispatchNativeRegionProbe();
+  if (address == kEeEnableQuery) {
+    if (cpu->msr & kPpcMsrEe) self->pe_notification_irq_active_ = false;
+    const bool pending = self->EeEnableNeedsBoundary();
+    // A native mtmsr side exit publishes the exact next PPC instruction, but
+    // module_dispatch can otherwise redispatch that continuation in the same
+    // DSO superchain before Run gets a chance to deliver the interrupt. It can
+    // even clear EE again first. Mark only an actually requested boundary as
+    // an event; the common no-interrupt query remains entirely state-free.
+    if (pending && self->ee_pending_barrier_enabled_) BumpHostWriteEpoch(cpu);
+    return pending;
+  }
   const bool handled = self->DispatchHostCall(address);
   // Compiler/runtime admission probes are not guest-visible events.  Real HLE
   // calls are: stop the native superchain after the current wrapper so timer
   // and interrupt state is settled before more guest work runs.
+  // v301: libc leaves only touch guest GPRs and plain memory (a raised DSI
+  // already ends the chain through cpu->exception) -- exactly like the guest
+  // code they replace, so they do not end the superchain either.
   if (handled && address != kNativeRegionProbe && address != kRelAddressProbe &&
-      address != kGlobalIndirectProbe)
+      address != kGlobalIndirectProbe && !IsChainTransparentLeaf(address))
     BumpHostWriteEpoch(cpu);
   return handled;
 }
@@ -2496,6 +4682,14 @@ bool HostRuntime::HostCall(CPUState* cpu, std::uint32_t address) {
 
 bool HostRuntime::DispatchGlobalIndirect(std::uint32_t runtime_address) {
   if (!runtime_address) return false;
+
+  // A nested native call can cross the module boundary before the outer REL
+  // wrapper returns. Publish its caller's LR before the callee can save it.
+  if (native_region_secondary_owner_)
+    PublishSecondaryControlState(native_region_secondary_owner_);
+
+  TraceRelGprs("global-enter",
+               runtime_address, runtime_address, cpu_);
 
   // An indirect SDK call can arrive here too. Prefer the normal HLE surface
   // before entering native code so bctrl through a function pointer keeps the
@@ -2534,9 +4728,20 @@ bool HostRuntime::DispatchGlobalIndirect(std::uint32_t runtime_address) {
   // boundary, exactly like an intra-module indirect call.
   const GekkoAOTModuleDesc* secondary = nullptr;
   std::uint32_t linked = runtime_address;
+  bool secondary_dispatched = false;
   if (ResolveSecondaryAddress(runtime_address, &secondary, &linked) && secondary &&
-      secondary->dispatch && secondary->dispatch(&cpu_, linked)) {
+      secondary->dispatch) {
+    TraceRelGprs("global-secondary-enter", runtime_address, linked, cpu_);
+    const auto* previous_owner = native_region_secondary_owner_;
+    native_region_secondary_owner_ = secondary;
+    secondary_dispatched = secondary->dispatch(&cpu_, linked);
+    native_region_secondary_owner_ = previous_owner;
+  }
+  if (secondary_dispatched) {
+    PublishSecondaryControlState(secondary);
     cpu_.pc = TranslateSecondaryAddress(secondary, cpu_.pc);
+    TraceRelGprs("global-secondary-return",
+                 runtime_address, linked, cpu_);
     ++secondary_dispatches_;
     ++global_indirect_dispatches_;
     static unsigned logs = 0;
@@ -2685,12 +4890,55 @@ void HostRuntime::ServiceIdleCpBreakpointRecovery(bool frame_boundary) {
   cp_idle_breakpoint_address_ = 0u;
 }
 
+bool HostRuntime::TryTakeFifoWriteInterrupt(bool sdk_entry) {
+  if (!fifo_irq_fence_enabled_ || atomic_fifo_service_ ||
+      cp_.FifoReadWriteDistance() <= cp_.FifoHiWatermark() ||
+      (cp_.Control() & 0x0004u) == 0u || !cp_.GPReadEnabled() ||
+      (pi_.InterruptCauseValue() & pi_.InterruptMaskValue() &
+       GekkoAOT::HW::PI::NativePI::CommandProcessor) == 0u ||
+      (cpu_.msr & kPpcMsrEe) == 0u) return false;
+  if (!sdk_entry) {
+    // Multi-store instructions (stmw, quantized pairs, string stores) can
+    // issue several callbacks at one PC. Retrying after a later callback
+    // would duplicate their prefix. Update forms can also expose a modified
+    // base register. Admit only non-update, single scalar store instructions.
+    std::uint32_t instruction = 0u;
+    if (!memory_.Read32(cpu_.pc, &instruction)) return false;
+    const auto opcode = instruction >> 26u;
+    bool single_store = opcode == 36u || opcode == 38u || opcode == 44u ||
+                        opcode == 52u || opcode == 54u;
+    if (opcode == 31u) {
+      const auto xo = (instruction >> 1u) & 0x3ffu;
+      single_store = xo == 151u || xo == 215u || xo == 407u ||
+                     xo == 663u || xo == 727u || xo == 662u || xo == 918u;
+    }
+    if (!single_store) return false;
+  }
+  if (!TryTakeExternalInterrupt()) return false;
+  // Same unwind contract as a synchronous memory-service exception. The
+  // execution chassis consumes this private latch on entry to vector 0x500.
+  cpu_.exception |= kPpcExcExternalUnwind;
+  ++fifo_irq_fences_;
+  if (fifo_irq_fences_ <= 8u || (fifo_irq_fences_ & (fifo_irq_fences_ - 1u)) == 0u)
+    std::fprintf(stderr,
+                 "GEKKOAOT_FIFO_IRQ_FENCE_V235=1 count=%llu resume=%08x distance=%08x "
+                 "high=%08x staged=%u boundary=%s action=vector500-before-write\n",
+                 static_cast<unsigned long long>(fifo_irq_fences_), cpu_.srr0,
+                 cp_.FifoReadWriteDistance(), cp_.FifoHiWatermark(),
+                 gpu_fifo_gather_size_, sdk_entry ? "sdk-entry" : "scalar-store");
+  return true;
+}
+
 bool HostRuntime::TryTakeExternalInterrupt() {
   // External interrupts are level-sensitive at the PI boundary. The device/PI
   // cause remains asserted until guest software acknowledges it; this method
   // only performs the CPU-side exception entry when interrupts are enabled.
-  // Read the cause/mask pair once. InterruptPending() used to reload the same
-  // two fields, which is measurable because this probe sits on every dispatch.
+  // v182: NativePI caches the derived cause&mask level.  Reject the normal
+  // no-IRQ case with one boolean load before touching the MMIO register pair.
+  if (!pi_.InterruptPending()) return false;
+
+  // Read the cause/mask pair only for an actually pending interrupt.  These
+  // values are still used for exact vector/logging semantics below.
   const std::uint32_t pi_cause = pi_.InterruptCauseValue();
   const std::uint32_t pi_mask = pi_.InterruptMaskValue();
   const std::uint32_t pending = pi_cause & pi_mask;
@@ -2710,6 +4958,10 @@ bool HostRuntime::TryTakeExternalInterrupt() {
     return false;
   }
 
+  ++irq_external_taken_;
+  irq_external_causes_ |= pending;
+  for (std::uint32_t bits = pending & 0xffffu; bits != 0u; bits &= bits - 1u)
+    ++irq_cause_counts_[static_cast<unsigned>(std::countr_zero(bits))];
   if (video_ready) {
     static unsigned video_take_logs = 0u;
     if (video_take_logs++ < 128u)
@@ -2733,6 +4985,8 @@ bool HostRuntime::TryTakeExternalInterrupt() {
   exception_msr &= ~kPpcExceptionEntryClearMask;
   cpu_.msr = exception_msr;
   cpu_.pc = 0x00000500u;
+  pe_notification_irq_active_ = true;
+  CountHostEffect();
   return true;
 }
 
@@ -2744,6 +4998,7 @@ bool HostRuntime::TryTakeDecrementerInterrupt() {
   if (!decrementer_pending_ || (cpu_.msr & kPpcMsrEe) == 0u) return false;
 
   decrementer_pending_ = false;
+  ++irq_decrementer_taken_;
   const std::uint32_t old_msr = cpu_.msr;
   cpu_.srr0 = cpu_.pc;
   cpu_.srr1 = old_msr & kPpcMsrRfiMask;
@@ -2754,6 +5009,7 @@ bool HostRuntime::TryTakeDecrementerInterrupt() {
   exception_msr &= ~kPpcExceptionEntryClearMask;
   cpu_.msr = exception_msr;
   cpu_.pc = 0x00000900u;
+  CountHostEffect();
   return true;
 }
 
@@ -2833,22 +5089,41 @@ void HostRuntime::AdvanceCpuTimers(std::uint64_t cpu_cycles) {
   spr_state_[kSprDec] = old_dec - static_cast<std::uint32_t>(dec_ticks);
 }
 
-void HostRuntime::SyncNativeGXInterrupts() {
-  if (!native_gx_.PeEventPending()) return;
-  const bool token_seen = native_gx_.ConsumeTokenSeen();
-  const bool token_interrupt = native_gx_.ConsumeTokenInterruptSeen();
-  if (token_seen || token_interrupt)
-    pe_.SetToken(native_gx_.LastToken(), token_interrupt);
-  if (native_gx_.ConsumeFinishSeen())
-    pe_.SetFinish();
-  SyncNativePEInterrupts();
+void HostRuntime::SyncNativeGXInterrupts(bool polling_token) {
+  if(native_gx_.PeEventOverflow()) {
+    SetFault(FaultKind::MmioWrite,0xcc00100eu);
+    return;
+  }
+  if(!native_gx_.PeEventPending()) return;
+  // Renderer notifications cross a scheduling boundary, not a GPU fence.
+  // Keep enabled notifications ordered even inside an EE-disabled critical
+  // section: restoring EE must still deliver each pending SDK callback.
+  // An explicit token polling boundary can request latest-register semantics.
+  if (cpu_.msr & kPpcMsrEe) pe_notification_irq_active_ = false;
+  static const bool ordered_irq = RuntimeEnvBool("GEKKOAOT_GX_ORDERED_PE_IRQ", true);
+  GX::PeEvent event;
+  for (;;) {
+    // Publishing several enabled token interrupts before a guest can
+    // acknowledge the first folds distinct SDK callbacks into one latch.
+    // Keep notifications ordered without stopping GPU command execution.
+    const auto mask = pi_.InterruptMaskValue();
+    if (ordered_irq && !polling_token &&
+        (((mask & HW::PI::NativePI::PeToken) && pe_.TokenInterruptPending()) ||
+         ((mask & HW::PI::NativePI::PeFinish) && pe_.FinishInterruptPending()))) break;
+    if (!native_gx_.ConsumePeEvent(&event)) break;
+    NativeGXPeEvent(this,event.reg,event.value);
+  }
 }
 
 std::uint32_t HostRuntime::SprRead(CPUState* cpu, std::uint16_t spr, std::uint32_t address) {
   auto* self = Self(cpu);
   if (!self) return 0;
+  self->CountHostEffect();
   // User monitor registers are read-only aliases, not independent storage.
   if (spr >= 936u && spr <= 942u) spr += 16u;
+  if(self->native_counter_poll_enabled_ &&
+     (spr==953u || spr==954u || spr==957u || spr==958u))
+    self->ServiceTimedMmioPoll(address,true);
 
   // Mirror DolRecomp's architectural SPR fast-paths as well as the standalone
   // host-stored implementation-dependent registers.  Generated code normally
@@ -2913,6 +5188,7 @@ void HostRuntime::SprWrite(CPUState* cpu, std::uint16_t spr, std::uint32_t value
                            std::uint32_t address) {
   auto* self = Self(cpu);
   if (!self) return;
+  self->CountHostEffect();
   if (spr >= 936u && spr <= 942u) {
     self->SetFault(FaultKind::SprWrite, address, spr);
     return;
@@ -2939,14 +5215,45 @@ void HostRuntime::SprWrite(CPUState* cpu, std::uint16_t spr, std::uint32_t value
     // until it is rebuilt, independently of game identity.
     {
       bool restartable = !self->module_.IsOpen() || self->module_.SupportsMemoryRestart();
-      for (const auto& side : self->secondary_modules_)
+      std::size_t legacy_fixed_ignored = 0u;
+      // v166: fixed-address DOL/ELF files discovered on disc are not necessarily
+      // executable overlays. Debug companion ELFs (Terminator 3 ships one) can
+      // cover the same virtual addresses as main.dol without ever being entered.
+      // Such an unused fixed image must not veto the guest's SDR1 page-table
+      // activation merely because it was compiled by an older toolchain.
+      //
+      // REL modules remain part of the admission fence because OSLink may make
+      // them live after paging is enabled. Fixed modules are instead filtered at
+      // dispatch time below: a non-restartable one is never entered while real
+      // guest paging is active.
+      for (const auto& side : self->secondary_modules_) {
+        if (!side) continue;
+        const auto* descriptor = side->Descriptor();
+        if (descriptor && descriptor->num_rel_modules == 0u) {
+          if (!side->SupportsMemoryRestart()) ++legacy_fixed_ignored;
+          continue;
+        }
         restartable = restartable && side->SupportsMemoryRestart();
+      }
       const bool enable_pages = value != 0u && restartable;
       if (enable_pages != self->memory_.PagedVmem()) {
         std::fprintf(stderr,
                      "GEKKOAOT_VM_MIGRATION_V97=1 sdr1=%08x paging=%u module_restart=%u side_modules=%zu legacy_fallback=%u\n",
                      value, enable_pages ? 1u : 0u, restartable ? 1u : 0u,
                      self->secondary_modules_.size(), (value && !restartable) ? 1u : 0u);
+        if (legacy_fixed_ignored != 0u)
+          std::fprintf(stderr,
+                       "GEKKOAOT_VM_FIXED_EXEC_CAP_V166=1 sdr1=%08x paging=%u ignored_legacy_fixed=%zu policy=dispatch-fenced\n",
+                       value, enable_pages ? 1u : 0u, legacy_fixed_ignored);
+        // A previous fixed-image identity may point at a legacy side module.
+        // Paging changes its admissibility, so force the next boundary to
+        // resolve the executable again under the v166 capability filter.
+        self->fixed_exec_route_cache_ = {};
+        ++self->fixed_exec_route_epoch_;
+        ++self->fixed_exec_structure_epoch_;
+        ++self->dispatch_code_probe_generation_;
+        self->fixed_exec_active_descriptor_ = nullptr;
+        self->fixed_exec_negative_pcs_.fill(0u);
       } else if (value != 0u && !restartable) {
         static unsigned fallback_logs = 0;
         if (fallback_logs++ < 2u)
@@ -2959,6 +5266,19 @@ void HostRuntime::SprWrite(CPUState* cpu, std::uint16_t spr, std::uint32_t value
     return;
   case kSprDec: {
     const std::uint32_t old_value = self->spr_state_[kSprDec];
+    // v335: sample guest DEC programming (bounded) to diagnose decrementer storms.
+    static std::uint64_t dec_writes = 0u;
+    if ((++dec_writes & 0xffffu) == 1u && dec_writes < (1u << 22)) {
+      std::uint32_t frames[4]{}, sp = cpu->gpr[1];
+      for (auto& frame : frames) {
+        std::uint32_t back = 0u, saved = 0u;
+        if (!self->memory_.Read32(sp, &back) || !self->memory_.Read32(back + 4u, &saved)) break;
+        frame = saved; sp = back;
+      }
+      std::fprintf(stderr, "GEKKOAOT_DEC_WRITE_V335=1 n=%llu value=%08x old=%08x pc=%08x lr=%08x tb=%016llx callers=%08x,%08x,%08x,%08x\n",
+                   static_cast<unsigned long long>(dec_writes), value, old_value, address, cpu->lr,
+                   static_cast<unsigned long long>(cpu->timebase), frames[0], frames[1], frames[2], frames[3]);
+    }
     self->spr_state_[kSprDec] = value;
     self->decrementer_cycle_remainder_ = 0u;
     // A software write that flips DEC from non-negative to negative triggers
@@ -3024,6 +5344,8 @@ void HostRuntime::SprWrite(CPUState* cpu, std::uint16_t spr, std::uint32_t value
   }
   if (IsHostWritableSpr(spr)) {
     self->spr_state_[spr] = value;
+    if (spr >= 536u && spr <= 542u && (spr & 1u) == 0u)
+      self->RefreshVmemBatModes();
 
     // DMAU/DMAL drive the Gekko locked-cache DMA engine.  The transfer starts
     // when DMAL.DMA_T is written.  Model completion synchronously, matching the
@@ -3042,6 +5364,8 @@ void HostRuntime::SprWrite(CPUState* cpu, std::uint16_t spr, std::uint32_t value
                                                           memory_address, blocks)
                           : self->lc_.LockedCacheToMemory(self->memory_, memory_address,
                                                           cache_address, blocks);
+      if (ok && !memory_to_lc)
+        self->native_gx_.NotifyMemoryWrite(memory_address, blocks * 32u);
       // DMA_T reads back clear once the synchronous transfer has completed.
       self->spr_state_[kSprDmal] &= ~kDmalTransfer;
       if (!ok)
@@ -3058,6 +5382,18 @@ void HostRuntime::CacheControl(CPUState* cpu, std::uint8_t operation,
                                std::uint32_t instruction_address) {
   auto* self = Self(cpu);
   if (!self) return;
+  self->CountHostEffect();
+
+  if (operation == kCacheTlbie) {
+    self->InvalidateDataTlb(address);
+    static unsigned logs = 0;
+    if (logs++ < 32u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_NATIVE_DTLB_TLBIE_V212=1 ea=%08x set=%u pc=%08x invalidations=%llu\n",
+                   address, (address >> 12u) & 0x3fu, instruction_address,
+                   static_cast<unsigned long long>(self->data_tlb_invalidations_));
+    return;
+  }
 
   // Host RAM itself is coherent, but NativeGX/Aurora keeps GPU-side snapshots
   // of indexed arrays. dcbst/dcbf/dcbi are the guest's publication boundary
@@ -3070,10 +5406,39 @@ void HostRuntime::CacheControl(CPUState* cpu, std::uint8_t operation,
   // loader/overlay is re-identified from the authoritative guest bytes before
   // the next overlapping dispatch. Native code itself remains immutable; SMC
   // outside precompiled images therefore still fails closed elsewhere.
+  if (operation == kCacheIcbi && !self->IcbiLineTouchesFixedImages(address)) {
+    // v274: a line outside every fixed-image chunk cannot change a chunk hash,
+    // a native hook proof or an image route, so keep those epoch-local caches.
+    // Games that reinstall exception vectors (Ghost Recon 2 issues millions of
+    // icbi on 0x80000d00..) otherwise forced a full route, hook-proof and
+    // 128 KiB dispatch-probe rebuild after every line. Only the code that
+    // reads this line is invalidated: the low-vector interpreter cache, the
+    // dispatch probes that decode it and, outside the vector page where no
+    // REL can live, the lazy REL mapping.
+    self->InvalidateLowInstructionCacheLine(address);
+    if (AddressSpace::ToPhysical(address) >= kLowInstructionCacheSpan)
+      self->rel_mapping_dirty_ = true;
+    self->InvalidateDispatchProbesForRange(address, 32u);
+    ++self->icbi_route_invalidations_;
+    static unsigned targeted_logs = 0;
+    if (self->runtime_profile_enabled_ && targeted_logs++ < 16u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_ICBI_TARGETED_V274=1 ea=%08x pc=%08x targeted=%llu action=keep-fixed-image-route\n",
+                   address, instruction_address,
+                   static_cast<unsigned long long>(++self->icbi_targeted_invalidations_));
+    return;
+  }
   if (operation == kCacheIcbi) {
     self->InvalidateLowInstructionCacheLine(address);
+    // OSLink/overlay loaders publish relocated instructions through icbi.
+    // Defer the expensive MEM1 REL-header scan until a REL route is actually
+    // needed, then perform it once for the whole publication epoch.
+    self->rel_mapping_dirty_ = true;
     self->fixed_exec_route_cache_ = {};
+    ++self->fixed_exec_route_epoch_;
     self->fixed_exec_active_descriptor_ = nullptr;
+    self->fixed_exec_negative_pcs_.fill(0u);
+    self->InvalidateDispatchProbesForRange(address, 32u);
     ++self->icbi_route_invalidations_;
     static unsigned logs = 0;
     if (logs++ < 64u)
@@ -3084,16 +5449,407 @@ void HostRuntime::CacheControl(CPUState* cpu, std::uint8_t operation,
   }
 }
 
+
+void HostRuntime::InvalidateInstructionRange(std::uint32_t range_addr, std::uint32_t range_size) {
+    sdk_idle_poll_pc_=0u;
+    const std::uint32_t physical=AddressSpace::ToPhysical(range_addr);
+    if(physical<kLowInstructionCacheSpan){
+      const std::uint64_t physical_end=std::min<std::uint64_t>(
+          std::uint64_t(kLowInstructionCacheSpan),std::uint64_t(physical)+range_size);
+      const std::size_t first=physical/kLowInstructionCacheLineBytes;
+      const std::size_t last=static_cast<std::size_t>((physical_end+kLowInstructionCacheLineBytes-1u)/kLowInstructionCacheLineBytes);
+      for(std::size_t line=first;line<last&&line<low_instruction_cache_valid_.size();++line)
+        low_instruction_cache_valid_[line]=false;
+    }
+    rel_mapping_dirty_=true;
+    fixed_exec_route_cache_={};
+    ++fixed_exec_route_epoch_;
+    fixed_exec_active_descriptor_=nullptr;
+    fixed_exec_negative_pcs_.fill(0u);
+    InvalidateDispatchProbesForRange(range_addr, range_size);
+    icbi_route_invalidations_ += range_size/32u;
+}
+
+bool HostRuntime::DispatchCopiedCacheStub(std::uint32_t address, std::uint64_t* cycles) {
+  CountHostEffect();
+  // The SDK apploader copies this complete cache-publication leaf into RAM
+  // and patches its two range immediates. Lower only the proven whole routine;
+  // arbitrary RAM code still requires a compiled module.
+  constexpr std::array<std::uint32_t, 15> tail = {
+      0x54860034u, 0x7ce42a14u, 0x7ce63850u, 0x38e7001fu, 0x54e7d97eu,
+      0x7ce903a6u, 0x7c0037acu, 0x38c60020u, 0x4200fff8u, 0x7c0004acu,
+      0x4c00012cu, 0x8001000cu, 0x7c0803a6u, 0x38210008u, 0x4e800020u};
+  if (!cycles || (address & 3u) || (cpu_.msr & kPpcMsrPr)) return false;
+  const auto* code = memory_.Resolve(address, 76u);
+  if (!code) return false;
+  const auto word = [&](unsigned i) {
+    const auto* p = code + i * 4u;
+    return (std::uint32_t(p[0]) << 24u) | (std::uint32_t(p[1]) << 16u) |
+           (std::uint32_t(p[2]) << 8u) | p[3];
+  };
+  constexpr std::array<std::uint32_t,4> prefix = {
+      0x3c800000u, 0x38840000u, 0x3ca00000u, 0x38a50000u};
+  for (unsigned i=0; i<4; ++i)
+    if ((word(i) & 0xffff0000u) != prefix[i]) return false;
+  for (unsigned i=0; i<tail.size(); ++i)
+    if (word(i+4u) != tail[i]) return false;
+  const auto immediate_pair = [&](unsigned i) {
+    return ((word(i) & 0xffffu) << 16u) +
+        static_cast<std::uint32_t>(static_cast<std::int16_t>(word(i+1u)));
+  };
+  const std::uint32_t base = immediate_pair(0), size = immediate_pair(2);
+  const std::uint32_t aligned = base & ~31u;
+  const std::uint64_t end = std::uint64_t(base) + size;
+  const std::uint64_t rounded = (end + 31u) & ~31ull;
+  // Reject wrap and zero-CTR loops; do not silently change their semantics.
+  if (end + 31u > 0xffffffffull || rounded <= aligned) return false;
+  std::uint32_t return_address=0;
+  if (cpu_.gpr[1] > 0xfffffff3u ||
+      !memory_.Read32(cpu_.gpr[1]+12u, &return_address)) return false;
+  const auto span = static_cast<std::uint32_t>(rounded-aligned);
+  InvalidateInstructionRange(aligned,span);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  cpu_.gpr[4]=base; cpu_.gpr[5]=size;
+  cpu_.gpr[6]=static_cast<std::uint32_t>(rounded); cpu_.gpr[7]=span/32u;
+  cpu_.ctr=0; cpu_.gpr[0]=return_address;
+  cpu_.gpr[1]+=8u; cpu_.lr=return_address; cpu_.pc=return_address & ~3u;
+  *cycles=16u+std::uint64_t(span/32u)*3u;
+  static unsigned logs=0;
+  if (logs++<16u)
+    std::fprintf(stderr,"GEKKOAOT_COPIED_CACHE_STUB_V252=1 pc=%08x base=%08x size=%u return=%08x policy=whole-signature-native-lowering\n",
+                 address,base,size,cpu_.pc);
+  return true;
+}
+
 void HostRuntime::InvalidateLowInstructionCache() {
+  sdk_idle_poll_pc_ = 0u;
   low_instruction_cache_valid_.fill(false);
+  native_low_vector_cache_.Reset();
 }
 
 void HostRuntime::InvalidateLowInstructionCacheLine(std::uint32_t address) {
+  sdk_idle_poll_pc_ = 0u;
   const std::uint32_t physical = AddressSpace::ToPhysical(address);
   if (physical >= kLowInstructionCacheSpan) return;
   const std::size_t line = physical / kLowInstructionCacheLineBytes;
   if (line < low_instruction_cache_valid_.size())
     low_instruction_cache_valid_[line] = false;
+  native_low_vector_cache_.InvalidateLine(address);
+}
+
+void HostRuntime::CaptureIdleRegs() {
+  auto* out = idle_loop_.regs.data();
+  const auto* cpu = reinterpret_cast<const std::uint8_t*>(&cpu_);
+  constexpr std::size_t kCore = offsetof(CPUState, timebase);
+  constexpr std::size_t kSystem =
+      offsetof(CPUState, program_exception) + sizeof(std::uint32_t) - offsetof(CPUState, sr);
+  std::memcpy(out, cpu, kCore);
+  std::memcpy(out + kCore, cpu + offsetof(CPUState, sr), kSystem);
+  std::memcpy(out + kCore + kSystem, &cpu_.reserve_addr, sizeof(cpu_.reserve_addr));
+  std::memcpy(out + kCore + kSystem + sizeof(cpu_.reserve_addr), &cpu_.reserve_valid,
+              sizeof(cpu_.reserve_valid));
+  idle_loop_.have_regs = true;
+}
+
+bool HostRuntime::IdleRegsMatch() const {
+  if (!idle_loop_.have_regs) return false;
+  const auto* in = idle_loop_.regs.data();
+  const auto* cpu = reinterpret_cast<const std::uint8_t*>(&cpu_);
+  constexpr std::size_t kCore = offsetof(CPUState, timebase);
+  constexpr std::size_t kSystem =
+      offsetof(CPUState, program_exception) + sizeof(std::uint32_t) - offsetof(CPUState, sr);
+  return std::memcmp(in, cpu, kCore) == 0 &&
+         std::memcmp(in + kCore, cpu + offsetof(CPUState, sr), kSystem) == 0 &&
+         std::memcmp(in + kCore + kSystem, &cpu_.reserve_addr, sizeof(cpu_.reserve_addr)) == 0 &&
+         std::memcmp(in + kCore + kSystem + sizeof(cpu_.reserve_addr), &cpu_.reserve_valid,
+                     sizeof(cpu_.reserve_valid)) == 0;
+}
+
+void HostRuntime::SnapshotIdlePages() {
+  constexpr std::size_t kPage = GuestWriteTracker::kPageBytes;
+  idle_page_data_.resize(idle_pages_.size() * kPage);
+  for (std::size_t i = 0; i < idle_pages_.size(); ++i)
+    std::memcpy(idle_page_data_.data() + i * kPage,
+                reinterpret_cast<const void*>(idle_pages_[i]), kPage);
+}
+
+void HostRuntime::RestartIdleLoop() {
+  auto& s = idle_loop_;
+  s.head_pc = cpu_.pc;
+  s.boundaries = 0u;
+  s.prev_boundaries = ~0u;
+  s.sequence = 0xcbf29ce484222325ull;
+  s.prev_sequence = 0u;
+  s.stable = 0u;
+  s.phase = 0u;
+  s.have_regs = false;
+}
+
+void HostRuntime::FailIdleLoopProof() {
+  auto& s = idle_loop_;
+  s.stable = 0u;
+  if (s.phase != 0u) {
+    // An unproductive proof costs tracker scans; back off exponentially on
+    // loops that repeat registers but keep changing memory.
+    s.backoff = std::min<std::uint32_t>(4096u, std::max<std::uint32_t>(16u, s.backoff * 2u));
+    s.cooldown = s.backoff;
+  }
+  s.phase = 0u;
+}
+
+// v274: called at every HostRuntime boundary (top of Run's loop).
+void HostRuntime::ObserveIdleLoop(RunResult& result) {
+  auto& s = idle_loop_;
+  const std::uint32_t pc = cpu_.pc;
+  if (pc != s.head_pc) {
+    s.sequence = (s.sequence ^ pc) * 0x100000001b3ull;
+    if (++s.boundaries > kIdleLoopMaxBoundaries) {
+      RestartIdleLoop();
+      s.effects = host_effects_ + hle_calls_;
+      CaptureIdleRegs();
+    }
+    return;
+  }
+
+  // One iteration completed. It repeats the previous one exactly when it
+  // crossed the same boundary PCs, called no host service, took no
+  // exception/interrupt and returned with identical guest registers.
+  const bool repeat = s.have_regs && s.boundaries == s.prev_boundaries &&
+                      s.sequence == s.prev_sequence &&
+                      host_effects_ + hle_calls_ == s.effects &&
+                      cpu_.exception == 0u && fault_.kind == FaultKind::None &&
+                      IdleRegsMatch();
+  if (!repeat) {
+    FailIdleLoopProof();
+  } else if (s.cooldown != 0u) {
+    --s.cooldown;
+  } else if (s.phase == 0u) {
+    if (++s.stable >= kIdleLoopStableIterations && (cpu_.msr & kPpcMsrEe) != 0u) {
+      if (!guest_write_tracker_.Available()) {
+        if (guest_write_tracker_.Enable({memory_.Mem1(), memory_.Mem2(),
+                                         memory_.FakeVmemBacking()}))
+          std::fprintf(stderr, "GEKKOAOT_IDLE_LOOP_PROOF_V274=1 tracker=%s\n",
+                       guest_write_tracker_.BackendName());
+        else
+          idle_loop_proof_enabled_ = false;  // no exact proof on this host
+      }
+      if (idle_loop_proof_enabled_ && guest_write_tracker_.Reset()) s.phase = 1u;
+    }
+  } else if (s.phase == 1u) {
+    // Learn the pages one iteration writes, then snapshot them: they are
+    // the start state of the iteration that must prove the fixed point.
+    idle_pages_.clear();
+    if (!guest_write_tracker_.Collect(&idle_pages_, kIdleLoopMaxPages)) {
+      FailIdleLoopProof();
+    } else {
+      SnapshotIdlePages();
+      s.phase = 2u;
+    }
+  } else {
+    idle_written_.clear();
+    bool changed = !guest_write_tracker_.Collect(&idle_written_, kIdleLoopMaxPages);
+    bool unknown = false;
+    for (const auto page : idle_written_) {
+      if (changed) break;
+      const auto it = std::find(idle_pages_.begin(), idle_pages_.end(), page);
+      if (it == idle_pages_.end()) { unknown = true; continue; }
+      const auto index = static_cast<std::size_t>(it - idle_pages_.begin());
+      changed = std::memcmp(reinterpret_cast<const void*>(page),
+                            idle_page_data_.data() + index * GuestWriteTracker::kPageBytes,
+                            GuestWriteTracker::kPageBytes) != 0;
+    }
+    if (changed) {
+      FailIdleLoopProof();
+    } else if (unknown) {
+      // The write set grew (for example a callee touched a new stack page);
+      // extend it and prove the next iteration instead.
+      for (const auto page : idle_written_)
+        if (std::find(idle_pages_.begin(), idle_pages_.end(), page) == idle_pages_.end() &&
+            idle_pages_.size() < kIdleLoopMaxPages)
+          idle_pages_.push_back(page);
+      SnapshotIdlePages();
+    } else {
+      // Proven: registers, host state and every written page are unchanged,
+      // so the next iteration would replay this one bit for bit. Sleep until
+      // the next hardware/timer event (bounded by the maintenance cap).
+      s.backoff = 0u;
+      ++idle_loop_parks_;
+      if (idle_loop_parks_ <= 8u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_IDLE_LOOP_PROOF_V274=1 action=park head=%08x boundaries=%u pages=%zu sp=%08x parks=%llu\n",
+                     s.head_pc, s.boundaries, idle_pages_.size(), cpu_.gpr[1],
+                     static_cast<unsigned long long>(idle_loop_parks_));
+      WaitForIdleEvent(result);
+      // Writes made while parked (DMA, disk threads) belong to the next
+      // verified iteration's start state, not to the loop.
+      if (!guest_write_tracker_.Reset()) FailIdleLoopProof();
+      else SnapshotIdlePages();
+    }
+  }
+
+  s.prev_boundaries = s.boundaries;
+  s.prev_sequence = s.sequence;
+  s.boundaries = 0u;
+  s.sequence = 0xcbf29ce484222325ull;
+  s.effects = host_effects_ + hle_calls_;
+  CaptureIdleRegs();
+}
+
+// v274: generated code sets MSR[EE] without leaving AOT execution unless this
+// returns true. An interrupt can only be taken at that point if it is already
+// latched: device state changes inside AOT code reach the host through MMIO and
+// HLE callbacks, and wall-clock hardware time is sampled at dispatch
+// boundaries, which keep their own budget cadence. NativeOS keeps the v17
+// boundary on every enable because its idle/alarm services act at boundaries.
+bool HostRuntime::EeEnableNeedsBoundary() {
+  if (runtime_profile_enabled_) ++ee_enable_queries_;
+  if (!ee_pending_query_enabled_ || compat_diagnostics_enabled_ || !os_hooks_.empty())
+    return true;
+  return pi_.InterruptPending() || decrementer_pending_;
+}
+
+// v274: OSDisableInterrupts/OSEnableInterrupts/OSRestoreInterrupts end with
+// "mtmsr; rlwinm r3,...; blr". The MSR[EE] side exit returns to HostRuntime
+// at the rlwinm, and re-entering the AOT module just to retire two register
+// instructions costs a full chunk entry (state load/store) plus another
+// boundary. Retire such tails here instead: at most four Rc=0 integer
+// register instructions (rlwinm, ori, oris, addi, addis, or) followed by blr.
+// Recognition uses instruction encodings only; no title or address database.
+// Every word is decoded before any state changes, so a non-matching tail
+// leaves the CPU untouched. Returns the retired instruction count, or 0.
+std::uint32_t HostRuntime::TryExecuteLeafTail(std::uint32_t pc, bool execute) {
+  constexpr std::uint32_t kMaxOps = 4u;
+  constexpr std::uint32_t kBlr = 0x4e800020u;
+  std::array<std::uint32_t, kMaxOps> ops{};
+  std::uint32_t count = 0u;
+  for (;;) {
+    std::uint32_t word = 0u;
+    if (!memory_.Read32(pc + 4u * count, &word)) return 0u;
+    if (word == kBlr) break;
+    if (count == kMaxOps) return 0u;
+    const std::uint32_t opcode = word >> 26u;
+    const bool supported =
+        (opcode == 21u && (word & 1u) == 0u) ||               // rlwinm
+        opcode == 24u || opcode == 25u ||                      // ori, oris
+        opcode == 14u || opcode == 15u ||                      // addi, addis
+        (opcode == 31u && ((word >> 1u) & 0x3ffu) == 444u &&  // or
+         (word & 1u) == 0u);
+    if (!supported) return 0u;
+    ops[count++] = word;
+  }
+  if (count == 0u) return 0u;
+  if (!execute) return count + 1u;
+
+  auto& gpr = cpu_.gpr;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const std::uint32_t w = ops[i];
+    const std::uint32_t opcode = w >> 26u;
+    const std::uint32_t rs = (w >> 21u) & 31u;  // rD for addi/addis
+    const std::uint32_t ra = (w >> 16u) & 31u;
+    const std::uint32_t imm = w & 0xffffu;
+    switch (opcode) {
+    case 21u: {
+      const std::uint32_t sh = (w >> 11u) & 31u;
+      const std::uint32_t mb = (w >> 6u) & 31u;
+      const std::uint32_t me = (w >> 1u) & 31u;
+      const std::uint32_t value = gpr[rs];
+      const std::uint32_t rotated = sh == 0u ? value : ((value << sh) | (value >> (32u - sh)));
+      const std::uint32_t head = 0xffffffffu >> mb;
+      const std::uint32_t tail = 0xffffffffu << (31u - me);
+      const std::uint32_t mask = mb <= me ? (head & tail) : (head | tail);
+      gpr[ra] = rotated & mask;
+      break;
+    }
+    case 24u: gpr[ra] = gpr[rs] | imm; break;
+    case 25u: gpr[ra] = gpr[rs] | (imm << 16u); break;
+    case 14u:
+      gpr[rs] = (ra == 0u ? 0u : gpr[ra]) +
+                static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(imm)));
+      break;
+    case 15u:
+      gpr[rs] = (ra == 0u ? 0u : gpr[ra]) + (imm << 16u);
+      break;
+    default: {  // or rA,rS,rB
+      const std::uint32_t rb = (w >> 11u) & 31u;
+      gpr[ra] = gpr[rs] | gpr[rb];
+      break;
+    }
+    }
+  }
+  cpu_.pc = cpu_.lr;
+  return count + 1u;
+}
+
+bool HostRuntime::IcbiLineTouchesFixedImages(std::uint32_t address) {
+  // Only the BAT-mapped MEM1 windows have a fixed EA identity. Physical-mode
+  // or paged addresses (and the ICFI flash-invalidate request at EA 0) keep
+  // the conservative full invalidation.
+  const std::uint32_t window = address & 0xf0000000u;
+  if (window != 0x80000000u && window != 0xc0000000u) return true;
+  const std::uint32_t physical = AddressSpace::ToPhysical(address);
+  if (physical >= AddressSpace::CompatMem1BackingSize) return true;
+  const std::uint64_t start = 0x80000000ull | (physical & ~31u);
+  const std::uint64_t end = start + 32u;
+  const auto touches = [&](const GekkoAOTModuleDesc* descriptor) {
+    if (!descriptor) return false;
+    if (!descriptor->chunk_ranges || descriptor->num_chunk_ranges == 0u) return true;
+    std::uint32_t lo = 0u;
+    std::uint32_t hi = descriptor->num_chunk_ranges;
+    while (lo < hi) {
+      const std::uint32_t mid = lo + (hi - lo) / 2u;
+      if (descriptor->chunk_ranges[mid].end <= start) lo = mid + 1u;
+      else hi = mid;
+    }
+    return lo < descriptor->num_chunk_ranges && descriptor->chunk_ranges[lo].start < end;
+  };
+  if (touches(module_.Descriptor())) return true;
+  for (const auto& side : secondary_modules_) {
+    const auto* descriptor = side ? side->Descriptor() : nullptr;
+    if (!descriptor) continue;
+    // REL images run at OSLink-chosen heap addresses; their publication is
+    // tracked through rel_mapping_dirty_, which the targeted path preserves
+    // outside the exception-vector page.
+    if (descriptor->num_rel_modules != 0u) {
+      if (AddressSpace::ToPhysical(address) < kLowInstructionCacheSpan) continue;
+      return true;
+    }
+    if (touches(descriptor)) return true;
+  }
+  return false;
+}
+
+void HostRuntime::InvalidateDispatchProbesForRange(std::uint32_t address,
+                                                  std::uint32_t size) {
+  ++native_read_poll_generation_;
+  // v274: dispatch probes used to be flushed (128 KiB) on every icbi epoch.
+  // A probe at pc decodes [pc-4, pc+24), so only probes whose window meets the
+  // published lines can change; drop those under each MEM1 alias a dispatch
+  // PC can use, plus every recorded SDK idle hit (its OSEnableInterrupts
+  // callee lies elsewhere). Paged/physical addresses, ICFI (EA 0) and large
+  // ranges keep the full flush.
+  const std::uint32_t window = address & 0xf0000000u;
+  const std::uint32_t physical = AddressSpace::ToPhysical(address);
+  constexpr std::uint32_t kTargetedProbeRangeLimit = 4096u;
+  if ((window != 0x80000000u && window != 0xc0000000u) || size == 0u ||
+      size > kTargetedProbeRangeLimit ||
+      physical >= AddressSpace::CompatMem1BackingSize) {
+    ++dispatch_code_probe_generation_;
+    sdk_idle_probe_pcs_.clear();
+    return;
+  }
+  const std::uint32_t first = physical & ~31u;
+  const std::uint32_t last = (physical + size + 31u) & ~31u;
+  const std::uint32_t bases[] = {0x80000000u, 0xc0000000u, 0u};
+  const auto drop = [this](std::uint32_t pc) {
+    auto& probe = dispatch_code_probe_cache_[((pc >> 2u) ^ (pc >> 13u)) &
+                                             (kDispatchCodeProbeCacheSize - 1u)];
+    if (probe.pc == pc) probe = {};
+  };
+  for (const std::uint32_t base : bases)
+    for (std::uint32_t pc = (base | first) - 20u; pc != (base | last) + 4u; pc += 4u)
+      drop(pc);
+  for (const std::uint32_t pc : sdk_idle_probe_pcs_) drop(pc);
+  sdk_idle_probe_pcs_.clear();
 }
 
 bool HostRuntime::FetchLowMemoryInstruction(std::uint32_t address,
@@ -3126,8 +5882,71 @@ bool HostRuntime::FetchLowMemoryInstruction(std::uint32_t address,
   return true;
 }
 
+bool HostRuntime::ExecuteNativeLowMemoryVector(std::uint32_t address,
+                                              std::uint64_t* charged_cycles) {
+  if (!native_low_vector_enabled_ || !charged_cycles ||
+      (cpu_.msr & (kPpcMsrEe | kPpcMsrPr)) != 0u ||
+      (spr_state_[kSprHid0] & kHid0IceMask) == 0u)
+    return false;
+  const auto physical = AddressSpace::ToPhysical(address);
+  if (!IsLowExceptionVectorAddress(physical) || (physical & 0xffu) != 0u)
+    return false;
+
+  const NativeLowVector* proof = native_low_vector_cache_.Find(address);
+  std::optional<NativeLowVector> decoded;
+  if (!proof) {
+    constexpr auto line_span = (NativeLowVector::ByteCount + kLowInstructionCacheLineBytes - 1u) &
+                               ~(kLowInstructionCacheLineBytes - 1u);
+    if (!memory_.Resolve(address, line_span)) return false;
+    std::array<std::uint32_t, NativeLowVector::WordCount> words{};
+    // Inspect exactly the currently visible instructions without filling any
+    // untouched cache line. A failed proof/custom vector must retain the
+    // interpreter's original fetch order and fault/SMC visibility.
+    for (std::size_t i = 0u; i < words.size(); ++i) {
+      const auto word_physical = physical + std::uint32_t(i) * 4u;
+      const auto line = word_physical / kLowInstructionCacheLineBytes;
+      if (low_instruction_cache_valid_[line])
+        words[i] = low_instruction_cache_[word_physical / 4u];
+      else if (!memory_.Read32(word_physical, &words[i]))
+        return false;
+      // Custom VM/DSI trampolines usually differ at their first opcode. Do
+      // not inspect the other cache lines once the exact SDK proof fails.
+      if (i == 0u && words[i] != 0x7c9043a6u) return false;
+    }
+    decoded = NativeLowVector::Decode(words);
+    if (!decoded) return false;
+    proof = &*decoded;
+  }
+
+  if (!proof->Execute(cpu_, memory_, address, spr_state_[272u], *charged_cycles))
+    return false;
+  if (decoded) {
+    // Both accepted RI branches fetch all five cache lines. Context writes
+    // cannot overlap them (checked by Execute), so materialize those same
+    // lines only after successful admission/execution, then retain the proof.
+    // The complete five-line aperture was prevalidated above.
+    bool fetched = true;
+    for (std::uint32_t offset = 0u; offset < NativeLowVector::ByteCount;
+         offset += kLowInstructionCacheLineBytes) {
+      std::uint32_t word = 0u;
+      fetched = FetchLowMemoryInstruction(address + offset, &word) && fetched;
+    }
+    if (fetched) native_low_vector_cache_.Store(address, *decoded);
+    ++native_low_vector_proofs_;
+  }
+  // Preserve diagnostics/idle-proof bookkeeping from 34 instructions plus
+  // nine SPR transfers without re-entering each individual host service.
+  if (track_host_effects_) host_effects_ += 43u;
+  if (native_low_vector_executions_++ == 0u)
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_EXCEPTION_VECTOR_V294=1 accepted=%08x instructions=34 cycles=35 identity=exact-sdk-template fallback=original-interpreter\n",
+                 address);
+  return true;
+}
+
 bool HostRuntime::ExecuteLowMemoryInstruction(std::uint32_t address,
                                               std::uint64_t* charged_cycles) {
+  CountHostEffect();
   if (!charged_cycles) return false;
   const std::uint32_t physical = AddressSpace::ToPhysical(address);
   if (!IsLowExceptionVectorAddress(physical) || (physical & 3u) != 0u) return false;
@@ -3142,6 +5961,7 @@ bool HostRuntime::ExecuteLowMemoryInstruction(std::uint32_t address,
   // the standalone equivalent of the normal execution chassis accepting the
   // pending synchronous exception. Consume only the matching synchronous bit;
   // unrelated/future asynchronous causes remain pending.
+  if (physical == 0x0300u) NoteDsiTrace('A', cpu_.srr0, cpu_.exception);
   AcknowledgeSynchronousExceptionVector(&cpu_, physical);
 
   // RAM-resident OS vectors access the low-memory context pointers and, on
@@ -3182,6 +6002,7 @@ bool HostRuntime::ExecuteLowMemoryInstruction(std::uint32_t address,
     cpu_.msr = (cpu_.msr & ~kPpcMsrRfiMask) | (cpu_.srr1 & kPpcMsrRfiMask);
     cpu_.msr &= ~kPpcMsrPow;
     cpu_.pc = cpu_.srr0 & ~3u;
+    pe_notification_irq_active_ = false;
     *charged_cycles = 2u;
     return true;
   }
@@ -3384,14 +6205,20 @@ std::uint64_t HostRuntime::TakeRealtimeHardwareCycles(std::uint64_t charged,
   const std::uint64_t poll_quantum = force_sample ? kIdlePollQuantum : kGuestPollQuantum;
 
   hardware_clock_sampled_last_call_ = false;
-  if (charged > std::numeric_limits<std::uint64_t>::max() -
-                    hardware_clock_guest_since_sample_)
-    hardware_clock_guest_since_sample_ = poll_quantum;
-  else
-    hardware_clock_guest_since_sample_ += charged;
+  if (!force_sample) {
+    if (charged > std::numeric_limits<std::uint64_t>::max() -
+                      hardware_clock_guest_since_sample_)
+      hardware_clock_guest_since_sample_ = poll_quantum;
+    else
+      hardware_clock_guest_since_sample_ += charged;
 
-  if (hardware_clock_started_ && hardware_clock_guest_since_sample_ < poll_quantum)
-    return 0u;
+    if (hardware_clock_started_ && hardware_clock_guest_since_sample_ < poll_quantum)
+      return 0u;
+  }
+  // v158: idle/event waits call with charged=0 after a real wall-clock park.
+  // "force_sample" must therefore actually sample the clock; the old code
+  // merely selected a smaller guest-work quantum and could return zero forever
+  // after sleeping, forcing NativeOS/SDK idle paths back into a busy loop.
   hardware_clock_guest_since_sample_ = 0u;
 
   if (!hardware_tsc_checked_) {
@@ -3613,9 +6440,155 @@ void HostRuntime::ServicePerformanceMetrics(std::uint64_t hardware_cycles) {
 
   std::fprintf(stderr,
                "GEKKOAOT_PERF_V49=1 vps=%.3f nominal_vps=%.3f guest_fps=%.3f "
-               "present_fps=%.3f interp_fps=%.3f speed=%.2f target=%u drops=%llu\\n",
+               "present_fps=%.3f interp_fps=%.3f speed=%.2f target=%u drops=%llu\n",
                vps, nominal_vps, guest_fps, present_fps, interp_fps, speed,
                host_fps_limit_hz_, static_cast<unsigned long long>(dropped_delta));
+  // v335: opt-in guest OS thread dump (GEKKOAOT_GUEST_THREAD_DUMP=1, every
+  // 5 s): walks the SDK active-thread queue in guest RAM, so it also covers
+  // titles whose OS runs as guest code (no NativeOS). Saved PC/LR, the stack
+  // chain and the wait queue show where each thread is blocked.
+  static const bool thread_dump = RuntimeEnvBool("GEKKOAOT_GUEST_THREAD_DUMP", false);
+  static unsigned thread_dump_tick = 0u;
+  if (thread_dump && ++thread_dump_tick % 5u == 0u) {
+    std::uint32_t thread = 0u, current = 0u;
+    memory_.Read32(0x800000E4u, &current);
+    memory_.Read32(0x800000DCu, &thread);
+    for (unsigned n = 0u; thread != 0u && n < 32u; ++n) {
+      std::uint16_t state = 0u;
+      std::uint32_t prio = 0u, suspend = 0u, queue = 0u, srr0 = 0u, lr = 0u, sp = 0u, next = 0u;
+      memory_.Read16(thread + 0x2C8u, &state);
+      memory_.Read32(thread + 0x2D0u, &prio);
+      memory_.Read32(thread + 0x2CCu, &suspend);
+      memory_.Read32(thread + 0x2DCu, &queue);
+      memory_.Read32(thread + 0x198u, &srr0);
+      memory_.Read32(thread + 0x084u, &lr);
+      memory_.Read32(thread + 0x004u, &sp);
+      std::uint32_t frames[2]{};
+      for (auto& frame : frames) {
+        std::uint32_t back = 0u, saved = 0u;
+        if (!memory_.Read32(sp, &back) || !memory_.Read32(back + 4u, &saved)) break;
+        frame = saved; sp = back;
+      }
+      std::fprintf(stderr, "GEKKOAOT_GUEST_THREAD_V335=1 thread=%08x%s state=%u prio=%d suspend=%d queue=%08x pc=%08x lr=%08x callers=%08x,%08x\n",
+                   thread, thread == current ? "*" : "", state, static_cast<int>(prio),
+                   static_cast<int>(suspend), queue, srr0, lr, frames[0], frames[1]);
+      if (!memory_.Read32(thread + 0x2FCu, &next)) break;
+      thread = next;
+    }
+  }
+  // v335: interrupt delivery rates; a storm (an unacknowledged cause or an
+  // OS that re-arms every boundary) shows up here as tens of thousands per second.
+  if (irq_external_taken_ != irq_report_external_ || irq_decrementer_taken_ != irq_report_decrementer_) {
+    std::fprintf(stderr, "GEKKOAOT_IRQ_RATE_V335=1 external_per_s=%.0f causes=%05x decrementer_per_s=%.0f "
+                 "di=%.0f si=%.0f exi=%.0f ai=%.0f dsp=%.0f vi=%.0f pe_token=%.0f pe_finish=%.0f cp=%.0f fpscr=%08x\n",
+                 static_cast<double>(irq_external_taken_ - irq_report_external_) / seconds,
+                 irq_external_causes_,
+                 static_cast<double>(irq_decrementer_taken_ - irq_report_decrementer_) / seconds,
+                 irq_cause_counts_[2] / seconds, irq_cause_counts_[3] / seconds, irq_cause_counts_[4] / seconds,
+                 irq_cause_counts_[5] / seconds, irq_cause_counts_[6] / seconds, irq_cause_counts_[8] / seconds,
+                 irq_cause_counts_[9] / seconds, irq_cause_counts_[10] / seconds, irq_cause_counts_[11] / seconds,
+                 cpu_.fpscr);
+    irq_cause_counts_.fill(0u);
+    irq_report_external_ = irq_external_taken_;
+    irq_report_decrementer_ = irq_decrementer_taken_;
+    irq_external_causes_ = 0u;
+  }
+  if (rate_throttles_ != rate_report_throttles_) {
+    std::fprintf(stderr, "GEKKOAOT_GUEST_RATE_V333=1 throttles_per_s=%.0f parked=%.1f%% clock_spin_parks=%llu probes=%llu\n",
+                 static_cast<double>(rate_throttles_ - rate_report_throttles_) / seconds,
+                 100.0 * static_cast<double>(rate_throttle_ns_ - rate_report_ns_) / 1e9 / seconds,
+                 static_cast<unsigned long long>(clock_spin_parks_),
+                 static_cast<unsigned long long>(clock_spin_probes_));
+    rate_report_throttles_ = rate_throttles_;
+    rate_report_ns_ = rate_throttle_ns_;
+  }
+  // v274: host-boundary telemetry; every optimization that keeps guest code
+  // native shows up here as fewer boundaries per second.
+  const auto per_second = [&](std::uint64_t total, std::uint64_t& last) {
+    const double rate = static_cast<double>(total - last) / seconds;
+    last = total;
+    return rate;
+  };
+  if (runtime_profile_enabled_) {
+    native_gx_.ReportSyncProfile(seconds);
+    std::fprintf(stderr,
+                 "GEKKOAOT_IDLE_V300=1 idle_gx_busy=%.1f%% idle_gx_idle=%.1f%% gx_wakes_per_s=%.0f\n",
+                 100.0 * static_cast<double>(idle_ns_gx_busy_) / 1e9 / seconds,
+                 100.0 * static_cast<double>(idle_ns_gx_idle_) / 1e9 / seconds,
+                 static_cast<double>(idle_gx_wakes_) / seconds);
+    idle_ns_gx_busy_ = idle_ns_gx_idle_ = idle_gx_wakes_ = 0u;
+    std::fprintf(stderr,
+                 "GEKKOAOT_EXTERNAL_V300=1 reads_per_s vm=%.0f wgpipe=%.0f mmio=%.0f other=%.0f "
+                 "writes_per_s vm=%.0f wgpipe=%.0f mmio=%.0f other=%.0f\n",
+                 external_reads_[0] / seconds, external_reads_[1] / seconds,
+                 external_reads_[2] / seconds, external_reads_[3] / seconds,
+                 external_writes_[0] / seconds, external_writes_[1] / seconds,
+                 external_writes_[2] / seconds, external_writes_[3] / seconds);
+    external_reads_ = {};
+    external_writes_ = {};
+    if (!external_other_regions_.empty()) {
+      std::vector<std::pair<std::uint64_t, std::uint32_t>> top;
+      for (const auto& [key, count] : external_other_regions_) top.emplace_back(count, key);
+      std::sort(top.begin(), top.end(), std::greater<>());
+      std::string line;
+      for (std::size_t i = 0; i < top.size() && i < 8u; ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %08x%s=%.0f", top[i].second & 0xffff0000u,
+                      (top[i].second & 1u) ? "w" : "r", static_cast<double>(top[i].first) / seconds);
+        line += item;
+      }
+      std::fprintf(stderr, "GEKKOAOT_EXTERNAL_OTHER_V301=1 per_s%s\n", line.c_str());
+      external_other_regions_.clear();
+    }
+  }
+  if (runtime_profile_enabled_)
+  std::fprintf(stderr,
+               "GEKKOAOT_BOUNDARY_V274=1 boundaries_per_s=%.0f leaf_tails_per_s=%.0f "
+               "hle_per_s=%.0f host_effects_per_s=%.0f idle_parks_per_s=%.1f guest_mhz=%.1f "
+               "ee_queries_per_s=%.0f\n",
+               per_second(boundaries_total_, perf_last_boundaries_),
+               per_second(leaf_tail_executions_, perf_last_leaf_tails_),
+               per_second(hle_calls_, perf_last_hle_calls_),
+               per_second(host_effects_, perf_last_host_effects_),
+               per_second(idle_loop_parks_, perf_last_idle_parks_),
+               per_second(guest_cycles_total_, perf_last_guest_cycles_) / 1e6,
+               per_second(ee_enable_queries_, perf_last_ee_queries_));
+  if (runtime_profile_enabled_) {
+    // v301: busiest native services (s<SimpleHleKind>, o<NativeOS::Kind>).
+    std::vector<std::pair<std::uint64_t, std::string>> kinds;
+    for (std::size_t i = 0; i < simple_hle_kind_calls_.size(); ++i)
+      if (simple_hle_kind_calls_[i]) kinds.emplace_back(simple_hle_kind_calls_[i], "s" + std::to_string(i));
+    for (std::size_t i = 0; i < os_hle_kind_calls_.size(); ++i)
+      if (os_hle_kind_calls_[i]) kinds.emplace_back(os_hle_kind_calls_[i], "o" + std::to_string(i));
+    std::sort(kinds.begin(), kinds.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string line;
+    for (std::size_t i = 0; i < kinds.size() && i < 10u; ++i) {
+      char item[48];
+      std::snprintf(item, sizeof(item), " %s=%.0f", kinds[i].second.c_str(),
+                    static_cast<double>(kinds[i].first) / seconds);
+      line += item;
+    }
+    std::fprintf(stderr, "GEKKOAOT_HLE_KINDS_V301=1 guest_declines=%llu per_s%s\n",
+                 static_cast<unsigned long long>(hle_guest_declines_), line.c_str());
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_SDK_PACKETS_V306=1 packets_per_s=%.0f mmio_callbacks=0\n",
+                 static_cast<double>(native_sdk_gx_packets_)/seconds);
+    native_sdk_gx_packets_=0u;
+    simple_hle_kind_calls_ = {};
+    os_hle_kind_calls_ = {};
+  }
+  if (boundary_profile_enabled_ && !boundary_profile_.empty()) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> top(boundary_profile_.begin(),
+                                                             boundary_profile_.end());
+    const std::size_t count = std::min<std::size_t>(top.size(), 64u);
+    std::partial_sort(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(count), top.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (std::size_t i = 0; i < count; ++i)
+      std::fprintf(stderr, "GEKKOAOT_BOUNDARY_PROFILE_V274=1 rank=%zu pc=%08x lr=%08x per_s=%.0f\n",
+                   i + 1u, static_cast<unsigned>(top[i].first >> 32u),
+                   static_cast<unsigned>(top[i].first),
+                   static_cast<double>(top[i].second) / seconds);
+    boundary_profile_.clear();
+  }
 
   perf_metrics_last_ = now;
   perf_last_hardware_cycles_ = perf_hardware_cycles_total_;
@@ -3675,6 +6648,235 @@ void HostRuntime::PollLiveVideoConfig(std::uint64_t charged) {
   if (have_aspect) native_gx_.SetAspectMode(aspect_mode);
 }
 
+void HostRuntime::ServiceWidescreenFrustumAssist(bool frame_boundary) {
+  if (!frame_boundary || !widescreen_frustum_assist_enabled_) return;
+
+  constexpr float kNativeAspect = 4.0f / 3.0f;
+  constexpr std::uint32_t kMem1Base = 0x80000000u;
+  constexpr std::size_t kAutoScanBegin = 0x00200000u;
+  constexpr std::size_t kAutoScanTailGuard = 0x00200000u;
+  constexpr std::size_t kAutoScanChunk = 0x00080000u;  // 512 KiB / VI frame.
+  constexpr std::uint32_t kAutoConfirmFrames = 45u;
+  constexpr std::uint32_t kAutoRetryFrames = 180u;
+
+  ++widescreen_frustum_scan_frames_;
+
+  const auto read_guest_float = [&](std::uint32_t address, float* out) -> bool {
+    if (!out) return false;
+    const auto* p = memory_.Resolve(address, sizeof(float));
+    if (!p) return false;
+    *out = GekkoAOT::GX::ReadBigEndianFloat(p);
+    return std::isfinite(*out);
+  };
+  const auto write_guest_float = [&](std::uint32_t address, float value) -> bool {
+    auto* p = memory_.Resolve(address, sizeof(float));
+    if (!p || !std::isfinite(value)) return false;
+    GekkoAOT::GX::WriteBigEndianFloat(p, value);
+    return true;
+  };
+  const auto clear_auto_scan = [&] {
+    widescreen_frustum_scan_offset_ = 0u;
+    widescreen_frustum_scan_candidate_count_ = 0u;
+    widescreen_frustum_scan_candidate_aspect_ = 0u;
+    widescreen_frustum_scan_candidate_fov_ = 0u;
+  };
+  const auto clear_pending = [&] {
+    widescreen_frustum_pending_aspect_address_ = 0u;
+    widescreen_frustum_pending_fov_address_ = 0u;
+    widescreen_frustum_pending_confirm_frames_ = 0u;
+  };
+  const auto invalidate_auto_selection = [&] {
+    widescreen_frustum_aspect_address_ = 0u;
+    widescreen_frustum_fov_address_ = 0u;
+    widescreen_frustum_selected_logged_ = false;
+    widescreen_frustum_next_scan_frame_ =
+        widescreen_frustum_scan_frames_ + kAutoRetryFrames;
+  };
+
+  const bool wide = native_gx_.WidescreenActive();
+  const float target_aspect = native_gx_.WidescreenTargetAspect();
+
+  // Restore exactly the value observed before the assist modified it.  Do not
+  // assume every title's native camera scalar is bit-identical to 4/3.
+  if (!wide || !std::isfinite(target_aspect) ||
+      target_aspect <= kNativeAspect * 1.005f) {
+    if (widescreen_frustum_aspect_address_ != 0u) {
+      float current = 0.0f;
+      if (read_guest_float(widescreen_frustum_aspect_address_, &current) &&
+          std::fabs(current - widescreen_frustum_last_target_aspect_) <= 0.002f &&
+          write_guest_float(widescreen_frustum_aspect_address_,
+                            widescreen_frustum_original_aspect_)) {
+        std::fprintf(stderr,
+                     "GEKKOAOT_WIDESCREEN_FRUSTUM_V177 action=restore address=0x%08x aspect=%.6f\n",
+                     widescreen_frustum_aspect_address_,
+                     widescreen_frustum_original_aspect_);
+      }
+    }
+    widescreen_frustum_last_target_aspect_ = kNativeAspect;
+    return;
+  }
+  widescreen_frustum_last_target_aspect_ = target_aspect;
+
+  float observed_fov = 0.0f;
+  float observed_aspect = 0.0f;
+  const bool have_camera =
+      native_gx_.CurrentPerspectiveCamera(&observed_fov, &observed_aspect) &&
+      GekkoAOT::GX::LooksLikeCameraFov(observed_fov) &&
+      GekkoAOT::GX::LooksLikeNativeAspect(observed_aspect);
+  if (have_camera) {
+    widescreen_frustum_observed_fov_ = observed_fov;
+    widescreen_frustum_observed_aspect_ = observed_aspect;
+  }
+
+  // Explicit override remains an escape hatch, but is not part of automatic
+  // detection and therefore does not introduce a per-game rule in the runtime.
+  if (widescreen_frustum_aspect_address_ == 0u &&
+      widescreen_frustum_pending_aspect_address_ == 0u) {
+    if (const char* configured =
+            std::getenv("GEKKOAOT_WIDESCREEN_FRUSTUM_ASPECT_ADDR");
+        configured && *configured) {
+      char* endp = nullptr;
+      const unsigned long value = std::strtoul(configured, &endp, 0);
+      if (endp != configured && endp && *endp == '\0' &&
+          value <= std::numeric_limits<std::uint32_t>::max() &&
+          memory_.Resolve(static_cast<std::uint32_t>(value), sizeof(float))) {
+        widescreen_frustum_aspect_address_ = static_cast<std::uint32_t>(value);
+        widescreen_frustum_manual_ = true;
+        float original = kNativeAspect;
+        if (read_guest_float(widescreen_frustum_aspect_address_, &original))
+          widescreen_frustum_original_aspect_ = original;
+        clear_auto_scan();
+        std::fprintf(stderr,
+                     "GEKKOAOT_WIDESCREEN_FRUSTUM_V177 source=manual address=0x%08x original=%.6f target=%.6f\n",
+                     widescreen_frustum_aspect_address_,
+                     widescreen_frustum_original_aspect_, target_aspect);
+      }
+    }
+  }
+
+  // Automatic path: Aurora supplies the actual perspective projection consumed
+  // by GX.  Search incrementally for a *unique* adjacent RAM pair matching that
+  // live FOV and aspect.  This removes per-title address rules and rejects
+  // unrelated 1.333333/FOV-looking constants elsewhere in MEM1.
+  if (!widescreen_frustum_manual_ && have_camera &&
+      widescreen_frustum_aspect_address_ == 0u &&
+      widescreen_frustum_pending_aspect_address_ == 0u &&
+      widescreen_frustum_scan_frames_ >= widescreen_frustum_next_scan_frame_) {
+    const std::size_t reported =
+        std::min<std::size_t>(AddressSpace::ReportedMem1Size(), memory_.Mem1().size());
+    const std::size_t scan_end =
+        reported > kAutoScanTailGuard ? reported - kAutoScanTailGuard : reported;
+
+    if (scan_end > kAutoScanBegin + 8u) {
+      if (widescreen_frustum_scan_offset_ == 0u)
+        widescreen_frustum_scan_offset_ = static_cast<std::uint32_t>(kAutoScanBegin);
+
+      const std::size_t begin = widescreen_frustum_scan_offset_;
+      const std::size_t end = std::min(scan_end, begin + kAutoScanChunk + 4u);
+      const auto candidates = GekkoAOT::GX::FindProjectionCorrelatedCandidates(
+          memory_.Mem1(), kMem1Base, begin, end, observed_fov, observed_aspect, 8u);
+
+      for (const auto& candidate : candidates) {
+        if (widescreen_frustum_scan_candidate_count_ == 0u) {
+          widescreen_frustum_scan_candidate_aspect_ = candidate.aspect_address;
+          widescreen_frustum_scan_candidate_fov_ = candidate.fov_address;
+        }
+        if (widescreen_frustum_scan_candidate_count_ < 2u)
+          ++widescreen_frustum_scan_candidate_count_;
+      }
+
+      const std::size_t next = begin + kAutoScanChunk;
+      const bool finished = next >= scan_end ||
+                            widescreen_frustum_scan_candidate_count_ > 1u;
+      if (!finished) {
+        widescreen_frustum_scan_offset_ = static_cast<std::uint32_t>(next);
+      } else {
+        if (widescreen_frustum_scan_candidate_count_ == 1u) {
+          widescreen_frustum_pending_aspect_address_ =
+              widescreen_frustum_scan_candidate_aspect_;
+          widescreen_frustum_pending_fov_address_ =
+              widescreen_frustum_scan_candidate_fov_;
+          widescreen_frustum_pending_confirm_frames_ = 0u;
+          widescreen_frustum_ambiguous_logged_ = false;
+          std::fprintf(stderr,
+                       "GEKKOAOT_WIDESCREEN_FRUSTUM_V177 source=projection phase=confirm address=0x%08x fov-address=0x%08x gx-fov=%.3f gx-aspect=%.6f frames=%u\n",
+                       widescreen_frustum_pending_aspect_address_,
+                       widescreen_frustum_pending_fov_address_, observed_fov,
+                       observed_aspect, kAutoConfirmFrames);
+        } else if (!widescreen_frustum_ambiguous_logged_) {
+          std::fprintf(stderr,
+                       "GEKKOAOT_WIDESCREEN_FRUSTUM_V177 source=projection phase=scan candidates=%u action=no-patch reason=%s gx-fov=%.3f gx-aspect=%.6f\n",
+                       widescreen_frustum_scan_candidate_count_,
+                       widescreen_frustum_scan_candidate_count_ == 0u ? "none" : "ambiguous",
+                       observed_fov, observed_aspect);
+          widescreen_frustum_ambiguous_logged_ = true;
+        }
+        clear_auto_scan();
+        widescreen_frustum_next_scan_frame_ =
+            widescreen_frustum_scan_frames_ + kAutoRetryFrames;
+      }
+    }
+  }
+
+  // Candidate must track the live GX camera for 45 frames.  This is much
+  // stronger evidence than merely remaining in a plausible numeric range.
+  if (!widescreen_frustum_manual_ &&
+      widescreen_frustum_aspect_address_ == 0u &&
+      widescreen_frustum_pending_aspect_address_ != 0u) {
+    float aspect = 0.0f;
+    float fov = 0.0f;
+    const bool valid = have_camera &&
+        read_guest_float(widescreen_frustum_pending_aspect_address_, &aspect) &&
+        read_guest_float(widescreen_frustum_pending_fov_address_, &fov) &&
+        GekkoAOT::GX::LooksLikeAspect(aspect, observed_aspect) &&
+        GekkoAOT::GX::MatchesObservedFov(fov, observed_fov);
+    if (!valid) {
+      clear_pending();
+      widescreen_frustum_next_scan_frame_ =
+          widescreen_frustum_scan_frames_ + kAutoRetryFrames;
+    } else if (++widescreen_frustum_pending_confirm_frames_ >= kAutoConfirmFrames) {
+      widescreen_frustum_aspect_address_ =
+          widescreen_frustum_pending_aspect_address_;
+      widescreen_frustum_fov_address_ = widescreen_frustum_pending_fov_address_;
+      widescreen_frustum_original_aspect_ = aspect;
+      clear_pending();
+      widescreen_frustum_selected_logged_ = false;
+    }
+  }
+
+  if (widescreen_frustum_aspect_address_ == 0u) return;
+
+  float current_aspect = 0.0f;
+  if (!read_guest_float(widescreen_frustum_aspect_address_, &current_aspect)) return;
+
+  const bool original_aspect = GekkoAOT::GX::LooksLikeAspect(
+      current_aspect, widescreen_frustum_original_aspect_, 0.0040f);
+  const bool already_target = std::fabs(current_aspect - target_aspect) <= 0.002f;
+  if (!original_aspect && !already_target) {
+    if (!widescreen_frustum_manual_) invalidate_auto_selection();
+    return;
+  }
+
+  if (original_aspect &&
+      !write_guest_float(widescreen_frustum_aspect_address_, target_aspect))
+    return;
+
+  if (!widescreen_frustum_selected_logged_) {
+    float fov = 0.0f;
+    const bool have_fov = widescreen_frustum_fov_address_ != 0u &&
+                          read_guest_float(widescreen_frustum_fov_address_, &fov);
+    std::fprintf(stderr,
+                 "GEKKOAOT_WIDESCREEN_FRUSTUM_V177 source=%s action=patch address=0x%08x original=%.6f target=%.6f fov-address=0x%08x fov=%s%.3f gx-fov=%.3f gx-aspect=%.6f hardcode=none\n",
+                 widescreen_frustum_manual_ ? "manual" : "projection",
+                 widescreen_frustum_aspect_address_,
+                 widescreen_frustum_original_aspect_, target_aspect,
+                 widescreen_frustum_fov_address_, have_fov ? "" : "n/a:",
+                 have_fov ? fov : 0.0f, widescreen_frustum_observed_fov_,
+                 widescreen_frustum_observed_aspect_);
+    widescreen_frustum_selected_logged_ = true;
+  }
+}
+
 void HostRuntime::ServiceDiscCompletion(std::uint64_t cycles) {
   if (di_async_completion_pending_) {
     // A guest may cancel/break the DI command before the deferred completion.
@@ -3682,7 +6884,7 @@ void HostRuntime::ServiceDiscCompletion(std::uint64_t cycles) {
     // resurrecting a cancelled command.
     if ((di_.DMAControl() & 1u) == 0u || di_.CommandSequence() != di_async_sequence_) {
       static unsigned cancel_logs = 0u;
-      if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && cancel_logs++ < 32u)
+      if (EnvTraceDvd() && cancel_logs++ < 32u)
         std::fprintf(stderr,
                      "GEKKOAOT_NATIVE_DI_ASYNC_V58=1 phase=cancel seq=%llu offset=%08llx dma=%08x bytes=%u\n",
                      static_cast<unsigned long long>(di_async_sequence_),
@@ -3690,8 +6892,23 @@ void HostRuntime::ServiceDiscCompletion(std::uint64_t cycles) {
                      di_async_dma_address_, di_async_bytes_);
       di_async_completion_pending_ = false;
       di_async_cycles_remaining_ = 0u;
+      if (di_io_inflight_) QuiesceDiscIo();
       di_async_staging_.clear();
     } else if (cycles >= di_async_cycles_remaining_) {
+      if (di_io_inflight_) {
+        if (!di_io_future_.valid() ||
+            di_io_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+          // Guest drive time has expired, but host I/O is still running. Keep
+          // TSTART asserted and poll on the next hardware slice; never block the
+          // AOT CPU worker waiting for disk/decompression.
+          di_async_cycles_remaining_ = 0u;
+          return;
+        }
+        DiscIoResult io = di_io_future_.get();
+        di_io_inflight_ = false;
+        if (io.ok) di_async_staging_ = std::move(io.bytes);
+        else di_async_staging_.clear();
+      }
       const auto sequence = di_async_sequence_;
       const auto bytes = di_async_bytes_;
       const auto dma = di_async_dma_address_;
@@ -3702,6 +6919,7 @@ void HostRuntime::ServiceDiscCompletion(std::uint64_t cycles) {
       if (di_async_staging_.size() == bytes) {
         if (auto* target = memory_.Resolve(dma, bytes)) {
           std::memcpy(target, di_async_staging_.data(), bytes);
+          native_gx_.NotifyMemoryWrite(dma, bytes);
           published = true;
         }
       }
@@ -3713,12 +6931,17 @@ void HostRuntime::ServiceDiscCompletion(std::uint64_t cycles) {
       }
       SyncNativeDIInterrupt();
       static unsigned complete_logs = 0u;
-      if (RuntimeEnvBool("GEKKOAOT_TRACE_DVD", false) && complete_logs++ < 256u)
+      if (EnvTraceDvd() && complete_logs++ < 256u) {
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        if (const auto* target = memory_.Resolve(dma, bytes))
+          for (std::uint32_t i = 0; i < bytes; ++i) hash = (hash ^ target[i]) * 0x100000001b3ull;
         std::fprintf(stderr,
-                     "GEKKOAOT_NATIVE_DI_PARITY_V143=1 phase=%s seq=%llu offset=%08llx dma=%08x bytes=%u status=%08x visibility=completion\n",
+                     "GEKKOAOT_NATIVE_DI_PARITY_V143=1 phase=%s seq=%llu offset=%08llx dma=%08x bytes=%u status=%08x fnv=%016llx pc=%08x visibility=completion\n",
                      completed ? "complete" : (published ? "stale-drop" : "dma-fault"),
                      static_cast<unsigned long long>(sequence),
-                     static_cast<unsigned long long>(offset), dma, bytes, di_.Status());
+                     static_cast<unsigned long long>(offset), dma, bytes, di_.Status(),
+                     static_cast<unsigned long long>(hash), cpu_.pc);
+      }
     } else {
       di_async_cycles_remaining_ -= cycles;
     }
@@ -3731,10 +6954,20 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
     result.cycles = std::numeric_limits<std::uint64_t>::max();
   else
     result.cycles += charged;
+  if (runtime_profile_enabled_ && !idle_wait) guest_cycles_total_ += charged;
+  if (!idle_wait) rate_charged_ += charged;
 
   const std::uint64_t hardware_cycles =
       TakeRealtimeHardwareCycles(charged, idle_wait);
   perf_hardware_cycles_total_ += hardware_cycles;
+
+  // The async GX parser publishes ordered PE token/finish events through a
+  // bounded queue.  Commit them on the CPU thread before a zero-time fast
+  // return so interrupt latency is bounded by AOT dispatch, not wall-clock
+  // sampling. PeEventPending() is one atomic load on the no-event
+  // path.
+  if (runtime_parallel_workers_ && native_gx_.PeEventPending())
+    SyncNativeGXInterrupts();
 
   // v136 hot-path collapse: most AOT dispatch boundaries occur between host
   // clock samples. No native device can advance without realtime hardware
@@ -3750,10 +6983,16 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
   const bool gx_ready = native_gx_.Ready();
 
   if (hardware_cycles != 0u) {
+  if (cp_.RegisterDrainPending()) {
+    cp_.ServiceRegisterDrain();
+    SyncNativeCPInterrupt();
+  }
   ServiceDiscCompletion(hardware_cycles);
 
   PollLiveVideoConfig(hardware_cycles);
   AdvanceCpuTimers(hardware_cycles);
+  si_.AdvanceCycles(hardware_cycles);
+  SyncNativeSIInterrupt();
   vi_.AdvanceCycles(hardware_cycles);
   const bool vi_interrupt_update = vi_.ConsumeInterruptUpdate();
   if (vi_interrupt_update)
@@ -3761,25 +7000,43 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
 
   odd_field_boundary = vi_.ConsumeOddFieldBoundary();
   even_field_boundary = vi_.ConsumeEvenFieldBoundary();
+  if (runtime_profile_enabled_ && (odd_field_boundary || even_field_boundary)) {
+    // v300 diagnostic: GX display copies produced during each VI field.
+    static std::string pattern;
+    static std::uint64_t last_frames = 0u;
+    const auto produced = perf_guest_frames_total_ - last_frames;
+    last_frames = perf_guest_frames_total_;
+    pattern.push_back(static_cast<char>('0' + std::min<std::uint64_t>(produced, 9u)));
+    if (pattern.size() >= 60u) {
+      std::fprintf(stderr, "GEKKOAOT_FIELD_COPIES_V300=1 %s\n", pattern.c_str());
+      pattern.clear();
+    }
+  }
   frame_boundary = vi_.ConsumeFrameBoundary();
-  if (frame_boundary) ++perf_vi_boundaries_total_;
+  if (frame_boundary) {
+    ++perf_vi_boundaries_total_;
+    ServiceWidescreenFrustumAssist(true);
+  }
 
   // v160: only after a complete VI frame has elapsed can an already-handled
   // CP breakpoint be classified as a scheduler/video-flip deadlock.
   ServiceIdleCpBreakpointRecovery(frame_boundary);
 
-  // Sample host input in its own GameCube hardware-time domain. Retail SI
-  // polling is commonly around 120 Hz and, unlike presentation or the AOT CPU
-  // loop, this clock remains real-time. Do not replay missed samples after a
-  // long host stall: one fresh snapshot is sufficient, then retain phase.
+  // NativeHW v4: SI automatic polling is a real hardware-time producer, not
+  // merely an optimization fallback. v3 disabled this when NativeHW SI was on,
+  // freezing IN_HI/IN_LO for games that consume automatic SIPOLL samples. Keep
+  // one 120 Hz host snapshot + SI latch in both modes, while explicit COMCSR
+  // transfers retain their <=1 ms low-latency refresh. Missed host samples are
+  // collapsed to one fresh snapshot after a stall.
 #if defined(GEKKOAOT_NATIVE_SDL_INPUT)
-  if (native_input_ready_) {
+  if (GekkoAOT::NativeHW::SI::NeedsPeriodicHostPoll(
+          native_hw_.SI(), native_input_ready_)) {
     constexpr std::uint64_t kNativeInputPollCycles =
-        GekkoAOT::HW::VI::NativeVI::CpuClockHz / 120u;
-    static std::uint64_t native_input_hw_phase = 0u;
-    native_input_hw_phase += hardware_cycles;
-    if (native_input_hw_phase >= kNativeInputPollCycles) {
-      native_input_hw_phase %= kNativeInputPollCycles;
+        GekkoAOT::NativeHW::SI::PollIntervalCycles(
+            GekkoAOT::HW::VI::NativeVI::CpuClockHz, 120u);
+    native_input_hw_phase_ += hardware_cycles;
+    if (native_input_hw_phase_ >= kNativeInputPollCycles) {
+      native_input_hw_phase_ %= kNativeInputPollCycles;
       RefreshNativeInput(true);
     }
   }
@@ -3808,6 +7065,16 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
   // Dolphin/retail semantics select TOP for the odd field and BOTTOM for the
   // even field.  If both origins are identical (typical progressive/single-XFB
   // setup), retain one present per full frame instead of presenting duplicates.
+  const auto queue_vi_frame = [&](std::uint32_t top, std::uint32_t bottom) {
+    if (!GekkoAOT::NativeHW::VI::ShouldPresent(
+            native_hw_.VI(), perf_guest_frames_total_, native_vi_last_queued_frame_))
+      return;
+    // Include VI geometry for RAM-owned scanout. Its pixels and selected field
+    // can change without a new GX copy; the renderer can dedupe cached GX data.
+    QueueHostPresent(top, bottom, vi_.XfbWidthPixels(), vi_.XfbStrideBytes(),
+                     vi_.XfbFieldHeight());
+    if (native_hw_.VI()) native_vi_last_queued_frame_ = perf_guest_frames_total_;
+  };
   if (gx_ready && !gx_present_on_copy_) {
     const std::uint32_t top = vi_.XfbAddressTop();
     const std::uint32_t bottom = vi_.XfbAddressBottom();
@@ -3815,7 +7082,7 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
 
     if (split_fields) {
       if (odd_field_boundary) {
-        QueueHostPresent(top, top);
+        queue_vi_frame(top, top);
         static unsigned odd_logs = 0;
         if (odd_logs++ < 32u)
           std::fprintf(stderr,
@@ -3823,7 +7090,7 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
                        top, top, bottom);
       }
       if (even_field_boundary) {
-        QueueHostPresent(bottom, bottom);
+        queue_vi_frame(bottom, bottom);
         static unsigned even_logs = 0;
         if (even_logs++ < 32u)
           std::fprintf(stderr,
@@ -3833,7 +7100,7 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
     } else if (frame_boundary) {
       const std::uint32_t xfb = top != 0u ? top : bottom;
       if (xfb != 0u) {
-        QueueHostPresent(xfb, xfb);
+        queue_vi_frame(xfb, xfb);
         static unsigned frame_logs = 0;
         if (frame_logs++ < 32u)
           std::fprintf(stderr,
@@ -3875,17 +7142,24 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
   // causing repeated/stale chunks and the characteristic harsh/metallic audio.
   const bool native_32k_mixer =
       dsp_.NativeAxHleActive() || dsp_.NativeJAudioHleActive();
-  const std::uint32_t effective_aid_hz = native_32k_mixer ? 32028u : guest_aid_hz;
-  dsp_.SetAudioSampleRateHz(effective_aid_hz);
+  const std::uint32_t effective_aid_hz = native_hw_.AI()
+      ? GekkoAOT::NativeHW::AI::EffectiveAidRate(true, guest_aid_hz, native_32k_mixer)
+      : (native_32k_mixer ? 32028u : guest_aid_hz);
+  if (native_audio_effective_hz_ != effective_aid_hz) {
+    dsp_.SetAudioSampleRateHz(effective_aid_hz);
+    native_audio_effective_hz_ = effective_aid_hz;
+  }
   {
     static std::uint32_t last_guest_hz = 0u;
     static std::uint32_t last_effective_hz = 0u;
     if (guest_aid_hz != last_guest_hz || effective_aid_hz != last_effective_hz) {
       std::fprintf(stderr,
                    "GEKKOAOT_NATIVE_AUDIO_RATE_V69 guest_aid_hz=%u effective_aid_hz=%u "
-                   "ax_hle=%u jaudio_hle=%u policy=%s\n",
+                   "ax_hle=%u jaudio_hle=%u native_hw_ai=%u native_hw_dsp=%u policy=%s\n",
                    guest_aid_hz, effective_aid_hz, dsp_.NativeAxHleActive() ? 1u : 0u,
-                   dsp_.NativeJAudioHleActive() ? 1u : 0u,
+                   dsp_.NativeJAudioHleActive() ? 1u : 0u, native_hw_.AI() ? 1u : 0u,
+                   GekkoAOT::NativeHW::DSP::HostTaskBackendActive(
+                       native_hw_.DSP(), dsp_.NativeAxHleActive(), dsp_.NativeJAudioHleActive()) ? 1u : 0u,
                    dsp_.NativeAxHleActive() ? "ax-fixed-32k"
                                             : (dsp_.NativeJAudioHleActive() ? "jaudio-fixed-32k" : "guest-ai"));
       last_guest_hz = guest_aid_hz;
@@ -3895,16 +7169,26 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
   dsp_.AdvanceCycles(hardware_cycles);
   ai_.AdvanceCycles(hardware_cycles);
 
-  // CP/DI/EXI/SI interrupt state only changes through paths that already
-  // synchronize immediately on MMIO/FIFO activity. Re-polling all of them for
-  // every compiled guest slice was pure overhead. AI/DSP are time-driven, so
-  // retain sub-microsecond delivery latency with a 256-cycle poll quantum.
-  constexpr std::uint64_t kTimedIrqSyncQuantum = 256u;
-  timed_irq_sync_cycles_ += hardware_cycles;
-  if (timed_irq_sync_cycles_ >= kTimedIrqSyncQuantum || frame_boundary) {
-    timed_irq_sync_cycles_ %= kTimedIrqSyncQuantum;
-    SyncNativeDSPInterrupt();
-    SyncNativeAIInterrupt();
+  // NativeHW v3: AI/DSP MMIO writes synchronize PI immediately, so after a
+  // time advance the only interesting transition is an interrupt that actually
+  // became pending. Avoid the old 256-cycle "is it pending yet?" polling when
+  // the corresponding NativeHW service is enabled. Legacy mode keeps the exact
+  // previous quantum for A/B compatibility.
+  const bool native_dsp_irq_due = GekkoAOT::NativeHW::DSP::TimedIrqNeedsSync(
+      native_hw_.DSP(), dsp_.InterruptPending());
+  const bool native_ai_irq_due = GekkoAOT::NativeHW::AI::TimedIrqNeedsSync(
+      native_hw_.AI(), ai_.InterruptPending());
+  if (native_dsp_irq_due) SyncNativeDSPInterrupt();
+  if (native_ai_irq_due) SyncNativeAIInterrupt();
+
+  if (!native_hw_.DSP() || !native_hw_.AI()) {
+    constexpr std::uint64_t kTimedIrqSyncQuantum = 256u;
+    timed_irq_sync_cycles_ += hardware_cycles;
+    if (timed_irq_sync_cycles_ >= kTimedIrqSyncQuantum || frame_boundary) {
+      timed_irq_sync_cycles_ %= kTimedIrqSyncQuantum;
+      if (!native_hw_.DSP()) SyncNativeDSPInterrupt();
+      if (!native_hw_.AI()) SyncNativeAIInterrupt();
+    }
   }
 
   } // hardware_cycles != 0
@@ -3954,24 +7238,67 @@ void HostRuntime::RebuildPpcHaltIndex() {
             [](const PpcHaltPc& a,const PpcHaltPc& b){return a.pc<b.pc;});
   std::fprintf(stderr,"GEKKOAOT_NATIVE_PPCHALT_INDEX_V1=1 entries=%zu loops=%zu\n",
                ppc_halt_pcs_.size(),ppc_halt_pcs_.size()/5u);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_PPCHALT_OVERLAY_GUARD_V214=1 policy=live-signature-revalidate-on-index-hit\n");
 }
 
 bool HostRuntime::DetectSdkPpcHalt(std::uint32_t pc, std::uint32_t* entry) const {
   // PPCHalt is static SDK code. Pre-index its five PCs once when the DOL is
   // loaded instead of hashing and reading guest RAM at every dispatch boundary.
+  if (ppc_halt_pcs_.empty() || pc < ppc_halt_pcs_.front().pc ||
+      pc > ppc_halt_pcs_.back().pc) return false;
   const auto it=std::lower_bound(ppc_halt_pcs_.begin(),ppc_halt_pcs_.end(),pc,
       [](const PpcHaltPc& item,std::uint32_t value){return item.pc<value;});
   if(it==ppc_halt_pcs_.end()||it->pc!=pc) return false;
+
+  // v214: a fixed secondary DOL/ELF may overlay the main executable at the
+  // exact same guest addresses.  The PPCHalt index above intentionally belongs
+  // to the boot/main DOL, so an address-only hit is not sufficient after an
+  // overlay has been published.  Medal of Honor: Frontline is a concrete retail
+  // case: main.dol has PPCHalt at 0x80683744 while Moh2StubRelGC.elf has
+  // PPCMthid2 (mtspr HID2,r3) at 0x80683744.  Stopping on the stale main-DOL
+  // index prevents the mission-return stub from restoring hardware state.
+  //
+  // Candidate hits are extremely rare, so revalidate the five live words here
+  // rather than paying guest-memory reads at every dispatch boundary.  This is
+  // also self-modifying/overlay safe: only the executable bytes currently
+  // visible in MEM1 can be classified as PPCHalt.
+  static constexpr std::array<std::uint32_t,5> kPattern={
+      0x7c0004acu,0x60000000u,0x38600000u,0x60000000u,0x4bfffff4u,
+  };
+  for(std::uint32_t i=0;i<kPattern.size();++i) {
+    std::uint32_t word=0u;
+    if(!memory_.Read32(it->entry+i*4u,&word)||word!=kPattern[i]) {
+      static unsigned overlay_guard_logs=0u;
+      if(overlay_guard_logs++<16u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_NATIVE_PPCHALT_OVERLAY_GUARD_V214=1 pc=%08x indexed_entry=%08x mismatch_offset=%u live=%08x expected=%08x action=bypass-stale-index\n",
+                     pc,it->entry,i*4u,word,kPattern[i]);
+      return false;
+    }
+  }
+
   if(entry) *entry=it->entry;
   return true;
 }
 
 void HostRuntime::RefreshSecondaryRelMappings() {
+  // v156: this used to scan the whole 24 MiB MEM1 every time a secondary
+  // address missed active_rel_sections_.  On titles with canonical REL calls
+  // (notably SMB) that made ResolveSecondaryAddress consume essentially an
+  // entire CPU core while the game appeared stuck.  A linked REL cannot be
+  // executed correctly until its relocated instructions are published through
+  // icbi/ICInvalidateRange, so CacheControl() marks this index dirty at that
+  // architectural boundary.  Between publication epochs the mapping is stable.
+  if (!rel_mapping_dirty_) return;
+  cached_rel_route_ = {};
+
   ++rel_mapping_refreshes_;
   std::vector<ActiveRelSection> discovered;
   const auto& ram = memory_.Mem1();
   if (ram.size() < 0x40u) {
     active_rel_sections_.clear();
+    rel_mapping_dirty_ = false;
     return;
   }
 
@@ -3979,6 +7306,8 @@ void HostRuntime::RefreshSecondaryRelMappings() {
     const GekkoAOTModuleDesc* descriptor = nullptr;
     const GekkoAOTRelModule* module = nullptr;
     bool found = false;
+    const GekkoAOTRelImportProof* proofs = nullptr;
+    std::uint32_t proof_count = 0;
   };
   std::vector<PendingRel> pending;
   std::unordered_multimap<std::uint32_t, std::size_t> by_module_id;
@@ -3990,13 +7319,16 @@ void HostRuntime::RefreshSecondaryRelMappings() {
       if (module.section_count == 0u || module.section_count > 4096u || module.num_sections == 0u)
         continue;
       const std::size_t index = pending.size();
-      pending.push_back({descriptor, &module, false});
+      std::uint32_t proof_count = 0;
+      const auto* proofs = library->RelImportProofs(module.module_id, &proof_count);
+      pending.push_back({descriptor, &module, false, proofs, proof_count});
       by_module_id.emplace(module.module_id, index);
     }
   }
 
   if (pending.empty()) {
     active_rel_sections_.clear();
+    rel_mapping_dirty_ = false;
     return;
   }
 
@@ -4053,7 +7385,11 @@ void HostRuntime::RefreshSecondaryRelMappings() {
         const auto* entry = ram.data() + entry_physical;
         std::uint32_t runtime_start = ReadGuestBE32(entry) & ~3u;
         const std::uint32_t runtime_size = ReadGuestBE32(entry + 4u);
-        if (runtime_start == 0u || runtime_size < section.size) {
+        // OSLink rewrites the section address but not its size.  Requiring an
+        // exact size match also prevents duplicate module-id overlays from
+        // spuriously claiming a live header merely because their section is
+        // smaller than the currently loaded variant.
+        if (runtime_start == 0u || runtime_size != section.size) {
           valid = false;
           break;
         }
@@ -4077,6 +7413,9 @@ void HostRuntime::RefreshSecondaryRelMappings() {
         candidate_sections.push_back({item.descriptor, module.module_id, section.section_index,
                                       section.linked_start, runtime_start, section.size});
       }
+      if (valid && item.proofs &&
+          !MatchRelImportProofs(ram, candidate, item.proofs, item.proof_count))
+        valid = false;
       if (valid && !candidate_sections.empty()) {
         discovered.insert(discovered.end(), candidate_sections.begin(), candidate_sections.end());
         item.found = true;
@@ -4084,11 +7423,274 @@ void HostRuntime::RefreshSecondaryRelMappings() {
     }
   }
   active_rel_sections_ = std::move(discovered);
+  rel_mapping_dirty_ = false;
+
+  static unsigned refresh_logs = 0u;
+  if (refresh_logs++ < 32u)
+    std::fprintf(stderr,
+                 "GEKKOAOT_REL_MAP_REFRESH_V156=1 sections=%zu refreshes=%llu action=index-committed\n",
+                 active_rel_sections_.size(),
+                 static_cast<unsigned long long>(rel_mapping_refreshes_));
 }
 
 const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModule(
     std::uint32_t runtime_address, bool* overlap) {
   if (overlap) *overlap = false;
+  // A single DOL plus relocatable RELs cannot have a fixed-image ambiguity.
+  // Avoid clearing/scanning the candidate table at every AOT boundary unless
+  // a fixed side executable has actually been registered.
+  if (!has_fixed_secondary_modules_) return nullptr;
+
+  // RFI during SDK BAT initialization enters the physical MEM1 alias while
+  // translation is disabled. DolRecomp dispatch canonicalizes this alias, so
+  // image selection must use the same address before consulting coverage and
+  // verified routes. Otherwise overlapping ELFs fall through to the first
+  // secondary module and execute a different image at the same physical PC.
+  if (runtime_address < AddressSpace::CompatMem1BackingSize)
+    runtime_address |= 0x80000000u;
+
+  // Keep the currently executing verified chunk on the absolute cheapest path.
+  if (fixed_exec_route_cache_.valid && fixed_exec_route_cache_.descriptor &&
+      runtime_address >= fixed_exec_route_cache_.chunk_start &&
+      runtime_address < fixed_exec_route_cache_.chunk_end) {
+    if (overlap) *overlap = true;
+    return fixed_exec_route_cache_.descriptor;
+  }
+
+  // v277: once ICBI/hash verification has established the active fixed image,
+  // most GoldenEye/MOH-style execution lands on pages wholly covered by that
+  // image. Test that ownership immediately after the current-chunk cache. The
+  // old order still walked secondary-page, route, negative and memo caches
+  // before reaching the same proof, making image routing a top perf symbol.
+  if (const auto* active = fixed_exec_active_descriptor_;
+      active && active->num_rel_modules == 0u && active->chunk_hashes) {
+    if (fixed_exec_active_pages_owner_ != active ||
+        fixed_exec_active_pages_epoch_ != fixed_exec_structure_epoch_)
+      RebuildFixedExecActivePages();
+    if (runtime_address >= 0x80000000u) {
+      const std::uint32_t mem1_page = (runtime_address - 0x80000000u) >> 12u;
+      if (mem1_page < 8192u &&
+          ((fixed_exec_active_pages_[mem1_page >> 6u] >> (mem1_page & 63u)) & 1u) != 0u) {
+        if (overlap) *overlap = true;
+        return active;
+      }
+    }
+  }
+
+  // v275: a PC whose MEM1 page no fixed secondary executable covers has at
+  // most one candidate (the main image), which the resolver below reports as
+  // "no overlap". The one exception is a verified main image (its active-epoch
+  // shortcut returns the main descriptor), so keep the full path for it.
+  if (fixed_exec_active_descriptor_ != module_.Descriptor()) {
+    if (fixed_exec_secondary_pages_epoch_ != fixed_exec_structure_epoch_)
+      RebuildFixedExecSecondaryPages();
+    const std::uint32_t mem1_page = (runtime_address - 0x80000000u) >> 12u;
+    if (runtime_address >= 0x80000000u && mem1_page < 8192u &&
+        ((fixed_exec_secondary_pages_[mem1_page >> 6u] >> (mem1_page & 63u)) & 1u) == 0u) {
+      if (fixed_exec_route_cache_.valid &&
+          (runtime_address < fixed_exec_route_cache_.chunk_start ||
+           runtime_address >= fixed_exec_route_cache_.chunk_end))
+        fixed_exec_route_cache_ = {};
+      return nullptr;
+    }
+  }
+
+  // v175: keep a direct-mapped page route cache in addition to the single
+  // current-range cache. Fixed side executables often bounce between a handful
+  // of main/overlay chunks each frame; one range slot cannot retain that working
+  // set and paid FindModuleChunk/candidate scans again on every bounce. Entries
+  // are valid only in the current architectural I-cache publication epoch.
+  const std::uint32_t route_page = runtime_address >> 12u;
+  // v178: MEM1 is 32 MiB = exactly 8192 4K pages.  Use the guest page
+  // number directly instead of hashing 8192 pages into the old 256-entry
+  // cache.  Fixed overlays that bounce between distant chunks no longer
+  // evict each other merely because the hash collides.  Epoch validation
+  // still makes ICBI/module publication the authority.
+  const std::size_t route_slot =
+      static_cast<std::size_t>(route_page) &
+      (kFixedExecPageRouteCacheSize - 1u);
+  auto& page_route = fixed_exec_page_routes_[route_slot];
+  if (page_route.epoch == fixed_exec_route_epoch_ &&
+      page_route.page_tag == route_page && page_route.descriptor &&
+      runtime_address >= page_route.chunk_start &&
+      runtime_address < page_route.chunk_end) {
+    fixed_exec_route_cache_ = {page_route.descriptor, page_route.chunk_start,
+                               page_route.chunk_end, true};
+    ++fixed_exec_page_cache_hits_;
+    if (fixed_exec_page_cache_hits_ <= 8u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_FIXED_EXEC_PAGE_CACHE_V178=1 pc=%08x chunk=%08x-%08x hits=%llu fills=%llu epoch=%llu\n",
+                   runtime_address, page_route.chunk_start, page_route.chunk_end,
+                   static_cast<unsigned long long>(fixed_exec_page_cache_hits_),
+                   static_cast<unsigned long long>(fixed_exec_page_cache_fills_),
+                   static_cast<unsigned long long>(fixed_exec_route_epoch_));
+    if (overlap) *overlap = true;
+    return page_route.descriptor;
+  }
+
+  // An unresolved overlap currently falls back to the legacy address router.
+  // Before v163 that same PC repeated the full FNV neighborhood resolver on
+  // every AOT boundary. Loading loops can hit one ambiguous entry thousands of
+  // times per frame, turning the router itself into ~100% CPU. Cache only the
+  // exact unresolved PC (not a range), so semantics are identical until ICBI.
+  const std::size_t negative_slot =
+      ((runtime_address >> 2u) ^ (runtime_address >> 11u) ^ (runtime_address >> 17u)) &
+      (kFixedExecNegativeCacheSize - 1u);
+  if (fixed_exec_negative_pcs_[negative_slot] == runtime_address) {
+    if (overlap) *overlap = true;
+    ++fixed_exec_negative_cache_hits_;
+    static unsigned negative_hit_logs = 0u;
+    if (negative_hit_logs++ < 32u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_FIXED_EXEC_ROUTER_V163=1 action=negative-pc-cache-hit pc=%08x hits=%llu fallback=legacy-address-routing\\n",
+                   runtime_address,
+                   static_cast<unsigned long long>(fixed_exec_negative_cache_hits_));
+    return nullptr;
+  }
+
+  // v274: routes that never read guest memory are resolved once per
+  // (structural epoch, active image, PC). icbi drops the active image but
+  // cannot change chunk coverage, so these entries survive it. The preceding route caches already missed,
+  // exactly as on the full path below, so replaying the memo reproduces that
+  // path's result and its route/page-cache side effects.
+  const auto& memo = fixed_exec_route_memo_[
+      ((runtime_address >> 2u) ^ (runtime_address >> 13u)) &
+      (kFixedExecRouteMemoSize - 1u)];
+  if (memo.epoch == fixed_exec_structure_epoch_ && memo.pc == runtime_address &&
+      memo.active == fixed_exec_active_descriptor_) {
+    if (memo.route) {
+      fixed_exec_route_cache_ = {memo.route, memo.chunk_start, memo.chunk_end, true};
+      page_route = {memo.route, route_page, memo.chunk_start, memo.chunk_end,
+                    fixed_exec_route_epoch_};
+      ++fixed_exec_page_cache_fills_;
+      if (overlap) *overlap = true;
+      return memo.route;
+    }
+    if (fixed_exec_route_cache_.valid &&
+        (runtime_address < fixed_exec_route_cache_.chunk_start ||
+         runtime_address >= fixed_exec_route_cache_.chunk_end))
+      fixed_exec_route_cache_ = {};
+    return nullptr;
+  }
+
+  return SelectFixedExecutableModuleSlow(runtime_address, overlap);
+}
+
+void HostRuntime::RebuildFixedExecActivePages() {
+  fixed_exec_active_pages_.fill(0u);
+  fixed_exec_active_pages_owner_ = fixed_exec_active_descriptor_;
+  fixed_exec_active_pages_epoch_ = fixed_exec_structure_epoch_;
+  const auto* active = fixed_exec_active_descriptor_;
+  if (!active || !active->chunk_ranges || !active->chunk_hashes) return;
+  constexpr std::uint64_t kBase = 0x80000000u;
+  constexpr std::uint64_t kEnd = kBase + 8192ull * 4096ull;
+  // Merge the valid chunks (chunk_ranges are sorted, as FindModuleChunk's
+  // binary search requires) and mark only pages lying wholly inside a merged
+  // interval: every word of such a page is in a chunk with a build hash.
+  std::uint64_t run_start = 0u, run_end = 0u;
+  const auto flush = [&]() {
+    if (run_end <= run_start) return;
+    const std::uint64_t start = std::max(run_start, kBase);
+    const std::uint64_t end = std::min(run_end, kEnd);
+    if (end <= start) return;
+    const std::uint64_t first = (start - kBase + 4095u) >> 12u;
+    const std::uint64_t last = (end - kBase) >> 12u;  // exclusive
+    for (std::uint64_t page = first; page < last; ++page)
+      fixed_exec_active_pages_[page >> 6u] |= 1ull << (page & 63u);
+  };
+  for (std::uint32_t i = 0; i < active->num_chunk_ranges; ++i) {
+    if (active->chunk_hashes[i] == 0u) continue;
+    const std::uint64_t start = active->chunk_ranges[i].start;
+    const std::uint64_t end = active->chunk_ranges[i].end;
+    if (end <= start) continue;
+    if (start <= run_end && end > run_start && run_end > run_start) {
+      run_end = std::max(run_end, end);
+      continue;
+    }
+    flush();
+    run_start = start;
+    run_end = end;
+  }
+  flush();
+}
+
+void HostRuntime::RebuildFixedExecSecondaryPages() {
+  fixed_exec_secondary_pages_.fill(0u);
+  constexpr std::uint32_t kBase = 0x80000000u;
+  constexpr std::uint32_t kLast = kBase + 8192u * 4096u - 1u;
+  for (const auto& secondary : secondary_modules_) {
+    const auto* descriptor = secondary ? secondary->Descriptor() : nullptr;
+    // Same admission as the resolver's candidates (REL-bearing images and
+    // images without chunk hashes never take part in fixed-image routing).
+    if (!descriptor || descriptor->num_rel_modules != 0u || !descriptor->chunk_hashes ||
+        !descriptor->chunk_ranges)
+      continue;
+    for (std::uint32_t i = 0; i < descriptor->num_chunk_ranges; ++i) {
+      if (descriptor->chunk_hashes[i] == 0u) continue;
+      const auto range = descriptor->chunk_ranges[i];
+      if (range.end <= range.start || range.end - 1u < kBase || range.start > kLast) continue;
+      const std::uint32_t first = (std::max(range.start, kBase) - kBase) >> 12u;
+      const std::uint32_t last = (std::min(range.end - 1u, kLast) - kBase) >> 12u;
+      for (std::uint32_t page = first; page <= last; ++page)
+        fixed_exec_secondary_pages_[page >> 6u] |= 1ull << (page & 63u);
+    }
+  }
+  fixed_exec_secondary_pages_epoch_ = fixed_exec_structure_epoch_;
+}
+
+// v274: the cache probes above run on every AOT boundary of titles with a
+// fixed side executable. Keep the resolver's 1.5 KiB candidate/score frame out
+// of that path; this body is the unchanged v84-v178 resolver.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModuleSlow(
+    std::uint32_t runtime_address, bool* overlap) {
+  const std::uint32_t route_page = runtime_address >> 12u;
+  auto& page_route = fixed_exec_page_routes_[
+      static_cast<std::size_t>(route_page) & (kFixedExecPageRouteCacheSize - 1u)];
+  const std::size_t negative_slot =
+      ((runtime_address >> 2u) ^ (runtime_address >> 11u) ^ (runtime_address >> 17u)) &
+      (kFixedExecNegativeCacheSize - 1u);
+  auto& memo = fixed_exec_route_memo_[
+      ((runtime_address >> 2u) ^ (runtime_address >> 13u)) &
+      (kFixedExecRouteMemoSize - 1u)];
+  const auto memoize = [&](const GekkoAOTModuleDesc* route, std::uint32_t start,
+                           std::uint32_t end) {
+    memo = {fixed_exec_structure_epoch_, fixed_exec_active_descriptor_, route,
+            runtime_address, start, end};
+  };
+
+  const auto remember_route = [&](const GekkoAOTModuleDesc* route_descriptor,
+                                  std::uint32_t start, std::uint32_t end) {
+    fixed_exec_route_cache_ = {route_descriptor, start, end, true};
+    if (!route_descriptor || runtime_address < start || runtime_address >= end)
+      return;
+    page_route = {route_descriptor, route_page, start, end,
+                  fixed_exec_route_epoch_};
+    ++fixed_exec_page_cache_fills_;
+  };
+
+  // v161: once v155 has proven which fixed executable owns the current
+  // instruction-cache epoch, do not rebuild the candidate list and run
+  // FindModuleChunk across every side executable at each new AOT chunk.  ICBI
+  // already clears fixed_exec_active_descriptor_, so this remains exactly as
+  // conservative as the existing epoch ownership rule while removing a hot
+  // routing cost in games such as MOH Frontline with several fixed ELFs.
+  if (fixed_exec_active_descriptor_ && fixed_exec_active_descriptor_->num_rel_modules == 0u &&
+      fixed_exec_active_descriptor_->chunk_hashes) {
+    std::uint32_t active_chunk = 0u;
+    if (FindModuleChunk(fixed_exec_active_descriptor_, runtime_address, &active_chunk) &&
+        fixed_exec_active_descriptor_->chunk_hashes[active_chunk] != 0u) {
+      const auto range = fixed_exec_active_descriptor_->chunk_ranges[active_chunk];
+      remember_route(fixed_exec_active_descriptor_, range.start, range.end);
+      memoize(fixed_exec_active_descriptor_, range.start, range.end);
+      if (overlap) *overlap = true;
+      return fixed_exec_active_descriptor_;
+    }
+  }
 
   struct Candidate {
     const GekkoAOTModuleDesc* descriptor = nullptr;
@@ -4103,6 +7705,12 @@ const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModule(
     if (!descriptor || descriptor->num_rel_modules != 0u ||
         !descriptor->chunk_hashes || candidate_count >= candidates.size())
       return;
+    if (memory_.PagedVmem() && secondary_index >= 0) {
+      const auto index = static_cast<std::size_t>(secondary_index);
+      if (index >= secondary_modules_.size() || !secondary_modules_[index] ||
+          !secondary_modules_[index]->SupportsMemoryRestart())
+        return;
+    }
     std::uint32_t chunk = 0u;
     if (!FindModuleChunk(descriptor, runtime_address, &chunk)) return;
     if (descriptor->chunk_hashes[chunk] == 0u) return;
@@ -4120,6 +7728,7 @@ const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModule(
         (runtime_address < fixed_exec_route_cache_.chunk_start ||
          runtime_address >= fixed_exec_route_cache_.chunk_end))
       fixed_exec_route_cache_ = {};
+    memoize(nullptr, 0u, 0u);
     return nullptr;
   }
   if (overlap) *overlap = true;
@@ -4152,7 +7761,8 @@ const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModule(
       const auto& candidate = candidates[i];
       if (candidate.descriptor != fixed_exec_active_descriptor_) continue;
       const auto range = candidate.descriptor->chunk_ranges[candidate.chunk];
-      fixed_exec_route_cache_ = {candidate.descriptor, range.start, range.end, true};
+      remember_route(candidate.descriptor, range.start, range.end);
+      memoize(candidate.descriptor, range.start, range.end);
       static unsigned active_epoch_logs = 0u;
       if (active_epoch_logs++ < 64u)
         std::fprintf(stderr,
@@ -4192,7 +7802,7 @@ const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModule(
     const auto range = candidate.descriptor->chunk_ranges[candidate.chunk];
     const bool changed = fixed_exec_active_descriptor_ != candidate.descriptor;
     fixed_exec_active_descriptor_ = candidate.descriptor;
-    fixed_exec_route_cache_ = {candidate.descriptor, range.start, range.end, true};
+    remember_route(candidate.descriptor, range.start, range.end);
     if (changed) ++fixed_exec_route_switches_;
     static unsigned route_logs = 0u;
     if (route_logs++ < 192u) {
@@ -4288,10 +7898,11 @@ const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModule(
   }
 
   fixed_exec_active_descriptor_ = nullptr;
+  fixed_exec_negative_pcs_[negative_slot] = runtime_address;
   static unsigned miss_logs = 0u;
   if (miss_logs++ < 64u)
     std::fprintf(stderr,
-                 "GEKKOAOT_FIXED_EXEC_ROUTER_V87=0 action=identity-unresolved pc=%08x candidates=%zu matching=%zu fallback=legacy-address-routing\\n",
+                 "GEKKOAOT_FIXED_EXEC_ROUTER_V163=0 action=identity-unresolved pc=%08x candidates=%zu matching=%zu cache=exact-pc fallback=legacy-address-routing\\n",
                  runtime_address, candidate_count, matching_count);
   return nullptr;
 }
@@ -4300,6 +7911,13 @@ bool HostRuntime::DispatchFixedExecutableModule(const GekkoAOTModuleDesc* descri
                                                 std::uint32_t runtime_address,
                                                 RunResult& result) {
   if (!descriptor || !descriptor->dispatch) return false;
+  if (memory_.PagedVmem() && descriptor != module_.Descriptor()) {
+    for (const auto& side : secondary_modules_) {
+      if (!side || side->Descriptor() != descriptor) continue;
+      if (!side->SupportsMemoryRestart()) return false;
+      break;
+    }
+  }
   RecordCompatBreadcrumb(runtime_address, CompatDispatchKind::Secondary);
   cpu_.pc = runtime_address;
   cpu_.downcount = 0;
@@ -4314,8 +7932,9 @@ bool HostRuntime::DispatchFixedExecutableModule(const GekkoAOTModuleDesc* descri
   if (cpu_.downcount < 0) {
     const std::uint64_t charged =
         static_cast<std::uint64_t>(-(cpu_.downcount + 1)) + 1u;
-    AdvanceRuntimeCycles(charged, result);
+    AdvanceRuntimeCyclesFast(charged, result);
   }
+  ConsumeAotPollPark(result);
   return true;
 }
 
@@ -4325,6 +7944,19 @@ bool HostRuntime::ResolveSecondaryAddress(std::uint32_t runtime_address,
   if (!descriptor || !linked_address) return false;
   *descriptor = nullptr;
   *linked_address = runtime_address;
+
+  // Never trust a previously discovered live mapping after the guest has
+  // published new code.  Refresh once first; all following lookups in the same
+  // I-cache epoch stay on the cheap indexed path.
+  if (rel_mapping_dirty_) RefreshSecondaryRelMappings();
+
+  if (cached_rel_route_.owner && runtime_address >= cached_rel_route_.runtime_start &&
+      runtime_address < cached_rel_route_.runtime_end) {
+    *descriptor = cached_rel_route_.owner;
+    *linked_address = cached_rel_route_.linked_start +
+                      (runtime_address - cached_rel_route_.runtime_start);
+    return true;
+  }
 
   const auto resolve_active = [&]() -> bool {
     for (const auto& section : active_rel_sections_) {
@@ -4340,20 +7972,66 @@ bool HostRuntime::ResolveSecondaryAddress(std::uint32_t runtime_address,
         continue;
       *descriptor = section.owner;
       *linked_address = linked;
+      // Cache only verified executable coverage, bounded to this live section.
+      // The publication epoch invalidates it before any overlay replacement.
+      for (std::uint32_t i = 0; i < section.owner->num_code_ranges; ++i) {
+        const auto& code = section.owner->code_ranges[i];
+        if (linked < code.start || linked >= code.end) continue;
+        const auto start = std::max(code.start, section.linked_start);
+        const auto end = std::min<std::uint64_t>(code.end,
+            std::uint64_t(section.linked_start) + section.size);
+        const auto live_start = section.runtime_start + (start - section.linked_start);
+        const auto live_end = live_start + (end - start);
+        bool exclusive = true;
+        const auto* main = module_.Descriptor();
+        if (main) {
+          for (std::uint32_t j = 0; j < main->num_code_ranges; ++j) {
+            const auto& range = main->code_ranges[j];
+            if (live_start < range.end && live_end > range.start) {
+              exclusive = false; break;
+            }
+          }
+        }
+        cached_rel_route_ = {section.owner, live_start,
+            static_cast<std::uint32_t>(live_end), start, exclusive};
+        break;
+      }
       return true;
     }
     return false;
   };
   if (resolve_active()) return true;
 
-  // Fixed-address DOL/ELF side modules can be dispatched directly. REL modules
-  // are normally resolved through OSLink mappings, but if a title happens to
-  // link a REL at the same address chosen by AOT (SMB2 does this in some
-  // layouts), the descriptor's exact coverage is also a safe direct mapping.
+  // Older modules can publish canonical callbacks. Only a currently linked
+  // REL can own such a target; coverage in an unloaded variant is no proof.
+  const ActiveRelSection* canonical_owner = nullptr;
+  for (const auto& section : active_rel_sections_) {
+    if (runtime_address < section.linked_start ||
+        std::uint64_t(runtime_address) >= std::uint64_t(section.linked_start) + section.size ||
+        !section.owner ||
+        !AddressInRanges(section.owner->code_ranges, section.owner->num_code_ranges,
+                         runtime_address))
+      continue;
+    if (canonical_owner && canonical_owner->owner != section.owner)
+      return false; // Ambiguous canonical callbacks must be published as live addresses.
+    canonical_owner = &section;
+  }
+  if (canonical_owner) {
+    *descriptor = canonical_owner->owner;
+    return true;
+  }
+
+  // Fixed-address DOL/ELF side modules can be dispatched directly. RELs must
+  // have a live mapping: identical synthetic coverage in several variants
+  // cannot establish which executable is actually installed.
   const auto resolve_canonical = [&]() -> bool {
     for (const auto& library : secondary_modules_) {
       const auto* module = library ? library->Descriptor() : nullptr;
-      if (module && AddressInRanges(module->code_ranges, module->num_code_ranges, runtime_address)) {
+      if (memory_.PagedVmem() && module && module->num_rel_modules == 0u &&
+          library && !library->SupportsMemoryRestart())
+        continue;
+      if (module && module->num_rel_modules == 0u &&
+          AddressInRanges(module->code_ranges, module->num_code_ranges, runtime_address)) {
         *descriptor = module;
         *linked_address = runtime_address;
         return true;
@@ -4362,20 +8040,27 @@ bool HostRuntime::ResolveSecondaryAddress(std::uint32_t runtime_address,
     return false;
   };
 
-  // Prefer live OSLink mappings over canonical fallback, then fixed/canonical
-  // coverage. This lets dynamically relocated RELs win when both are present.
-  RefreshSecondaryRelMappings();
+  // Prefer live OSLink mappings over canonical fallback.  The expensive map
+  // refresh already happened above only when the I-cache epoch was dirty.
   if (resolve_active()) return true;
   return resolve_canonical();
 }
 
 std::uint32_t HostRuntime::TranslateSecondaryAddress(const GekkoAOTModuleDesc* descriptor,
                                                      std::uint32_t linked_address) const {
-  (void)descriptor;
   // A relocation in REL A may branch directly to the canonical linked address
   // of REL B. active_rel_sections_ now includes data too, so require native
   // code coverage for PC translation while the memory bridge below can use all
   // sections.
+  // The executing owner disambiguates overlapping synthetic REL windows.
+  // Prefer it before considering an explicit cross-module destination.
+  for (const auto& section : active_rel_sections_) {
+    if (section.owner != descriptor) continue;
+    const auto end = std::uint64_t(section.linked_start) + section.size;
+    if (linked_address >= section.linked_start && std::uint64_t(linked_address) < end &&
+        AddressInRanges(descriptor->code_ranges, descriptor->num_code_ranges, linked_address))
+      return section.runtime_start + (linked_address - section.linked_start);
+  }
   for (const auto& section : active_rel_sections_) {
     const std::uint64_t end = std::uint64_t(section.linked_start) + section.size;
     if (linked_address < section.linked_start || std::uint64_t(linked_address) >= end)
@@ -4389,9 +8074,87 @@ std::uint32_t HostRuntime::TranslateSecondaryAddress(const GekkoAOTModuleDesc* d
   return linked_address;
 }
 
+void HostRuntime::PublishSecondaryControlState(const GekkoAOTModuleDesc* descriptor) {
+  // LR is an architectural return address. A main-DOL callee may save it in an
+  // OSThread or stack frame before returning, so it must carry the real OSLink
+  // address, never the compiler's synthetic window. Exception SRR0 needs the
+  // same repair when an exception was raised inside the REL wrapper.
+  cpu_.lr = TranslateSecondaryAddress(descriptor, cpu_.lr);
+  if (IsLowExceptionVectorAddress(AddressSpace::ToPhysical(cpu_.pc)))
+    cpu_.srr0 = TranslateSecondaryAddress(descriptor, cpu_.srr0);
+}
+
 bool HostRuntime::TranslateCanonicalRelAddress(std::uint32_t canonical_address,
                                                std::uint32_t* runtime_address) const {
   if (!runtime_address) return false;
+
+  // Address queries emitted by a REL have a known owner. Its own sections
+  // must win over another loaded module with the same synthetic link window.
+  if (native_region_secondary_owner_) {
+    for (const auto& section : active_rel_sections_) {
+      if (section.owner != native_region_secondary_owner_) continue;
+      if (canonical_address >= section.runtime_start &&
+          std::uint64_t(canonical_address) < std::uint64_t(section.runtime_start) + section.size) {
+        *runtime_address = canonical_address;
+        return true;
+      }
+    }
+    for (const auto& section : active_rel_sections_) {
+      if (section.owner != native_region_secondary_owner_) continue;
+      if (canonical_address >= section.linked_start &&
+          std::uint64_t(canonical_address) < std::uint64_t(section.linked_start) + section.size) {
+        *runtime_address = section.runtime_start + (canonical_address - section.linked_start);
+        return true;
+      }
+    }
+  }
+
+  // v172: the synthetic REL link window and OSLink's live MEM1 placements can
+  // overlap numerically. An already-linked pointer from the currently running
+  // REL can therefore look like a canonical pointer belonging to another REL.
+  // Translating it a second time corrupts data/heap state. Keep that pointer
+  // unchanged when the live mapping says it belongs to the current REL while
+  // the canonical mapping would reinterpret it as a different module.
+  std::uint32_t current_module_id = 0u;
+  for (const auto& section : active_rel_sections_) {
+    const std::uint64_t linked_end =
+        std::uint64_t(section.linked_start) + section.size;
+    if (cpu_.pc >= section.linked_start && std::uint64_t(cpu_.pc) < linked_end) {
+      current_module_id = section.module_id;
+      break;
+    }
+  }
+
+  const ActiveRelSection* runtime_hit = nullptr;
+  const ActiveRelSection* canonical_hit = nullptr;
+  for (const auto& section : active_rel_sections_) {
+    const std::uint64_t runtime_end =
+        std::uint64_t(section.runtime_start) + section.size;
+    if (!runtime_hit && canonical_address >= section.runtime_start &&
+        std::uint64_t(canonical_address) < runtime_end)
+      runtime_hit = &section;
+
+    const std::uint64_t linked_end =
+        std::uint64_t(section.linked_start) + section.size;
+    if (!canonical_hit && canonical_address >= section.linked_start &&
+        std::uint64_t(canonical_address) < linked_end)
+      canonical_hit = &section;
+  }
+
+  if (current_module_id != 0u && runtime_hit && canonical_hit &&
+      runtime_hit->module_id == current_module_id &&
+      canonical_hit->module_id != current_module_id) {
+    *runtime_address = canonical_address;
+    static unsigned identity_logs = 0u;
+    if (identity_logs++ < 32u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_REL_RUNTIME_IDENTITY_V172=1 pc=%08x address=%08x "
+                   "runtime_module=%u canonical_module=%u action=keep-runtime\n",
+                   cpu_.pc, canonical_address, runtime_hit->module_id,
+                   canonical_hit->module_id);
+    return true;
+  }
+
   for (const auto& section : active_rel_sections_) {
     const std::uint64_t end = std::uint64_t(section.linked_start) + section.size;
     if (canonical_address >= section.linked_start &&
@@ -4403,6 +8166,14 @@ bool HostRuntime::TranslateCanonicalRelAddress(std::uint32_t canonical_address,
   return false;
 }
 
+std::uint32_t HostRuntime::SecondaryModuleCapabilities(const GekkoAOTModuleDesc* descriptor) {
+  if (cached_secondary_caps_owner_ == descriptor) return cached_secondary_caps_;
+  const auto found = secondary_module_caps_.find(descriptor);
+  cached_secondary_caps_owner_ = descriptor;
+  cached_secondary_caps_ = found == secondary_module_caps_.end() ? 0u : found->second;
+  return cached_secondary_caps_;
+}
+
 bool HostRuntime::DispatchSecondaryModule(std::uint32_t runtime_address, RunResult& result) {
   const GekkoAOTModuleDesc* resolved = nullptr;
   std::uint32_t linked_address = runtime_address;
@@ -4410,13 +8181,179 @@ bool HostRuntime::DispatchSecondaryModule(std::uint32_t runtime_address, RunResu
   const auto commit_dispatch = [&](const GekkoAOTModuleDesc* descriptor,
                                    std::uint32_t address) -> bool {
     if (!descriptor || !descriptor->dispatch) return false;
+    TraceRelGprs("secondary-enter",
+                 runtime_address, address, cpu_);
+    if (memory_.PagedVmem() && descriptor != module_.Descriptor()) {
+      for (const auto& side : secondary_modules_) {
+        if (!side || side->Descriptor() != descriptor) continue;
+        if (!side->SupportsMemoryRestart()) return false;
+        break;
+      }
+    }
     RecordCompatBreadcrumb(address, CompatDispatchKind::Secondary);
     cpu_.pc = address;
     cpu_.downcount = 0;
     cpu_.external_read_count = 0;
     cpu_.external_write_count = 0;
-    if (!descriptor->dispatch(&cpu_, address)) return false;
+
+    native_region_last_blocked_start_ = 0u;
+    native_region_probe_capture_ = true;
+    const auto* previous_secondary_owner = native_region_secondary_owner_;
+    native_region_secondary_owner_ = descriptor;
+    const bool first_dispatch_ok = descriptor->dispatch(&cpu_, address);
+    native_region_secondary_owner_ = previous_secondary_owner;
+    native_region_probe_capture_ = false;
+    if (!first_dispatch_ok) return false;
+
+    // v204c: an entry-time region guard can return to the same REL PC before
+    // executing any guest instruction. Distinguish that from a genuine guest
+    // loop by requiring zero charged cycles and zero external accesses.
+    if (cpu_.pc == address && cpu_.downcount == 0 &&
+        cpu_.external_read_count == 0u &&
+        cpu_.external_write_count == 0u &&
+        native_region_last_blocked_start_ != 0u) {
+      const std::uint32_t blocked_start = native_region_last_blocked_start_;
+
+      // Preserve a real HLE entry if the requested PC itself is intercepted.
+      if (DispatchHostCall(address)) {
+        ++hle_calls_;
+        static unsigned exact_hle_logs = 0u;
+        if (exact_hle_logs++ < 64u)
+          std::fprintf(stderr,
+                       "GEKKOAOT_REL_ZERO_PROGRESS_V204C=1 pc=%08x guard=%08x action=dispatch-exact-host-call\n",
+                       address, blocked_start);
+      } else {
+        // The rejected guard may be the containing function start while the
+        // dispatch address is an interior continuation (e.g. 805E2D3C inside
+        // 805E2CAC). Admit exactly that guard once.
+        native_region_retry_start_ = blocked_start;
+        cpu_.pc = address;
+        cpu_.downcount = 0;
+        cpu_.external_read_count = 0;
+        cpu_.external_write_count = 0;
+        const auto* previous_retry_owner = native_region_secondary_owner_;
+        native_region_secondary_owner_ = descriptor;
+        const bool retry_ok = descriptor->dispatch(&cpu_, address);
+        native_region_secondary_owner_ = previous_retry_owner;
+        native_region_retry_start_ = 0u;
+        if (!retry_ok) return false;
+
+        static unsigned retry_logs = 0u;
+        if (retry_logs++ < 64u)
+          std::fprintf(stderr,
+                       "GEKKOAOT_REL_ZERO_PROGRESS_V204C=1 pc=%08x guard=%08x next=%08x downcount=%lld action=retry-blocked-range-once\n",
+                       address, blocked_start, cpu_.pc,
+                       static_cast<long long>(cpu_.downcount));
+
+        if (cpu_.pc == address && cpu_.downcount == 0 &&
+            cpu_.external_read_count == 0u &&
+            cpu_.external_write_count == 0u)
+          return false;
+      }
+    }
+
+    // v174: a REL is compiled at a synthetic canonical link address, while
+    // OSLink installs it at a live MEM1 address. DolRecomp may intentionally
+    // keep static REL data bases canonical across *internal* AOT side exits so
+    // its provenance-aware addressing can continue on the next slice. v173
+    // normalized r14-r31 after every dispatch slice, which could therefore turn
+    // an internal compiler/runtime boundary into a false guest ABI boundary.
+    // SMB1/2 are particularly sensitive because their main game code spends
+    // long stretches inside RELs.
+    //
+    // Normalize registers only when control really leaves this REL (main.dol
+    // or another module). Argument registers must be included: a REL may pass
+    // a pointer to its static data through r3-r10 to a main.dol function.
+    // If the next PC is either a
+    // canonical or live executable address owned by this same descriptor, keep
+    // the canonical register state intact for the next AOT slice.
+    // Relocation-proven codegen already writes fully materialized pointers to
+    // architectural GPRs. Its module boundary needs no numeric register repair.
+    // Keep the legacy policy only for modules lacking this explicit capability.
+    if ((SecondaryModuleCapabilities(descriptor) & GEKKOAOT_MODULE_CAP_REL_LIVE_GPRS) == 0u) {
+      bool stays_in_rel =
+          AddressInRanges(descriptor->code_ranges, descriptor->num_code_ranges, cpu_.pc);
+      if (!stays_in_rel) {
+        for (const auto& section : active_rel_sections_) {
+          if (section.owner != descriptor ||
+              !AddressInRanges(descriptor->code_ranges, descriptor->num_code_ranges,
+                               section.linked_start))
+            continue;
+          const std::uint64_t runtime_end =
+              std::uint64_t(section.runtime_start) + section.size;
+          if (cpu_.pc >= section.runtime_start && std::uint64_t(cpu_.pc) < runtime_end) {
+            stays_in_rel = true;
+            break;
+          }
+        }
+      }
+
+      // An architectural exception is a suspended instruction, not a guest ABI
+      // call. In particular, a lazy-FPU trap can occur between a relocated LIS
+      // and ADDI: translating its unfinished high half corrupts the eventual
+      // address when initialized data and BSS have different live placements.
+      // Preserve all GPR bits until RFI resumes; only publish SRR0/LR below.
+      const bool enters_exception = cpu_.pc < 0x10000u;
+      if (!stays_in_rel && !enters_exception) {
+        // v198: only registers that can legitimately carry pointer state across a
+        // PowerPC module ABI boundary are eligible for canonical->live repair.
+        //
+        // r3-r10 are argument/return registers and r14-r31 are callee-saved. r0,
+        // r11 and r12 are volatile scratch registers, while r2/r13 are TOC/SDA
+        // anchors. Treating an arbitrary scratch value as a REL pointer is unsafe:
+        // Mickey's area008.rel exits with r0 == 0x80581f18 (numerically inside the
+        // synthetic REL data window), but that value is not an architectural
+        // pointer that survives the call. v174 remapped it to 0x812fc838 and the
+        // main-DOL script parser subsequently lost its stream state.
+        for (std::uint32_t reg = 3u; reg < 32u; ++reg) {
+          if ((reg >= 11u && reg <= 13u)) continue;
+          const std::uint32_t value = cpu_.gpr[reg];
+          if (AddressInRanges(descriptor->code_ranges, descriptor->num_code_ranges, value))
+            continue;
+
+          bool already_live = false;
+          for (const auto& section : active_rel_sections_) {
+            if (section.owner != descriptor) continue;
+            const std::uint64_t runtime_end =
+                std::uint64_t(section.runtime_start) + section.size;
+            if (value >= section.runtime_start && std::uint64_t(value) < runtime_end) {
+              already_live = true;
+              break;
+            }
+          }
+          if (already_live) continue;
+
+          for (const auto& section : active_rel_sections_) {
+            if (section.owner != descriptor) continue;
+            const std::uint64_t linked_end =
+                std::uint64_t(section.linked_start) + section.size;
+            if (value < section.linked_start || std::uint64_t(value) >= linked_end)
+              continue;
+            // Code pointers remain canonical for the dispatcher/router. The state
+            // repair is specifically for static data bases crossing a real guest
+            // module ABI boundary.
+            if (AddressInRanges(descriptor->code_ranges, descriptor->num_code_ranges,
+                                section.linked_start))
+              break;
+
+            const std::uint32_t translated =
+                section.runtime_start + (value - section.linked_start);
+            cpu_.gpr[reg] = translated;
+            static unsigned rel_state_logs = 0u;
+            if (rel_state_logs++ < 64u)
+              std::fprintf(stderr,
+                           "GEKKOAOT_REL_ABI_STATE_V198=1 module=%u reg=r%u canonical=%08x runtime=%08x action=normalize-pointer-abi-only\n",
+                           section.module_id, reg, value, translated);
+            break;
+          }
+        }
+      }
+
+    }
+    PublishSecondaryControlState(descriptor);
     cpu_.pc = TranslateSecondaryAddress(descriptor, cpu_.pc);
+    TraceRelGprs("secondary-translated",
+                 runtime_address, address, cpu_);
     ++secondary_dispatches_;
     ++result.dispatches;
     if (cpu_.downcount < 0) {
@@ -4424,6 +8361,7 @@ bool HostRuntime::DispatchSecondaryModule(std::uint32_t runtime_address, RunResu
           static_cast<std::uint64_t>(-(cpu_.downcount + 1)) + 1u;
       AdvanceRuntimeCycles(charged, result);
     }
+    ConsumeAotPollPark(result);
     return true;
   };
 
@@ -4451,6 +8389,415 @@ bool HostRuntime::DispatchSecondaryModule(std::uint32_t runtime_address, RunResu
   return false;
 }
 
+std::uint64_t HostRuntime::IdleWakeDeadlineCycles() const {
+  using GekkoAOT::NativeHW::Events::Deadlines;
+  using GekkoAOT::NativeHW::Events::Earliest;
+  using GekkoAOT::NativeHW::Events::Never;
+
+  // An already-asserted source should be delivered immediately, not parked.
+  if (pi_.InterruptPending() || decrementer_pending_) return 0u;
+
+  Deadlines deadlines{};
+  deadlines.vi = vi_.CyclesUntilNextInterrupt();
+  // Presentation is host-native work too. Even with all VI compare masks off,
+  // an idle PPC must not sleep across a completed scanout frame indefinitely.
+  if (native_hw_.VI() && native_gx_.Ready())
+    deadlines.vi_frame = vi_.CyclesUntilNextFrameBoundary();
+#if defined(GEKKOAOT_NATIVE_SDL_INPUT)
+  if (native_input_ready_) {
+    constexpr std::uint64_t kNativeInputPollCycles =
+        GekkoAOT::NativeHW::SI::PollIntervalCycles(
+            GekkoAOT::HW::VI::NativeVI::CpuClockHz, 120u);
+    deadlines.si = GekkoAOT::NativeHW::SI::CyclesUntilPoll(
+        true, native_input_hw_phase_, kNativeInputPollCycles);
+  }
+#endif
+  deadlines.si = std::min(deadlines.si, si_.CyclesUntilTransfer());
+  deadlines.ai = ai_.CyclesUntilInterrupt();
+  deadlines.dsp = dsp_.CyclesUntilInterrupt();
+  if (di_async_completion_pending_)
+    deadlines.di = std::max<std::uint64_t>(1u, di_async_cycles_remaining_);
+
+  // DEC counts Time Base ticks at CPU/12. Account for the partial tick already
+  // accumulated so an idle park cannot sleep across the 0 -> 0xffffffff edge.
+  const std::uint64_t dec_ticks = static_cast<std::uint64_t>(spr_state_[kSprDec]) + 1ull;
+  const std::uint64_t dec_scaled = dec_ticks * kTimerRatio;
+  deadlines.decrementer =
+      dec_scaled > decrementer_cycle_remainder_
+          ? dec_scaled - decrementer_cycle_remainder_
+          : 1u;
+
+  const auto alarm_ticks =
+      GekkoAOT::NativeOS::Service::Get().TimebaseTicksUntilNextAlarm(&cpu_);
+  if (alarm_ticks != Never) {
+    if (alarm_ticks == 0u) {
+      deadlines.alarm = 0u;
+    } else {
+      const std::uint64_t alarm_scaled = alarm_ticks * kTimerRatio;
+      deadlines.alarm = alarm_scaled > timebase_cycle_remainder_
+                            ? alarm_scaled - timebase_cycle_remainder_
+                            : 1u;
+    }
+  }
+  return Earliest(deadlines);
+}
+
+void HostRuntime::WaitForIdleEvent(RunResult& result,std::uint64_t maximum_cycles,bool masked_timer) {
+  // First publish any wall time that elapsed while the guest was entering the
+  // idle path. This can itself latch the event we were about to wait for.
+  AdvanceRuntimeCycles(0u, result, true);
+  if (result.status == RunStatus::HostRequestedExit) return;
+
+  std::uint64_t deadline = std::min(IdleWakeDeadlineCycles(),maximum_cycles);
+  // A proved finite counter delay can occur with interrupts masked. Pending
+  // causes remain latched; they cannot end this timer wait until EE is restored.
+  if(deadline==0u && masked_timer && (cpu_.msr&kPpcMsrEe)==0u) deadline=maximum_cycles;
+  if (deadline == 0u) return;
+
+  constexpr std::uint64_t kClockHz = GekkoAOT::HW::VI::NativeVI::CpuClockHz;
+  const std::uint64_t maintenance_cap = std::max<std::uint64_t>(
+      1u, (kClockHz * idle_event_max_wait_us_ + 999999ull) / 1000000ull);
+  deadline = GekkoAOT::NativeHW::Events::ClampMaintenance(deadline,
+                                                               maintenance_cap);
+
+  // Convert the hardware deadline to one host sleep. Unlike the old 4096-cycle
+  // spin loop, wall time is the authority: the hardware clock is sampled again
+  // after waking and advances by the actual elapsed duration, including any OS
+  // scheduler overshoot. No guest/device time is fabricated from host speed.
+  const auto wait_ns = std::max<std::uint64_t>(
+      1u, (deadline * 1000000000ull + kClockHz - 1u) / kClockHz);
+  ++idle_event_waits_;
+  idle_event_requested_cycles_ += deadline;
+  const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(wait_ns);
+  // v300: PE token/finish events come from the GX worker, asynchronously to
+  // every modelled deadline above. While it still owns queued commands (and
+  // after publishing our partial WGPIPE batch), sleep on its event channel so a
+  // DrawDone/token wait resumes when the GP work completes, not up to the next
+  // VI/maintenance deadline (2 ms) later.
+  const auto idle_start = runtime_profile_enabled_ ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+  const bool gx_wait = runtime_parallel_workers_ && native_gx_.WaitForWorkerEvent(until);
+  if (!gx_wait) std::this_thread::sleep_until(until);
+  if (runtime_profile_enabled_) {
+    const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - idle_start).count());
+    (gx_wait ? idle_ns_gx_busy_ : idle_ns_gx_idle_) += ns;
+    if (gx_wait) ++idle_gx_wakes_;
+  }
+  AdvanceRuntimeCycles(0u, result, true);
+}
+
+void HostRuntime::ConsumeAotPollPark(RunResult& result) {
+  if (cpu_.external_rid != kAotPollParkMarker) return;
+  cpu_.external_rid = 0u;
+
+  if (!aot_poll_park_enabled_ || result.status == RunStatus::HostRequestedExit)
+    return;
+
+  // A pure AOT poll has no guest-visible work to perform until an asynchronous
+  // device/timer/callback can change the loaded RAM flag. Keep architectural
+  // interrupt delivery exact: pending IRQ/DEC enters the real guest vector
+  // immediately; otherwise park only while EE is enabled and wake on the same
+  // event horizon used by the SDK/NativeOS idle paths. The maintenance cap in
+  // WaitForIdleEvent prevents an unmodelled producer from sleeping forever.
+  if ((cpu_.msr & kPpcMsrEe) == 0u) return;
+
+  ++aot_poll_parks_;
+  CountHostEffect();  // already parked by the structural AOT poll detector
+  if (aot_poll_parks_ <= 16u) {
+    std::fprintf(stderr,
+                 "GEKKOAOT_AOT_POLL_PARK_V42=1 pc=%08x parks=%llu ee=1 action=event-deadline-wait\n",
+                 cpu_.pc, static_cast<unsigned long long>(aot_poll_parks_));
+  }
+  if (TryTakeExternalInterrupt() || TryTakeDecrementerInterrupt()) return;
+
+  if (idle_event_wait_enabled_)
+    WaitForIdleEvent(result);
+
+  if (result.status != RunStatus::HostRequestedExit) {
+    TryTakeExternalInterrupt();
+    TryTakeDecrementerInterrupt();
+  }
+}
+
+HostRuntime::DispatchCodeProbeCacheEntry& HostRuntime::ProbeDispatchCode(std::uint32_t pc) {
+  // Executable publication invalidates all classifications at once. Storing
+  // that epoch once leaves each hot slot in eight bytes rather than 24.
+  if (dispatch_code_probe_epoch_ != dispatch_code_probe_generation_) {
+    dispatch_code_probe_cache_.fill({});
+    dispatch_code_probe_epoch_ = dispatch_code_probe_generation_;
+  }
+  const std::size_t slot = ((pc >> 2u) ^ (pc >> 13u)) &
+                          (kDispatchCodeProbeCacheSize - 1u);
+  auto& probe = dispatch_code_probe_cache_[slot];
+  if (probe.pc != pc) { probe = {}; probe.pc = pc; }
+  return probe;
+}
+
+void HostRuntime::ParkNativeCounterPoll(RunResult& result) {
+  if(!native_counter_poll_enabled_ || !idle_event_wait_enabled_ || cpu_.exception ||
+     ((cpu_.msr&kPpcMsrEe)!=0u && (pi_.InterruptPending() || decrementer_pending_))) return;
+  const auto epoch=native_read_poll_generation_+dispatch_code_probe_generation_;
+  if(native_counter_poll_epoch_!=epoch) {
+    native_counter_polls_.fill({});native_counter_poll_epoch_=epoch;
+  }
+  const auto pc=cpu_.pc,lr=cpu_.lr;
+  auto& entry=native_counter_polls_[((pc>>2u)^(lr>>2u)^(pc>>13u))&255u];
+  const auto read_ram=[this](std::uint32_t ea,std::uint32_t* word) {
+    const auto physical=AddressSpace::ToPhysical(ea);
+    if((ea&3u) || memory_.Mem1().size()<4u || physical>memory_.Mem1().size()-4u) return false;
+    return memory_.Read32(ea,word);
+  };
+  if(entry.pc!=pc || entry.lr!=lr) {
+    entry={};entry.pc=pc;entry.lr=lr;
+    const auto plan=NativeCounterPoll::DecodeBoundary(pc,lr,read_ram);
+    if(plan) {entry.plan=*plan;entry.valid=true;}
+  }
+  if(!entry.valid) return;
+  std::uint32_t limit;
+  if(!read_ram(cpu_.gpr[13]+static_cast<std::uint32_t>(entry.plan.offset),&limit)) return;
+  const auto mmcr0=spr_state_[952u],mmcr1=spr_state_[956u];
+  const bool user=(cpu_.msr&0x4000u)!=0u,marked=(cpu_.msr&4u)!=0u;
+  bool frozen=(mmcr0&0x80000000u) || (mmcr0&(user?0x20000000u:0x40000000u)) ||
+              (mmcr0&(marked?0x10000000u:0x08000000u));
+  if(entry.plan.spr!=953u && (mmcr0&0x2000u) && !(spr_state_[953u]&0x80000000u)) frozen=true;
+  const auto selector=entry.plan.spr==953u ? (mmcr0>>6u)&127u :
+      entry.plan.spr==954u ? mmcr0&63u : entry.plan.spr==957u ? (mmcr1>>27u)&31u : (mmcr1>>22u)&31u;
+  const auto cycles=NativeCounterPoll::Cycles(spr_state_[entry.plan.spr],cpu_.gpr[entry.plan.baseline],limit,selector,frozen);
+  static unsigned counter_proofs=0;
+  if(runtime_profile_enabled_ && counter_proofs++<16u)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_COUNTER_PROOF_V318=1 pc=%08x lr=%08x msr=%x limit=%x elapsed=%x selector=%u frozen=%u admitted=%u\n",
+      pc,lr,cpu_.msr,limit,spr_state_[entry.plan.spr]-cpu_.gpr[entry.plan.baseline],selector,frozen?1u:0u,cycles?1u:0u);
+  if(!cycles) return;
+  ++native_counter_poll_parks_;
+  if(native_counter_poll_parks_<=16u)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_COUNTER_POLL_V318=1 pc=%08x lr=%08x spr=%u deadline_cycles=%llu parks=%llu\n",
+      pc,lr,entry.plan.spr,static_cast<unsigned long long>(*cycles),static_cast<unsigned long long>(native_counter_poll_parks_));
+  WaitForIdleEvent(result,*cycles,true);
+  if(result.status!=RunStatus::HostRequestedExit) {
+    TryTakeExternalInterrupt();TryTakeDecrementerInterrupt();
+  }
+}
+
+void HostRuntime::ParkClockSpin(RunResult& result) {
+  const auto lr=time_poll_return_,entry_pc=time_poll_entry_;
+  const bool wide=time_poll_wide_;
+  time_poll_return_=0u;
+  const auto blocked=[this] {
+    return !clock_spin_enabled_ || !idle_event_wait_enabled_ || cpu_.exception ||
+           ((cpu_.msr&kPpcMsrEe)!=0u && (pi_.InterruptPending() || decrementer_pending_));
+  };
+  // Only a clock read repeated from the same site within microseconds is a
+  // candidate; ordinary per-frame timing never pays for a probe.
+  if(clock_spin_streak_<8u || cpu_.pc!=lr || blocked()) return;
+  const auto epoch=native_read_poll_generation_+dispatch_code_probe_generation_;
+  if(clock_spin_epoch_!=epoch) {clock_spins_.fill({});clock_spin_epoch_=epoch;}
+  auto& entry=clock_spins_[((lr>>2u)^(lr>>8u))&(clock_spins_.size()-1u)];
+  if(entry.lr!=lr || entry.entry!=entry_pc || entry.wide!=wide) {
+    entry={};entry.lr=lr;entry.entry=entry_pc;entry.wide=wide;
+  }
+  if(entry.cooldown) {--entry.cooldown;return;}
+  struct Memory {
+    HostRuntime* self;
+    bool Read(std::uint32_t ea,unsigned size,std::uint32_t* value) const {
+      // Cached/uncached MEM1 only: MMIO, VM and locked cache end the probe.
+      if((ea>>28u)!=0x8u && (ea>>28u)!=0xcu) return false;
+      const auto& mem1=self->memory_.Mem1();
+      const auto physical=AddressSpace::ToPhysical(ea);
+      if(physical>=mem1.size() || mem1.size()-physical<size) return false;
+      const auto* p=mem1.data()+physical;
+      std::uint32_t v=0;
+      for(unsigned i=0;i<size;++i) v=(v<<8u)|p[i];
+      *value=v;
+      return true;
+    }
+    bool Fetch(std::uint32_t ea,std::uint32_t* word) const {return !(ea&3u) && Read(ea,4u,word);}
+    bool Foreign(std::uint32_t target) const {
+      return self->os_hooks_.count(target)!=0u || self->simple_hle_hooks_.count(target)!=0u;
+    }
+  } memory{this};
+  SpinProbeState state;
+  for(unsigned i=0;i<32u;++i) state.gpr[i]=cpu_.gpr[i];
+  state.cr=cpu_.cr;state.xer=cpu_.xer;state.lr=cpu_.lr;state.ctr=cpu_.ctr;
+  const auto call_site=lr-4u;
+  const auto returned=wide ? (std::uint64_t(cpu_.gpr[3])<<32u)|cpu_.gpr[4] : std::uint64_t(cpu_.gpr[3]);
+  ++clock_spin_probes_;
+  // The iteration the guest is about to run must come back to this clock call.
+  if(spin_probe_.Run(state,lr,call_site,entry_pc,returned,wide,true,memory)!=SpinProbe::Outcome::Continue) {
+    entry.cooldown=256u;
+    return;
+  }
+  AdvanceRuntimeCycles(0u,result,true);
+  if(result.status==RunStatus::HostRequestedExit || blocked()) return;
+  const auto now=cpu_.timebase;
+  const auto waits=[&](std::uint64_t t) {
+    return spin_probe_.Run(state,lr,call_site,entry_pc,t,wide,false,memory)==SpinProbe::Outcome::Continue;
+  };
+  if(!waits(now)) return;
+  std::uint64_t exit=0u;
+  if(entry.exit>now && !waits(entry.exit) && waits(entry.exit-1u)) {
+    exit=entry.exit;  // unchanged wait after an early (event) wake
+  } else {
+    const auto first=SpinProbe::FirstExit(now,GekkoAOT::Time::GameCubeTimebaseHz,waits);
+    if(!first) {entry.cooldown=128u;return;}
+    exit=entry.exit=*first;
+  }
+  ++clock_spin_parks_;
+  if(clock_spin_parks_<=16u)
+    std::fprintf(stderr,"GEKKOAOT_CLOCK_SPIN_V334=1 entry=%08x lr=%08x wide=%u wait_ticks=%llu parks=%llu\n",
+      entry_pc,lr,wide?1u:0u,static_cast<unsigned long long>(exit-now),
+      static_cast<unsigned long long>(clock_spin_parks_));
+  WaitForIdleEvent(result,(exit-now)*GekkoAOT::Time::CpuCyclesPerTick,true);
+  // The clock call returns when the park ends; the guest recomputes and
+  // publishes its own state, and pending interrupts enter at the next boundary.
+  const auto t=cpu_.timebase;
+  if(wide) {cpu_.gpr[3]=static_cast<std::uint32_t>(t>>32u);cpu_.gpr[4]=static_cast<std::uint32_t>(t);}
+  else cpu_.gpr[3]=static_cast<std::uint32_t>(t);
+}
+
+void HostRuntime::ThrottleGuestRate(RunResult& result) {
+  // Opt-in (GEKKOAOT_GUEST_RATE_CEILING_PCT): cap charged guest cycles at a
+  // percentage of 486 MHz. A token bucket with a 20 ms burst keeps per-frame
+  // work unthrottled; once it is empty the guest parks on the same event-aware
+  // wait as the idle paths, so interrupts and device events are never delayed.
+  constexpr double kClockHz=static_cast<double>(GekkoAOT::HW::VI::NativeVI::CpuClockHz);
+  const double rate=kClockHz*guest_rate_ceiling_pct_/100.0;
+  const double burst=rate*0.020;
+  const auto now=std::chrono::steady_clock::now();
+  if(!rate_started_) {
+    rate_started_=true;rate_tokens_=burst;
+  } else {
+    rate_tokens_=std::min(burst,rate_tokens_+rate*std::chrono::duration<double>(now-rate_mark_time_).count());
+  }
+  rate_tokens_-=static_cast<double>(rate_charged_-rate_mark_charged_);
+  rate_mark_charged_=rate_charged_;rate_mark_time_=now;
+  if(rate_tokens_>=0.0 || !idle_event_wait_enabled_ || cpu_.exception ||
+     ((cpu_.msr&kPpcMsrEe)!=0u && (pi_.InterruptPending() || decrementer_pending_))) return;
+  const auto wait=static_cast<std::uint64_t>(-rate_tokens_*100.0/guest_rate_ceiling_pct_)+1u;
+  if(++rate_throttles_==1u)
+    std::fprintf(stderr,"GEKKOAOT_GUEST_RATE_V333=1 ceiling_mhz=%.0f burst_ms=20 first_pc=%08x action=event-aware-wait\n",
+                 rate/1e6,cpu_.pc);
+  WaitForIdleEvent(result,wait,true);
+  rate_throttle_ns_+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now()-now).count());
+  if(result.status!=RunStatus::HostRequestedExit) {
+    TryTakeExternalInterrupt();TryTakeDecrementerInterrupt();
+  }
+}
+
+void HostRuntime::ParkNativeReadPoll(RunResult& result) {
+  if(!native_read_poll_enabled_ || !idle_event_wait_enabled_ ||
+     (cpu_.msr&kPpcMsrEe)==0u || cpu_.exception || pi_.InterruptPending() || decrementer_pending_) return;
+  if(native_read_poll_epoch_!=native_read_poll_generation_+dispatch_code_probe_generation_) {
+    native_read_poll_negatives_.fill(0u);
+    native_read_polls_.fill({});
+    native_read_poll_epoch_=native_read_poll_generation_+dispatch_code_probe_generation_;
+  }
+  const auto pc=cpu_.pc;
+  const auto hash=(pc>>2u)^(pc>>13u);
+  auto& negative=native_read_poll_negatives_[hash&(native_read_poll_negatives_.size()-1u)];
+  if(negative==pc+1u) return;
+  auto& entry=native_read_polls_[hash&(native_read_polls_.size()-1u)];
+  const auto read_ram=[this](std::uint32_t ea,std::uint32_t* word) {
+    // No MMIO, fake VM, misalignment or faulting access can be classified as
+    // a pure RAM wait. All original AOT paths remain available for those cases.
+    const auto physical=AddressSpace::ToPhysical(ea);
+    if((ea&3u) || memory_.Mem1().size()<4u || physical>memory_.Mem1().size()-4u) return false;
+    return memory_.Read32(ea,word);
+  };
+  if(entry.pc!=pc) {
+    const auto plan=NativeReadPoll::Decode(pc,read_ram);
+    if(!plan) {negative=pc+1u;return;}
+    entry.pc=pc;entry.plan=*plan;
+  }
+  std::array<std::uint32_t,32> regs;
+  std::copy_n(cpu_.gpr,32u,regs.begin());
+  if(!entry.plan.Stable(pc,regs,cpu_.cr,cpu_.xer,read_ram)) return;
+  ++native_read_poll_parks_;
+  if(native_read_poll_parks_<=16u)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_READ_POLL_V318=1 pc=%08x loop=%08x..%08x wait=host-event preserved=gpr+cr+ram parks=%llu\n",
+      pc,entry.plan.begin,entry.plan.end,static_cast<unsigned long long>(native_read_poll_parks_));
+  WaitForIdleEvent(result);
+  if(result.status!=RunStatus::HostRequestedExit) {
+    TryTakeExternalInterrupt();
+    TryTakeDecrementerInterrupt();
+  }
+}
+
+void HostRuntime::ParkSdkIdlePoll(RunResult& result) {
+  if (!sdk_idle_park_enabled_) return;
+
+  // v181: this helper sits on every safe AOT boundary, but the SDK idle-poll
+  // signature exists at only one/few PCs.  The old order first read the current
+  // thread pointer and then decoded up to nine guest instructions for every
+  // unrelated PC.  Cache exact-PC hits and misses in the same publication epoch
+  // used by executable routing.  This preserves the boundary itself; only the
+  // redundant recognition work disappears.
+  const std::uint32_t pc = cpu_.pc;
+  auto& probe = ProbeDispatchCode(pc);
+
+  if (probe.idle_state == 0u) {
+    const auto offset = GekkoAOT::NativeOS::SdkIdlePollOffset(pc,
+        [this](std::uint32_t read_pc, std::uint32_t* word) {
+          return memory_.Read32(read_pc, word);
+        });
+    if (!offset) {
+      probe.idle_state = 1u;
+      return;
+    }
+    probe.idle_offset = *offset;
+    probe.idle_state = 2u;
+    if (std::find(sdk_idle_probe_pcs_.begin(), sdk_idle_probe_pcs_.end(), pc) ==
+        sdk_idle_probe_pcs_.end())
+      sdk_idle_probe_pcs_.push_back(pc);
+  } else if (probe.idle_state == 1u) {
+    return;
+  }
+
+  // v335: the guest OS is idle, i.e. waiting for an interrupt (GXDrawDone waits
+  // on the PE finish of commands it just queued). Publish the partial WGPIPE
+  // batch now even when a pending exception keeps this boundary from parking:
+  // GoldenEye's 10-tick job-worker alarms keep DEC pending almost permanently,
+  // so its ~90 DrawDone/frame each waited ~4 ms for an unrelated sync point.
+  native_gx_.PublishPendingWrites();
+  if ((cpu_.msr & kPpcMsrEe) == 0u || pi_.InterruptPending() || decrementer_pending_) return;
+
+  const std::int16_t offset = probe.idle_offset;
+  if (sdk_idle_poll_pc_ != pc || sdk_idle_poll_offset_ != offset) {
+    sdk_idle_poll_pc_ = pc;
+    sdk_idle_poll_offset_ = offset;
+    std::fprintf(stderr,
+                 "GEKKOAOT_IDLE_PARK=1 pc=%08x runqueue_offset=%d deadline=vi-halfline guest-loop=retained\n",
+                 pc, int(offset));
+  }
+
+  std::uint32_t current = 0;
+  if (!memory_.Read32(0x800000e4u, &current) || current != 0u) return;
+  std::uint32_t runnable = 0;
+  const auto queue = cpu_.gpr[13] + static_cast<std::uint32_t>(offset);
+  if (!memory_.Read32(queue, &runnable) || runnable != 0u) return;
+
+  CountHostEffect();  // already parked by the SDK idle-poll recognizer
+  // v158: the guest SDK idle loop gets the same event-driven park as NativeOS.
+  // The previous half-line wait woke tens of thousands of times per second and
+  // left SelectThread/RunQueue polling as a visible perf hotspot. Sleep until
+  // the earliest real IRQ/timer/device deadline (bounded by a host-maintenance
+  // cap), then let the original guest poll/exception path continue unchanged.
+  if (idle_event_wait_enabled_) {
+    WaitForIdleEvent(result);
+  } else {
+    const auto cycles = vi_.CyclesUntilHalfLine();
+    if (cycles == 0u) return;
+    const auto duration = std::chrono::nanoseconds(
+        (std::uint64_t(cycles) * 1000000000ull + HW::VI::NativeVI::CpuClockHz - 1u) /
+        HW::VI::NativeVI::CpuClockHz);
+    std::this_thread::sleep_until(std::chrono::steady_clock::now() + duration);
+    AdvanceRuntimeCycles(0u, result, true);
+  }
+  TryTakeExternalInterrupt();
+  TryTakeDecrementerInterrupt();
+}
+
 RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
   RunResult result{};
   if (!module_.Descriptor()) {
@@ -4466,7 +8813,7 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
   // every dispatch (the old loop duplicated the end-of-dispatch synchronization).
   if (!run_banner_reported_)
     std::fprintf(stderr,
-                 "GEKKOAOT_NATIVE_CP_FIFO_V88=1 drain=32-byte-step breakpoint=stop+irq fifo-top=base+size-4 wrap=exact\n");
+                 "GEKKOAOT_NATIVE_CP_FIFO_V162=1 drain=batched-until-breakpoint breakpoint=exact-stop+irq fifo-top=base+size-4 wrap=exact\n");
   SyncNativeCPInterrupt();
   SyncNativeDSPInterrupt();
   SyncNativeAIInterrupt();
@@ -4476,31 +8823,97 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
 
   const std::uint32_t native_idle_sleep_us =
       RuntimeEnvU32("GEKKOAOT_NATIVE_IDLE_SLEEP_US", 0u, 1000u);
+  sdk_idle_park_enabled_ = RuntimeEnvBool("GEKKOAOT_IDLE_PARK", true);
+  native_read_poll_enabled_=RuntimeEnvBool("GEKKOAOT_NATIVE_READ_POLL",false);
+  native_counter_poll_enabled_=RuntimeEnvBool("GEKKOAOT_NATIVE_COUNTER_POLL",false);
+  clock_spin_enabled_=RuntimeEnvBool("GEKKOAOT_CLOCK_SPIN_PARK",true);
+  // Opt-in power cap: generated code's cycle charge is not a Gekko cycle count
+  // (DNDD01 legitimately charges ~1.9 GHz at 60 fps and drops to 38 fps under
+  // a 200% cap), so no default ceiling is safe.
+  guest_rate_ceiling_pct_=RuntimeEnvU32("GEKKOAOT_GUEST_RATE_CEILING_PCT",0u,100000u);
+  aot_poll_park_enabled_ = RuntimeEnvBool("GEKKOAOT_AOT_POLL_PARK", true);
+  leaf_tail_enabled_ = RuntimeEnvBool("GEKKOAOT_LEAF_TAIL", true);
+  ee_pending_query_enabled_ = RuntimeEnvBool("GEKKOAOT_EE_PENDING_QUERY", true);
+  boundary_profile_enabled_ = RuntimeEnvBool("GEKKOAOT_BOUNDARY_PROFILE", false);
+  // Diagnostic counters (boundaries, host effects, EE queries, leaf tails,
+  // charged guest cycles) cost nothing unless explicitly requested.
+  runtime_profile_enabled_ =
+      boundary_profile_enabled_ || RuntimeEnvBool("GEKKOAOT_RUNTIME_PROFILE", false);
+  // Opt-in: parking proven no-op loops shifts guest timing enough to expose a
+  // timing-sensitive loader race in Luigi's Mansion (3 crashes in 13 runs of
+  // the foyer scene versus 0 in 12 with the prover off).
+  idle_loop_proof_enabled_ =
+      idle_loop_proof_enabled_ && RuntimeEnvBool("GEKKOAOT_IDLE_LOOP_PROOF", false);
+  track_host_effects_ = idle_loop_proof_enabled_ || runtime_profile_enabled_;
+  idle_event_wait_enabled_ = RuntimeEnvBool("GEKKOAOT_IDLE_EVENT_WAIT", true);
+  idle_event_max_wait_us_ = RuntimeEnvU32("GEKKOAOT_IDLE_EVENT_MAX_US", 2000u, 10000u);
   if (!run_banner_reported_) {
     std::fprintf(stderr,
-                 "GEKKOAOT_RUNTIME_PERF_V140=1 clock=tsc-or-steady zero-cycle=fast-return external-pointer=ram-first wgpipe=early-fastpath irq-probe=single-load nativeos=o1-best+priority-coherent safe-chain=%lld spin-yield=off context-drop=off idle-sleep-us=%u\n",
-                 static_cast<long long>(cpu_.cycle_budget), native_idle_sleep_us);
+                 "GEKKOAOT_RUNTIME_PERF_V159=1 clock=tsc-or-steady zero-cycle=fast-return external-pointer=ram-first mmio=page-dispatch wgpipe=be-fixed irq-probe=single-load nativeos=o1-best+priority-coherent safe-chain=%lld spin-yield=off context-drop=off idle-sleep-us=%u event-wait=%u event-max-us=%u aot-poll-park=%u force-sample=real\n",
+                 static_cast<long long>(cpu_.cycle_budget), native_idle_sleep_us,
+                 idle_event_wait_enabled_ ? 1u : 0u, idle_event_max_wait_us_,
+                 aot_poll_park_enabled_ ? 1u : 0u);
     run_banner_reported_ = true;
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_EXCEPTION_VECTOR_POLICY_V294=%u default=off cache=icbi+icfi ice-off=original-interpreter\n",
+                 native_low_vector_enabled_ ? 1u : 0u);
   }
 
+  // v276: the NativeOS service is a process singleton; resolve it once instead
+  // of twice per host boundary.
+  auto& native_os = GekkoAOT::NativeOS::Service::Get();
   while (dispatch_limit == 0 || result.dispatches < dispatch_limit) {
     if (cpu_.pc == 0u) {
       result.status = RunStatus::Completed;
       break;
     }
 
+    // v321: a DSI latch must be consumed by entering the 0x300 vector. A host
+    // service that lowered a fault and then redirected pc leaves generated code
+    // unwinding at every entry forever; report that state once.
+    if ((cpu_.exception & kPpcExcDsi) != 0u && !stale_dsi_reported_) {
+      NoteDsiTrace('B', cpu_.pc, cpu_.msr);
+      if (!IsLowExceptionVectorAddress(AddressSpace::ToPhysical(cpu_.pc))) {
+        stale_dsi_reported_ = true;
+        std::fprintf(stderr,
+                     "GEKKOAOT_VM_DSI_STALE_LATCH_V321=1 pc=%08x lr=%08x msr=%08x raise_pc=%08x raise_lr=%08x raise_msr=%08x dar=%08x srr0=%08x\n",
+                     cpu_.pc, cpu_.lr, cpu_.msr, last_dsi_pc_, last_dsi_lr_, last_dsi_msr_,
+                     cpu_.dar, cpu_.srr0);
+        for (std::uint32_t k = 0; k < 16u; ++k) {
+          const auto i = (dsi_trace_next_ + k) & 15u;
+          if (dsi_trace_tag_[i])
+            std::fprintf(stderr, "GEKKOAOT_VM_DSI_TRACE_V321=1 tag=%c pc=%08x exc=%x\n",
+                         static_cast<char>(dsi_trace_tag_[i]), dsi_trace_pc_[i], dsi_trace_exc_[i]);
+        }
+      }
+    }
+    if (runtime_profile_enabled_) {
+      ++boundaries_total_;
+      // v274: GEKKOAOT_BOUNDARY_PROFILE=1 histograms host boundaries by guest
+      // PC/LR and prints the top entries with the perf metrics line.
+      if (boundary_profile_enabled_)
+        ++boundary_profile_[(std::uint64_t(cpu_.pc) << 32u) | cpu_.lr];
+    }
+    if (idle_loop_proof_enabled_) {
+      ObserveIdleLoop(result);
+      if (result.status == RunStatus::HostRequestedExit) break;
+    }
+
     std::uint32_t halt_entry = 0;
-    if (DetectSdkPpcHalt(cpu_.pc, &halt_entry)) {
-      RecordCompatBreadcrumb(cpu_.pc, CompatDispatchKind::Main);
+    if (!ppc_halt_pcs_.empty() && cpu_.pc >= ppc_halt_pcs_.front().pc &&
+        cpu_.pc <= ppc_halt_pcs_.back().pc && DetectSdkPpcHalt(cpu_.pc, &halt_entry)) {
+      if (compat_diagnostics_enabled_)
+        RecordCompatBreadcrumb(cpu_.pc, CompatDispatchKind::Main);
       ReportCompatFailure("guest-halt", halt_entry, 0u, false);
       result.status = RunStatus::GuestHalted;
       result.fault_address = halt_entry;
       break;
     }
 
-    auto& native_os = GekkoAOT::NativeOS::Service::Get();
     if (native_os.IsIdle() && cpu_.pc == native_os.IdlePc()) {
-      RecordCompatBreadcrumb(cpu_.pc, CompatDispatchKind::Idle);
+      CountHostEffect();  // NativeOS owns this idle loop and parks it itself
+      if (compat_diagnostics_enabled_)
+        RecordCompatBreadcrumb(cpu_.pc, CompatDispatchKind::Idle);
       // Native equivalent of Dolphin OS SelectThread's IdleContext loop. First
       // consume a thread made runnable by a previous interrupt callback. If the
       // run queue is still empty, allow already-pending asynchronous exceptions
@@ -4515,23 +8928,28 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
       }
       if (cpu_.pc != native_os.IdlePc()) continue;
 
-      if (TryTakeExternalInterrupt() || TryTakeDecrementerInterrupt()) continue;
+      // v335: idle means waiting for an interrupt; make queued GPU work visible
+      // before delivering a pending one (see ParkSdkIdlePoll).
+      native_gx_.PublishPendingWrites();
+      // v183: pending IRQ/DEC latches are almost always clear while the guest
+      // is idle. Avoid entering the full exception helpers on that common path.
+      if ((pi_.InterruptPending() && TryTakeExternalInterrupt()) ||
+          (decrementer_pending_ && TryTakeDecrementerInterrupt()))
+        continue;
 
-      constexpr std::uint64_t kNativeIdleMaxQuantum = 4096u;
-      const std::uint64_t idle_quantum = std::max<std::uint64_t>(
-          1u, std::min<std::uint64_t>(kNativeIdleMaxQuantum, vi_.TicksPerHalfLine()));
-      // v136b: do not park by default. On Linux a nominal 50-us sleep may
-      // overshoot enough to shave throughput/latency on titles that enter the
-      // SDK idle context between render bursts. The O(1) NativeOS scheduler,
-      // TSC clock and zero-cycle fast return retain most of v136's CPU savings
-      // without sleeping. Parking remains an explicit power-saving opt-in.
-      if (native_idle_sleep_us != 0u)
-        std::this_thread::sleep_for(std::chrono::microseconds(native_idle_sleep_us));
-      // v46 virtualizes only the VI wait gate while NativeOS is genuinely
-      // idle. The guest clock itself is wall-paced to 1.0x, so a faster host
-      // cannot make game logic/audio randomly run faster. CPU timebase/DEC,
-      // DSP, AI and GX still receive the original idle_quantum below.
-      AdvanceRuntimeCycles(idle_quantum, result, true);
+      if (idle_event_wait_enabled_) {
+        // v158: no runnable OSThread means there is no useful PPC work until a
+        // hardware/timer/alarm event occurs. Park the host once instead of
+        // burning a core on Run()->AdvanceRuntimeCycles() 4096-cycle probes.
+        WaitForIdleEvent(result);
+      } else {
+        constexpr std::uint64_t kNativeIdleMaxQuantum = 4096u;
+        const std::uint64_t idle_quantum = std::max<std::uint64_t>(
+            1u, std::min<std::uint64_t>(kNativeIdleMaxQuantum, vi_.TicksPerHalfLine()));
+        if (native_idle_sleep_us != 0u)
+          std::this_thread::sleep_for(std::chrono::microseconds(native_idle_sleep_us));
+        AdvanceRuntimeCycles(idle_quantum, result, true);
+      }
       ++result.dispatches;
       if (result.status == RunStatus::HostRequestedExit) break;
       continue;
@@ -4541,12 +8959,22 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
     // the architectural SRR0 value for an asynchronous external interrupt.
     // Do this before NativeOS/HLE dispatch so the real low-memory 0x500 vector
     // owns interrupt delivery and can wake the guest scheduler normally.
-    TryTakeExternalInterrupt();
-    TryTakeDecrementerInterrupt();
+    // v183: keep exact per-boundary interrupt visibility, but make the normal
+    // no-event boundary two cheap latch tests instead of two helper calls.
+    if (pi_.InterruptPending()) TryTakeExternalInterrupt();
+    if (decrementer_pending_) TryTakeDecrementerInterrupt();
+    if (time_poll_return_ != 0u) ParkClockSpin(result);
+    if (guest_rate_ceiling_pct_ != 0u && rate_charged_ - rate_mark_charged_ >= 65536u)
+      ThrottleGuestRate(result);
+    ParkSdkIdlePoll(result);
+    ParkNativeCounterPoll(result);
+    ParkNativeReadPoll(result);
+    if (result.status == RunStatus::HostRequestedExit) break;
 
     const std::uint32_t native_os_pc = cpu_.pc;
-    if (GekkoAOT::NativeOS::Service::Get().Poll(&cpu_, native_os_pc)) {
-      RecordCompatBreadcrumb(native_os_pc, CompatDispatchKind::NativeHle);
+    if (native_os.Poll(&cpu_, native_os_pc)) {
+      if (compat_diagnostics_enabled_)
+        RecordCompatBreadcrumb(native_os_pc, CompatDispatchKind::NativeHle);
       ++hle_calls_;
       continue;
     }
@@ -4555,10 +8983,36 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
     cpu_.external_read_count = 0;
     cpu_.external_write_count = 0;
     const std::uint32_t dispatch_pc = cpu_.pc;
-    RecordCompatBreadcrumb(dispatch_pc, CompatDispatchKind::Main);
+    if (compat_diagnostics_enabled_)
+      RecordCompatBreadcrumb(dispatch_pc, CompatDispatchKind::Main);
 
     std::uint64_t low_memory_cycles = 0;
-    if (ExecuteLowMemoryInstruction(dispatch_pc, &low_memory_cycles)) {
+    // v182: low-memory vectors are exceptional. Avoid entering the sizeable
+    // interpreter helper at every ordinary MEM1 function boundary; the cheap
+    // page-mask prefilter is identical to the helper's first semantic test.
+    const std::uint32_t dispatch_physical = AddressSpace::ToPhysical(dispatch_pc);
+    bool native_low_vector = false;
+    if (IsLowExceptionVectorAddress(dispatch_physical) &&
+        ((native_low_vector = ExecuteNativeLowMemoryVector(dispatch_pc, &low_memory_cycles)) ||
+         ExecuteLowMemoryInstruction(dispatch_pc, &low_memory_cycles))) {
+      // v276: first-level exception vectors run with MSR[EE]=0, so no
+      // interrupt, NativeOS alarm or idle park can be taken between their
+      // instructions; every per-boundary check below is a no-op for them.
+      // Execute the rest of the vector in one host boundary instead of one
+      // full Run iteration per instruction. Stop exactly where the old loop
+      // could observe something: leaving the vector pages (rfi/branch to the
+      // OS handler), MSR[EE] becoming 1, a fault, or an instruction the
+      // low-memory executor does not handle (left to the next iteration).
+      for (std::uint32_t step = native_low_vector ? 34u : 1u; step < 256u; ++step) {
+        if (fault_.kind != FaultKind::None || (cpu_.msr & kPpcMsrEe) != 0u) break;
+        const std::uint32_t next_pc = cpu_.pc;
+        if (!IsLowExceptionVectorAddress(AddressSpace::ToPhysical(next_pc))) break;
+        std::uint64_t step_cycles = 0u;
+        if (!ExecuteLowMemoryInstruction(next_pc, &step_cycles)) break;
+        low_memory_cycles += step_cycles;
+      }
+      if (AddressSpace::ToPhysical(dispatch_pc) == 0x0300u)
+        NoteDsiTrace('V', cpu_.pc, cpu_.exception);
       if (compat_diagnostics_enabled_ && compat_breadcrumb_sequence_ != 0u)
         compat_breadcrumbs_[(compat_breadcrumb_next_ + kCompatBreadcrumbCount - 1u) %
                             kCompatBreadcrumbCount].kind = CompatDispatchKind::LowMemory;
@@ -4569,9 +9023,122 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
         break;
       }
       ++result.dispatches;
-      AdvanceRuntimeCycles(low_memory_cycles, result);
+      AdvanceRuntimeCyclesFast(low_memory_cycles, result);
       if (result.status == RunStatus::HostRequestedExit) break;
       continue;
+    }
+
+    // A verified live REL range outside main.dol cannot be handled by its
+    // dispatcher. Keep the normal event/HLE boundary above, then dispatch the
+    // known owner directly instead of paying a main-dispatch miss first.
+    if (!has_fixed_secondary_modules_ && !rel_mapping_dirty_ &&
+        cached_rel_route_.exclusive_from_main && cached_rel_route_.owner &&
+        dispatch_pc >= cached_rel_route_.runtime_start &&
+        dispatch_pc < cached_rel_route_.runtime_end &&
+        DispatchSecondaryModule(dispatch_pc, result)) {
+      if (fault_.kind != FaultKind::None) {
+        result.status = FaultStatus();
+        result.fault_address = fault_.address;
+        result.fault_value = fault_.value;
+        break;
+      }
+      if (result.status == RunStatus::HostRequestedExit) break;
+      continue;
+    }
+
+    // v170: some retail SDK builds leave OSGetTime/OSGetTick as tiny leaf
+    // helpers instead of exposing a resolver-friendly symbol. Executing these
+    // through overlapping fixed executable images can turn an otherwise trivial
+    // timebase read into a permanent busy loop.
+    //
+    // v181: safe host boundaries can revisit the same PCs millions of times.
+    // The previous miss path Resolve()'d and decoded two guest instructions on
+    // every boundary even though almost every PC is not a time helper. Cache the
+    // exact-PC classification in the executable publication epoch. This keeps
+    // the compatibility HLE semantics unchanged while turning repeated misses
+    // into a direct-mapped cache lookup.
+    {
+      auto& probe = ProbeDispatchCode(dispatch_pc);
+
+      if (probe.time_kind == 0u) {
+        std::uint32_t op0=0u, op1=0u, op2=0u, op3=0u, op4=0u, op5=0u;
+        const auto* time_head = fast_time_probe_enabled_
+            ? memory_.Resolve(dispatch_pc, 8u)
+            : nullptr;
+        bool have_time = false;
+        if (time_head) {
+          op0 = ReadGuestBE32(time_head);
+          op1 = ReadGuestBE32(time_head + 4u);
+          have_time = true;
+        } else {
+          have_time = memory_.Read32(dispatch_pc + 0u, &op0) &&
+                      memory_.Read32(dispatch_pc + 4u, &op1);
+        }
+
+        if (have_time && op0 == 0x7c6c42e6u && op1 == 0x4e800020u) {
+          probe.time_kind = 2u;
+        } else if (have_time && op0 == 0x7c6d42e6u && op1 == 0x7c8c42e6u) {
+          bool have_tail = false;
+          const auto* time_full = fast_time_probe_enabled_
+              ? memory_.Resolve(dispatch_pc, 24u)
+              : nullptr;
+          if (time_full) {
+            op2 = ReadGuestBE32(time_full + 8u);
+            op3 = ReadGuestBE32(time_full + 12u);
+            op4 = ReadGuestBE32(time_full + 16u);
+            op5 = ReadGuestBE32(time_full + 20u);
+            have_tail = true;
+          } else {
+            have_tail = memory_.Read32(dispatch_pc + 8u, &op2) &&
+                        memory_.Read32(dispatch_pc + 12u, &op3) &&
+                        memory_.Read32(dispatch_pc + 16u, &op4) &&
+                        memory_.Read32(dispatch_pc + 20u, &op5);
+          }
+          if (have_tail && op2 == 0x7cad42e6u && op3 == 0x7c032800u &&
+              op4 == 0x4082fff0u && op5 == 0x4e800020u)
+            probe.time_kind = 3u;
+          else if (have_tail)
+            probe.time_kind = 1u;
+        } else if (have_time) {
+          probe.time_kind = 1u;
+        }
+        // v274: classify exact integer leaf tails (see TryExecuteLeafTail).
+        if (probe.time_kind == 1u && leaf_tail_enabled_ &&
+            TryExecuteLeafTail(dispatch_pc, false) != 0u)
+          probe.time_kind = 4u;
+      }
+
+      if (probe.time_kind == 4u) {
+        // Re-decoded on every use, so a stale classification can only fall
+        // back to the module; it can never execute different guest bytes.
+        if (const std::uint32_t retired = TryExecuteLeafTail(dispatch_pc, true)) {
+          ++result.dispatches;
+          if (runtime_profile_enabled_) ++leaf_tail_executions_;
+          AdvanceRuntimeCyclesFast(retired, result);
+          if (result.status == RunStatus::HostRequestedExit) break;
+          continue;
+        }
+        probe.time_kind = 1u;
+      }
+
+      if (probe.time_kind == 2u) {
+        cpu_.gpr[3] = static_cast<std::uint32_t>(cpu_.timebase);
+        cpu_.pc = cpu_.lr;
+        ++result.dispatches;
+        ++hle_calls_;
+        AdvanceRuntimeCyclesFast(2u, result);
+        continue;
+      }
+      if (probe.time_kind == 3u) {
+        const std::uint64_t tb = cpu_.timebase;
+        cpu_.gpr[3] = static_cast<std::uint32_t>(tb >> 32u);
+        cpu_.gpr[4] = static_cast<std::uint32_t>(tb);
+        cpu_.pc = cpu_.lr;
+        ++result.dispatches;
+        ++hle_calls_;
+        AdvanceRuntimeCyclesFast(6u, result);
+        continue;
+      }
     }
 
     // v84: fixed DOL/ELF executables may replace each other at identical
@@ -4580,7 +9147,13 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
     // stale main/side module to win an overlap. Unique-address code stays on the
     // existing zero-hash hot path.
     bool fixed_overlap = false;
-    const auto* fixed_descriptor = SelectFixedExecutableModule(dispatch_pc, &fixed_overlap);
+    const GekkoAOTModuleDesc* fixed_descriptor = nullptr;
+    // The selector is intentionally heavyweight because it verifies overlapping
+    // fixed images. Most titles have none. Keep their boundary path to one
+    // predictable boolean branch instead of calling the router just to discover
+    // that fact again.
+    if (has_fixed_secondary_modules_)
+      fixed_descriptor = SelectFixedExecutableModule(dispatch_pc, &fixed_overlap);
     if (fixed_overlap && fixed_descriptor && fixed_descriptor != descriptor) {
       if (DispatchFixedExecutableModule(fixed_descriptor, dispatch_pc, result)) {
         if (fault_.kind != FaultKind::None) {
@@ -4629,6 +9202,14 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
         ++result.dispatches;
         continue;
       }
+      std::uint64_t copied_cache_cycles=0;
+      if (fault_.kind == FaultKind::None &&
+          DispatchCopiedCacheStub(dispatch_pc, &copied_cache_cycles)) {
+        ++result.dispatches;
+        AdvanceRuntimeCycles(copied_cache_cycles, result);
+        if (result.status == RunStatus::HostRequestedExit) break;
+        continue;
+      }
       if (fault_.kind == FaultKind::None)
         ReportCompatFailure("uncompiled-address", dispatch_pc, 0u);
       result.status = fault_.kind == FaultKind::None ? RunStatus::UncompiledAddress : FaultStatus();
@@ -4640,9 +9221,11 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
     ++result.dispatches;
     if (cpu_.downcount < 0) {
       const std::uint64_t charged = static_cast<std::uint64_t>(-(cpu_.downcount + 1)) + 1u;
-      AdvanceRuntimeCycles(charged, result);
+      AdvanceRuntimeCyclesFast(charged, result);
       if (result.status == RunStatus::HostRequestedExit) break;
     }
+    ConsumeAotPollPark(result);
+    if (result.status == RunStatus::HostRequestedExit) break;
 
     if (fault_.kind != FaultKind::None) {
       result.status = FaultStatus();
@@ -4661,6 +9244,8 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
   result.rel_mapping_refreshes = rel_mapping_refreshes_;
   result.rel_address_translations = rel_address_translations_;
   result.rel_address_misses = rel_address_misses_;
+  result.idle_event_waits = idle_event_waits_;
+  result.idle_event_requested_cycles = idle_event_requested_cycles_;
   result.rel_last_canonical = rel_last_canonical_;
   result.rel_last_runtime = rel_last_runtime_;
   result.link_register = cpu_.lr;
@@ -4736,6 +9321,25 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
     };
     result.halt_text_08 = read_guest_text(result.halt_stack_word_08);
     result.halt_text_10 = read_guest_text(result.halt_stack_word_10);
+
+    // PowerPC EABI frames are chained through 0(r1). The callee normally
+    // saves its incoming LR in the caller linkage area at caller_sp + 4.
+    // Walking that linkage after a terminal SDK PPCHalt reveals the routine
+    // that entered OSPanic without changing guest control flow.
+    std::uint32_t frame_sp = sp;
+    for (std::size_t depth = 0; depth < result.halt_frame_sp.size(); ++depth) {
+      std::uint32_t caller_sp = 0;
+      if (!memory_.Read32(frame_sp, &caller_sp)) break;
+      if (caller_sp <= frame_sp || (caller_sp & 3u) != 0u ||
+          caller_sp - frame_sp > 0x00100000u)
+        break;
+      std::uint32_t caller_lr = 0;
+      if (!memory_.Read32(caller_sp + 4u, &caller_lr)) break;
+      result.halt_frame_sp[depth] = frame_sp;
+      result.halt_frame_caller_lr[depth] = caller_lr;
+      result.halt_frame_count = static_cast<std::uint8_t>(depth + 1u);
+      frame_sp = caller_sp;
+    }
   }
 
   if (result.fault_address == 0 && fault_.kind != FaultKind::None)

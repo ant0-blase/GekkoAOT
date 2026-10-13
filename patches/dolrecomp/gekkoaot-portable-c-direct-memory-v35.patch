@@ -1,0 +1,234 @@
+diff --git a/src/cpu/cpu.h b/src/cpu/cpu.h
+--- a/src/cpu/cpu.h
++++ b/src/cpu/cpu.h
+@@ -142,6 +142,109 @@
+ u16  mem_read16(CPUState* cpu, u32 addr);
+ void mem_write16(CPUState* cpu, u32 addr, u16 value);
+ u8   mem_read8(CPUState* cpu, u32 addr);
+ void mem_write8(CPUState* cpu, u32 addr, u8 value);
++
++/* GekkoAOT v35 portable-C direct memory ABI.
++ *
++ * The LLVM backend already folds proven MEM1/MEM2 accesses into host loads and
++ * stores.  Portable C historically emitted an out-of-line mem_readXX/mem_writeXX
++ * call for every guest access, so normal game code paid address resolution and
++ * a function boundary even when the effective address was plain MEM1.  These
++ * tiny header helpers let the host C compiler see the common RAM path and keep
++ * the existing functions as the exact MMIO/FakeVMEM fallback.
++ *
++ * Cached/uncached aliases are canonicalised exactly like cpu.c.  Store helpers
++ * preserve reservation invalidation and the MEM1 write journal used by SMC /
++ * texture coherency. */
++static inline u32 dolrecomp_direct_canonical(u32 addr) {
++    return addr & ~0x40000000u;
++}
++
++static inline u8* dolrecomp_direct_ram_ptr(CPUState* cpu, u32 addr, u32 size,
++                                            bool* mem1) {
++    u32 canonical = dolrecomp_direct_canonical(addr);
++    if (canonical >= GC_RAM_BASE) {
++        u32 offset = canonical - GC_RAM_BASE;
++        if (offset <= cpu->ram_size && size <= cpu->ram_size - offset) {
++            if (mem1) *mem1 = true;
++            return cpu->ram + offset;
++        }
++    }
++    if (cpu->mem2 && canonical >= WII_MEM2_BASE) {
++        u32 offset = canonical - WII_MEM2_BASE;
++        if (offset <= cpu->mem2_size && size <= cpu->mem2_size - offset) {
++            if (mem1) *mem1 = false;
++            return cpu->mem2 + offset;
++        }
++    }
++    return (u8*)0;
++}
++
++static inline u16 dolrecomp_load_be16_fast(const u8* p) {
++    return ((u16)p[0] << 8) | (u16)p[1];
++}
++static inline u32 dolrecomp_load_be32_fast(const u8* p) {
++    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
++}
++static inline u64 dolrecomp_load_be64_fast(const u8* p) {
++    return ((u64)dolrecomp_load_be32_fast(p) << 32) | dolrecomp_load_be32_fast(p + 4);
++}
++static inline void dolrecomp_store_be16_fast(u8* p, u16 v) {
++    p[0] = (u8)(v >> 8); p[1] = (u8)v;
++}
++static inline void dolrecomp_store_be32_fast(u8* p, u32 v) {
++    p[0] = (u8)(v >> 24); p[1] = (u8)(v >> 16); p[2] = (u8)(v >> 8); p[3] = (u8)v;
++}
++static inline void dolrecomp_store_be64_fast(u8* p, u64 v) {
++    dolrecomp_store_be32_fast(p, (u32)(v >> 32));
++    dolrecomp_store_be32_fast(p + 4, (u32)v);
++}
++
++static inline void dolrecomp_direct_store_bookkeeping(CPUState* cpu, u32 addr,
++                                                       u32 size, bool mem1) {
++    const u32 reserve_addr = cpu->reserve_addr & ~0x40000000u;
++    const u32 store_addr = addr & ~0x40000000u;
++    if (cpu->reserve_valid && ((reserve_addr ^ store_addr) & ~31u) == 0)
++        cpu->reserve_valid = false;
++    if (mem1 && g_mem_write_journal)
++        g_mem_write_journal(store_addr - GC_RAM_BASE, size, g_mem_write_journal_user);
++}
++
++static inline u8 mem_read8_fast(CPUState* cpu, u32 addr) {
++    u8* p = dolrecomp_direct_ram_ptr(cpu, addr, 1u, (bool*)0);
++    return p ? p[0] : mem_read8(cpu, addr);
++}
++static inline u16 mem_read16_fast(CPUState* cpu, u32 addr) {
++    u8* p = dolrecomp_direct_ram_ptr(cpu, addr, 2u, (bool*)0);
++    return p ? dolrecomp_load_be16_fast(p) : mem_read16(cpu, addr);
++}
++static inline u32 mem_read32_fast(CPUState* cpu, u32 addr) {
++    u8* p = dolrecomp_direct_ram_ptr(cpu, addr, 4u, (bool*)0);
++    return p ? dolrecomp_load_be32_fast(p) : mem_read32(cpu, addr);
++}
++static inline u64 mem_read64_fast(CPUState* cpu, u32 addr) {
++    u8* p = dolrecomp_direct_ram_ptr(cpu, addr, 8u, (bool*)0);
++    return p ? dolrecomp_load_be64_fast(p) : mem_read64(cpu, addr);
++}
++static inline void mem_write8_fast(CPUState* cpu, u32 addr, u8 value) {
++    bool mem1 = false; u8* p = dolrecomp_direct_ram_ptr(cpu, addr, 1u, &mem1);
++    if (!p) { mem_write8(cpu, addr, value); return; }
++    dolrecomp_direct_store_bookkeeping(cpu, addr, 1u, mem1); p[0] = value;
++}
++static inline void mem_write16_fast(CPUState* cpu, u32 addr, u16 value) {
++    bool mem1 = false; u8* p = dolrecomp_direct_ram_ptr(cpu, addr, 2u, &mem1);
++    if (!p) { mem_write16(cpu, addr, value); return; }
++    dolrecomp_direct_store_bookkeeping(cpu, addr, 2u, mem1); dolrecomp_store_be16_fast(p, value);
++}
++static inline void mem_write32_fast(CPUState* cpu, u32 addr, u32 value) {
++    bool mem1 = false; u8* p = dolrecomp_direct_ram_ptr(cpu, addr, 4u, &mem1);
++    if (!p) { mem_write32(cpu, addr, value); return; }
++    dolrecomp_direct_store_bookkeeping(cpu, addr, 4u, mem1); dolrecomp_store_be32_fast(p, value);
++}
++static inline void mem_write64_fast(CPUState* cpu, u32 addr, u64 value) {
++    bool mem1 = false; u8* p = dolrecomp_direct_ram_ptr(cpu, addr, 8u, &mem1);
++    if (!p) { mem_write64(cpu, addr, value); return; }
++    dolrecomp_direct_store_bookkeeping(cpu, addr, 8u, mem1); dolrecomp_store_be64_fast(p, value);
++}
+
+ f64 ppc_approx_reciprocal(f64 value);
+diff --git a/src/backend/emitter.c b/src/backend/emitter.c
+--- a/src/backend/emitter.c
++++ b/src/backend/emitter.c
+@@ -169 +169 @@
+-        fprintf(out, "        f64 value = dolrecomp_f32_from_bits(mem_read32(ctx, ea));\n");
++        fprintf(out, "        f64 value = dolrecomp_f32_from_bits(mem_read32_fast(ctx, ea));\n");
+@@ -173 +173 @@
+-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_f64_from_bits(mem_read64(ctx, ea));\n",
++        fprintf(out, "        ctx->fpr[%u] = dolrecomp_f64_from_bits(mem_read64_fast(ctx, ea));\n",
+@@ -189 +189 @@
+-        fprintf(out, "        f64 value = dolrecomp_f32_from_bits(mem_read32(ctx, ea));\n");
++        fprintf(out, "        f64 value = dolrecomp_f32_from_bits(mem_read32_fast(ctx, ea));\n");
+@@ -193 +193 @@
+-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_f64_from_bits(mem_read64(ctx, ea));\n",
++        fprintf(out, "        ctx->fpr[%u] = dolrecomp_f64_from_bits(mem_read64_fast(ctx, ea));\n",
+@@ -209 +209 @@
+-        fprintf(out, "        mem_write32(ctx, ea, dolrecomp_f32_to_bits(ctx->fpr[%u]));\n",
++        fprintf(out, "        mem_write32_fast(ctx, ea, dolrecomp_f32_to_bits(ctx->fpr[%u]));\n",
+@@ -212 +212 @@
+-        fprintf(out, "        mem_write64(ctx, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]));\n",
++        fprintf(out, "        mem_write64_fast(ctx, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]));\n",
+@@ -228 +228 @@
+-        fprintf(out, "        mem_write32(ctx, ea, dolrecomp_f32_to_bits(ctx->fpr[%u]));\n",
++        fprintf(out, "        mem_write32_fast(ctx, ea, dolrecomp_f32_to_bits(ctx->fpr[%u]));\n",
+@@ -231 +231 @@
+-        fprintf(out, "        mem_write64(ctx, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]));\n",
++        fprintf(out, "        mem_write64_fast(ctx, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]));\n",
+@@ -286 +286 @@
+-    fprintf(out, "        for (u32 i = 0; i < 32; i += 4) mem_write32(ctx, ea + i, 0);\n");
++    fprintf(out, "        for (u32 i = 0; i < 32; i += 4) mem_write32_fast(ctx, ea + i, 0);\n");
+@@ -1438,8 +1438,8 @@
+-    case PPC_OP_LWZ:  emit_load(out, inst, "mem_read32(ctx, ea)", false); break;
+-    case PPC_OP_LWZU: emit_load(out, inst, "mem_read32(ctx, ea)", true); break;
+-    case PPC_OP_LBZ:  emit_load(out, inst, "mem_read8(ctx, ea)", false); break;
+-    case PPC_OP_LBZU: emit_load(out, inst, "mem_read8(ctx, ea)", true); break;
+-    case PPC_OP_LHZ:  emit_load(out, inst, "mem_read16(ctx, ea)", false); break;
+-    case PPC_OP_LHZU: emit_load(out, inst, "mem_read16(ctx, ea)", true); break;
+-    case PPC_OP_LHA:  emit_load(out, inst, "(u32)(s32)(s16)mem_read16(ctx, ea)", false); break;
+-    case PPC_OP_LHAU: emit_load(out, inst, "(u32)(s32)(s16)mem_read16(ctx, ea)", true); break;
++    case PPC_OP_LWZ:  emit_load(out, inst, "mem_read32_fast(ctx, ea)", false); break;
++    case PPC_OP_LWZU: emit_load(out, inst, "mem_read32_fast(ctx, ea)", true); break;
++    case PPC_OP_LBZ:  emit_load(out, inst, "mem_read8_fast(ctx, ea)", false); break;
++    case PPC_OP_LBZU: emit_load(out, inst, "mem_read8_fast(ctx, ea)", true); break;
++    case PPC_OP_LHZ:  emit_load(out, inst, "mem_read16_fast(ctx, ea)", false); break;
++    case PPC_OP_LHZU: emit_load(out, inst, "mem_read16_fast(ctx, ea)", true); break;
++    case PPC_OP_LHA:  emit_load(out, inst, "(u32)(s32)(s16)mem_read16_fast(ctx, ea)", false); break;
++    case PPC_OP_LHAU: emit_load(out, inst, "(u32)(s32)(s16)mem_read16_fast(ctx, ea)", true); break;
+@@ -1447,10 +1447,10 @@
+-    case PPC_OP_LWZX:  emit_loadx(out, inst, "mem_read32(ctx, ea)", false); break;
+-    case PPC_OP_LWZUX: emit_loadx(out, inst, "mem_read32(ctx, ea)", true); break;
+-    case PPC_OP_LBZX:  emit_loadx(out, inst, "mem_read8(ctx, ea)", false); break;
+-    case PPC_OP_LBZUX: emit_loadx(out, inst, "mem_read8(ctx, ea)", true); break;
+-    case PPC_OP_LHZX:  emit_loadx(out, inst, "mem_read16(ctx, ea)", false); break;
+-    case PPC_OP_LHZUX: emit_loadx(out, inst, "mem_read16(ctx, ea)", true); break;
+-    case PPC_OP_LHAX:  emit_loadx(out, inst, "(u32)(s32)(s16)mem_read16(ctx, ea)", false); break;
+-    case PPC_OP_LHAUX: emit_loadx(out, inst, "(u32)(s32)(s16)mem_read16(ctx, ea)", true); break;
+-    case PPC_OP_LWBRX: emit_loadx(out, inst, "bswap32(mem_read32(ctx, ea))", false); break;
+-    case PPC_OP_LHBRX: emit_loadx(out, inst, "bswap16(mem_read16(ctx, ea))", false); break;
++    case PPC_OP_LWZX:  emit_loadx(out, inst, "mem_read32_fast(ctx, ea)", false); break;
++    case PPC_OP_LWZUX: emit_loadx(out, inst, "mem_read32_fast(ctx, ea)", true); break;
++    case PPC_OP_LBZX:  emit_loadx(out, inst, "mem_read8_fast(ctx, ea)", false); break;
++    case PPC_OP_LBZUX: emit_loadx(out, inst, "mem_read8_fast(ctx, ea)", true); break;
++    case PPC_OP_LHZX:  emit_loadx(out, inst, "mem_read16_fast(ctx, ea)", false); break;
++    case PPC_OP_LHZUX: emit_loadx(out, inst, "mem_read16_fast(ctx, ea)", true); break;
++    case PPC_OP_LHAX:  emit_loadx(out, inst, "(u32)(s32)(s16)mem_read16_fast(ctx, ea)", false); break;
++    case PPC_OP_LHAUX: emit_loadx(out, inst, "(u32)(s32)(s16)mem_read16_fast(ctx, ea)", true); break;
++    case PPC_OP_LWBRX: emit_loadx(out, inst, "bswap32(mem_read32_fast(ctx, ea))", false); break;
++    case PPC_OP_LHBRX: emit_loadx(out, inst, "bswap16(mem_read16_fast(ctx, ea))", false); break;
+@@ -1473,6 +1473,6 @@
+-    case PPC_OP_STW:  emit_store(out, inst, "mem_write32", "u32", false); break;
+-    case PPC_OP_STWU: emit_store(out, inst, "mem_write32", "u32", true); break;
+-    case PPC_OP_STB:  emit_store(out, inst, "mem_write8", "u8", false); break;
+-    case PPC_OP_STBU: emit_store(out, inst, "mem_write8", "u8", true); break;
+-    case PPC_OP_STH:  emit_store(out, inst, "mem_write16", "u16", false); break;
+-    case PPC_OP_STHU: emit_store(out, inst, "mem_write16", "u16", true); break;
++    case PPC_OP_STW:  emit_store(out, inst, "mem_write32_fast", "u32", false); break;
++    case PPC_OP_STWU: emit_store(out, inst, "mem_write32_fast", "u32", true); break;
++    case PPC_OP_STB:  emit_store(out, inst, "mem_write8_fast", "u8", false); break;
++    case PPC_OP_STBU: emit_store(out, inst, "mem_write8_fast", "u8", true); break;
++    case PPC_OP_STH:  emit_store(out, inst, "mem_write16_fast", "u16", false); break;
++    case PPC_OP_STHU: emit_store(out, inst, "mem_write16_fast", "u16", true); break;
+@@ -1480,6 +1480,6 @@
+-    case PPC_OP_STWX:  emit_storex(out, inst, "mem_write32", "u32", false); break;
+-    case PPC_OP_STWUX: emit_storex(out, inst, "mem_write32", "u32", true); break;
+-    case PPC_OP_STBX:  emit_storex(out, inst, "mem_write8", "u8", false); break;
+-    case PPC_OP_STBUX: emit_storex(out, inst, "mem_write8", "u8", true); break;
+-    case PPC_OP_STHX:  emit_storex(out, inst, "mem_write16", "u16", false); break;
+-    case PPC_OP_STHUX: emit_storex(out, inst, "mem_write16", "u16", true); break;
++    case PPC_OP_STWX:  emit_storex(out, inst, "mem_write32_fast", "u32", false); break;
++    case PPC_OP_STWUX: emit_storex(out, inst, "mem_write32_fast", "u32", true); break;
++    case PPC_OP_STBX:  emit_storex(out, inst, "mem_write8_fast", "u8", false); break;
++    case PPC_OP_STBUX: emit_storex(out, inst, "mem_write8_fast", "u8", true); break;
++    case PPC_OP_STHX:  emit_storex(out, inst, "mem_write16_fast", "u16", false); break;
++    case PPC_OP_STHUX: emit_storex(out, inst, "mem_write16_fast", "u16", true); break;
+@@ -1507 +1507 @@
+-        fprintf(out, "        mem_write32(ctx, ea, bswap32(ctx->gpr[%u]));\n", inst->rS);
++        fprintf(out, "        mem_write32_fast(ctx, ea, bswap32(ctx->gpr[%u]));\n", inst->rS);
+@@ -1516 +1516 @@
+-        fprintf(out, "        mem_write16(ctx, ea, bswap16((u16)ctx->gpr[%u]));\n", inst->rS);
++        fprintf(out, "        mem_write16_fast(ctx, ea, bswap16((u16)ctx->gpr[%u]));\n", inst->rS);
+@@ -1546 +1546 @@
+-        fprintf(out, "            ctx->gpr[reg] |= (u32)mem_read8(ctx, ea + n) << (24u - 8u * (n & 3u));\n");
++        fprintf(out, "            ctx->gpr[reg] |= (u32)mem_read8_fast(ctx, ea + n) << (24u - 8u * (n & 3u));\n");
+@@ -1568 +1568 @@
+-        fprintf(out, "            mem_write8(ctx, ea + n, value);\n");
++        fprintf(out, "            mem_write8_fast(ctx, ea + n, value);\n");
+@@ -1577 +1577 @@
+-        fprintf(out, ";\n        ctx->gpr[%u] = mem_read32(ctx, ea);\n", inst->rD);
++        fprintf(out, ";\n        ctx->gpr[%u] = mem_read32_fast(ctx, ea);\n", inst->rD);
+@@ -1585 +1585 @@
+-        fprintf(out, "        if (success) { mem_write32(ctx, ea, ctx->gpr[%u]); ctx->reserve_valid = false; }\n", inst->rS);
++        fprintf(out, "        if (success) { mem_write32_fast(ctx, ea, ctx->gpr[%u]); ctx->reserve_valid = false; }\n", inst->rS);
+@@ -1593 +1593 @@
+-        fprintf(out, ";\n        mem_write32(ctx, ea, (u32)dolrecomp_f64_to_bits(ctx->fpr[%u]));\n    }\n", inst->rS);
++        fprintf(out, ";\n        mem_write32_fast(ctx, ea, (u32)dolrecomp_f64_to_bits(ctx->fpr[%u]));\n    }\n", inst->rS);
+@@ -1629 +1629 @@
+-        fprintf(out, "        for (u32 r = %u; r < 32; r++, ea += 4) ctx->gpr[r] = mem_read32(ctx, ea);\n",
++        fprintf(out, "        for (u32 r = %u; r < 32; r++, ea += 4) ctx->gpr[r] = mem_read32_fast(ctx, ea);\n",
+@@ -1639 +1639 @@
+-        fprintf(out, "        for (u32 r = %u; r < 32; r++, ea += 4) mem_write32(ctx, ea, ctx->gpr[r]);\n",
++        fprintf(out, "        for (u32 r = %u; r < 32; r++, ea += 4) mem_write32_fast(ctx, ea, ctx->gpr[r]);\n",

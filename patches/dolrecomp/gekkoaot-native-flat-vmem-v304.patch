@@ -1,0 +1,127 @@
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -251,6 +251,7 @@
+   std::array<llvm::Argument *, DOLIR_STATE_COUNT> native_inputs_{};
+   llvm::Value *native_mem1_bias_ = nullptr;
+   llvm::Value *native_mem2_bias_ = nullptr;
++  llvm::Value *native_flat_vmem_view_ = nullptr; // GEKKOAOT_NATIVE_FLAT_VMEM_V304
+   llvm::Value *nativeMemoryPointer(llvm::Value*, llvm::Value*, llvm::Value*);
+   llvm::Value *ram_ = nullptr;
+   llvm::Value *ram_size_ = nullptr;
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -324,6 +324,19 @@
+           builder_.CreateSub(builder_.CreatePtrToInt(mem2_, wide), builder_.getInt64(WII_MEM2_BASE)),
+           "host.mem2.bias");
+       function_->addFnAttr("dolrecomp-native-address-lowering", "287");
++      // GEKKOAOT_NATIVE_FLAT_VMEM_V304: obtain a stable owner-specific cell,
++      // not a cached mapping permission. Its size is reloaded at each access.
++      const char* flat = std::getenv("DOLRECOMP_NATIVE_FLAT_VMEM");
++      if (!flat || flat[0] != '0') {
++        auto viewGetter = module_.getOrInsertFunction("gekkoaot_native_flat_vmem_view",
++            FunctionType::get(pointer, {pointer}, false));
++        auto* viewService = cast<Function>(viewGetter.getCallee());
++        viewService->setOnlyReadsMemory();
++        viewService->setDoesNotThrow();
++        viewService->addFnAttr(Attribute::WillReturn);
++        native_flat_vmem_view_ = builder_.CreateCall(viewGetter, {ctx_}, "host.flat.vmem.view");
++        function_->addFnAttr("dolrecomp-native-flat-vmem", "304");
++      }
+     }
+ 
+   }
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -294,6 +294,31 @@
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(slowBlock);
++  Value* flatValue = nullptr;
++  BasicBlock* flatEnd = nullptr;
++  if (native_flat_vmem_view_) {
++    // GEKKOAOT_NATIVE_FLAT_VMEM_V304: use the ORIGINAL EA. Normalizing the
++    // cached/uncached MEM1 alias bit would turn 0x7e into unrelated 0x3e RAM.
++    Type* pointer = PointerType::getUnqual(context_);
++    auto* viewType = StructType::get(context_, {pointer, builder_.getInt32Ty()});
++    auto* size = builder_.CreateLoad(builder_.getInt32Ty(),
++        builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 1));
++    size->setVolatile(true); // SDR1 may revoke this view inside the same function.
++    Value* offset = builder_.CreateSub(address, builder_.getInt32(0x7e000000u));
++    Value* admitted = builder_.CreateAnd(builder_.CreateICmpUGE(size, builder_.getInt32(width)),
++        builder_.CreateICmpULE(offset, builder_.CreateSub(size, builder_.getInt32(width))));
++    auto* direct = BasicBlock::Create(context_, "load_flat_vmem", function_);
++    auto* fallback = BasicBlock::Create(context_, "load_flat_vmem_fallback", function_);
++    builder_.CreateCondBr(admitted, direct, fallback);
++    builder_.SetInsertPoint(direct);
++    Value* base = builder_.CreateLoad(pointer,
++        builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 0));
++    flatValue = endianLoad(builder_.CreateInBoundsGEP(builder_.getInt8Ty(), base, offset),
++                           resultType, width, loopPollingLoad);
++    flatEnd = builder_.GetInsertBlock();
++    builder_.CreateBr(join);
++    builder_.SetInsertPoint(fallback);
++  }
+   // FPRF only has to be committed before a host-visible service call. The hot
+   // MEM1/MEM2 paths are pure native memory accesses and must not pay this
+   // synchronization cost.
+@@ -304,7 +329,8 @@
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(join);
+-  PHINode *phi = builder_.CreatePHI(resultType, 3);
++  PHINode *phi = builder_.CreatePHI(resultType, flatValue ? 4 : 3);
++  if (flatValue) phi->addIncoming(flatValue, flatEnd);
+   phi->addIncoming(mem1Value, mem1Block);
+   phi->addIncoming(mem2Value, mem2Block);
+   phi->addIncoming(slowValue, slowEnd);
+@@ -523,6 +549,25 @@
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(slowBlock);
++  if (native_flat_vmem_view_) {
++    Type* pointer = PointerType::getUnqual(context_);
++    auto* viewType = StructType::get(context_, {pointer, builder_.getInt32Ty()});
++    auto* size = builder_.CreateLoad(builder_.getInt32Ty(),
++        builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 1));
++    size->setVolatile(true);
++    Value* offset = builder_.CreateSub(address, builder_.getInt32(0x7e000000u));
++    Value* admitted = builder_.CreateAnd(builder_.CreateICmpUGE(size, builder_.getInt32(width)),
++        builder_.CreateICmpULE(offset, builder_.CreateSub(size, builder_.getInt32(width))));
++    auto* direct = BasicBlock::Create(context_, "store_flat_vmem", function_);
++    auto* fallback = BasicBlock::Create(context_, "store_flat_vmem_fallback", function_);
++    builder_.CreateCondBr(admitted, direct, fallback);
++    builder_.SetInsertPoint(direct);
++    Value* base = builder_.CreateLoad(pointer,
++        builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 0));
++    endianStore(builder_.CreateInBoundsGEP(builder_.getInt8Ty(), base, offset), value, width);
++    builder_.CreateBr(join);
++    builder_.SetInsertPoint(fallback);
++  }
+   materializeFPRF();
+   externalWrite(address, value, width);
+   builder_.CreateBr(join);
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -240,7 +240,7 @@
+       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+       "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
+       "x86-return-registers=3|"
+-      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s%s",
++      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s%s%s",
+       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+       static_cast<unsigned>(options ? options->native_abi_policy
+@@ -259,6 +259,12 @@
+           ? "|native-wgpipe-try=244" : "",
+       std::getenv("DOLRECOMP_FP_REGION_COALESCE") &&
+           std::string(std::getenv("DOLRECOMP_FP_REGION_COALESCE")) == "0"
+-          ? "|fp-region-coalesce=292-off" : "|fp-region-coalesce=292-on");
++          ? "|fp-region-coalesce=292-off" : "|fp-region-coalesce=292-on",
++      // GEKKOAOT_NATIVE_FLAT_VMEM_V304: include admission policy in IR identity.
++      std::getenv("DOLRECOMP_NATIVE_ADDRESS_LOWERING") &&
++          std::string(std::getenv("DOLRECOMP_NATIVE_ADDRESS_LOWERING")) == "1" &&
++          (!std::getenv("DOLRECOMP_NATIVE_FLAT_VMEM") ||
++           std::string(std::getenv("DOLRECOMP_NATIVE_FLAT_VMEM")) != "0")
++          ? "|native-flat-vmem=304-on" : "|native-flat-vmem=304-off");
+   return written >= 0 && static_cast<size_t>(written) < size;
+ }

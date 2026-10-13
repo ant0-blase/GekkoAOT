@@ -38,6 +38,21 @@ int main() {
   CHECK((exi.Status(0) & (kTcMask | kTcCause)) == kTcMask);
   CHECK(!exi.InterruptPending());
 
+  // A card erase/program operation completes when CS drops and must raise
+  // EXI_INT independently of the transfer-complete interrupt.
+  NativeEXI card_exi;
+  NativeEXI::DeviceHooks hooks;
+  hooks.select = [](void*, std::uint32_t channel, std::uint8_t cs) {
+    return channel == 0u && cs == 0u;
+  };
+  card_exi.SetDeviceHooks(hooks);
+  CHECK(card_exi.WriteRegister(kStatus, 0x81u, 4));
+  CHECK(card_exi.WriteRegister(kStatus, 0x01u, 4));
+  CHECK((card_exi.Status(0) & 0x03u) == 0x03u);
+  CHECK(card_exi.InterruptPending());
+  CHECK(card_exi.WriteRegister(kStatus, 0x03u, 4));
+  CHECK(!card_exi.InterruptPending());
+
   // Channel 1 powers up with its external-event cause set. Its upper-half
   // write has the same lane isolation requirement as channel 0.
   constexpr std::uint32_t kChannel1 = kStatus + NativeEXI::ChannelStride;

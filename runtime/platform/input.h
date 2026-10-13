@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
 namespace GekkoAOT::Input {
 struct Pad {
   std::uint16_t buttons = 0;
@@ -9,14 +10,31 @@ struct Pad {
   std::uint8_t left = 0, right = 0, analog_a = 0, analog_b = 0;
   bool connected = false, rumble = false;
 };
+struct Stick {
+  std::int8_t x = 0, y = 0;
+  float normalized_x = 0.f, normalized_y = 0.f;
+  float mapped_x = 0.f, mapped_y = 0.f;
+};
+
+// SDL's negative endpoint is -32768 and the positive endpoint is 32767.
+// Preserve direction through one radial dead zone and one circular clamp.
+inline Stick MapStick(int raw_x, int raw_y, int deadzone = 4096) {
+  Stick out;
+  out.normalized_x = std::clamp(raw_x / (raw_x < 0 ? 32768.f : 32767.f), -1.f, 1.f);
+  out.normalized_y = std::clamp(raw_y / (raw_y < 0 ? 32768.f : 32767.f), -1.f, 1.f);
+  const float magnitude = std::hypot(out.normalized_x, out.normalized_y);
+  const float threshold = std::clamp(deadzone / 32767.f, 0.f, .95f);
+  if (magnitude <= threshold) return out;
+  const float radius = std::clamp((magnitude - threshold) / (1.f - threshold), 0.f, 1.f);
+  out.mapped_x = out.normalized_x / magnitude * radius;
+  out.mapped_y = out.normalized_y / magnitude * radius;
+  out.x = static_cast<std::int8_t>(std::clamp(std::lround(out.mapped_x * 127.f), -127l, 127l));
+  out.y = static_cast<std::int8_t>(std::clamp(std::lround(out.mapped_y * 127.f), -127l, 127l));
+  return out;
+}
+
 inline std::int8_t Axis(std::int16_t raw, bool invert = false) {
-  int value = raw;
-  if (invert) value = -value;
-  constexpr int deadzone = 4096;
-  if (value >= -deadzone && value <= deadzone) return 0;
-  const int sign = value < 0 ? -1 : 1;
-  const int magnitude = std::min(32767, value < 0 ? -value : value);
-  return static_cast<std::int8_t>(sign * (magnitude - deadzone) * 80 / (32767 - deadzone));
+  return MapStick(invert ? -int(raw) : int(raw), 0).x;
 }
 inline std::uint8_t Trigger(std::int16_t raw) {
   return static_cast<std::uint8_t>(std::max(0, int(raw)) * 255 / 32767);

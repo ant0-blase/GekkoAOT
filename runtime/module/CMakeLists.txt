@@ -12,6 +12,8 @@ set(MODULE_TABLES "" CACHE FILEPATH "Generated GekkoAOT module metadata include"
 set(GEKKOAOT_PGO_MODE "off" CACHE STRING "PGO mode: off, gen or use")
 set_property(CACHE GEKKOAOT_PGO_MODE PROPERTY STRINGS off gen use)
 set(GEKKOAOT_PGO_PROFILE "" CACHE FILEPATH "Merged LLVM PGO profile")
+set(GEKKOAOT_PGO_SAMPLE_PERIOD "0" CACHE STRING "IR instrumentation sampling period; 0 disables sampling")
+set(GEKKOAOT_PGO_SAMPLE_BURST "0" CACHE STRING "IR instrumentation sampling burst")
 option(GEKKOAOT_USE_THINLTO "Link DolRecomp LLVM bitcode with ThinLTO when available" OFF)
 if(NOT GAME_ID OR NOT EXISTS "${GENERATED_DIR}/generated.h" OR
    NOT EXISTS "${DOLRECOMP_DIR}/src/cpu/cpu.c" OR NOT EXISTS "${MODULE_TABLES}")
@@ -27,8 +29,22 @@ file(GLOB_RECURSE C_INPUTS CONFIGURE_DEPENDS
 
 if(GEKKOAOT_USE_THINLTO AND BITCODE_INPUTS AND CMAKE_C_COMPILER_ID MATCHES "Clang")
   set(DOLRECOMP_BACKEND "llvm-thinlto")
-  set_source_files_properties(${BITCODE_INPUTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-  set(DOLRECOMP_INPUTS ${BITCODE_INPUTS})
+  # Clang's driver classifies .bc as IR source even when CMake marks it as an
+  # external object. It then starts cc1 sequentially for EVERY partition.
+  # Preserve the bytes under object filenames so the linker owns ThinLTO and
+  # consumes the already optimized IR/summary directly, once and in parallel.
+  set(DOLRECOMP_INPUTS)
+  foreach(bitcode IN LISTS BITCODE_INPUTS)
+    file(RELATIVE_PATH relative "${GENERATED_DIR}" "${bitcode}")
+    string(REGEX REPLACE "\\.bc$" "" relative "${relative}")
+    set(object "${CMAKE_CURRENT_BINARY_DIR}/thinlto-objects/${relative}")
+    get_filename_component(object_dir "${object}" DIRECTORY)
+    file(MAKE_DIRECTORY "${object_dir}")
+    file(COPY_FILE "${bitcode}" "${object}" ONLY_IF_DIFFERENT)
+    list(APPEND DOLRECOMP_INPUTS "${object}")
+  endforeach()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${BITCODE_INPUTS})
+  set_source_files_properties(${DOLRECOMP_INPUTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
   list(LENGTH BITCODE_INPUTS GEKKOAOT_BITCODE_COUNT)
   message(STATUS "GekkoAOT: linking ${GEKKOAOT_BITCODE_COUNT} LLVM bitcode partitions with ThinLTO")
 elseif(CHUNK_INPUTS)
@@ -90,12 +106,26 @@ if(NOT GEKKOAOT_PGO_MODE STREQUAL "off")
   endif()
   if(GEKKOAOT_PGO_MODE STREQUAL "gen")
     target_compile_definitions(${MODULE_NAME} PRIVATE GEKKOAOT_PGO_GENERATE=1)
-    target_link_options(${MODULE_NAME} PRIVATE -fprofile-instr-generate)
-    message(STATUS "GekkoAOT PGO: instrumentation runtime enabled")
+    target_compile_options(${MODULE_NAME} PRIVATE -fprofile-generate)
+    if(GEKKOAOT_PGO_SAMPLE_PERIOD GREATER 0)
+      if(NOT GEKKOAOT_PGO_SAMPLE_BURST GREATER 0 OR
+         GEKKOAOT_PGO_SAMPLE_BURST GREATER GEKKOAOT_PGO_SAMPLE_PERIOD)
+        message(FATAL_ERROR "Invalid PGO sampling period/burst")
+      endif()
+      # Finalization rescales the entire session. C and translated IR must
+      # therefore use the same sampling fraction, rather than bias helpers.
+      target_compile_options(${MODULE_NAME} PRIVATE
+        "SHELL:-mllvm -enable-sampled-instrumentation"
+        "SHELL:-mllvm -sampled-instr-period=${GEKKOAOT_PGO_SAMPLE_PERIOD}"
+        "SHELL:-mllvm -sampled-instr-burst-duration=${GEKKOAOT_PGO_SAMPLE_BURST}")
+    endif()
+    target_link_options(${MODULE_NAME} PRIVATE -fprofile-generate)
+    message(STATUS "GekkoAOT PGO: LLVM IR instrumentation and C helpers/glue enabled over O3")
   elseif(GEKKOAOT_PGO_MODE STREQUAL "use")
     if(NOT EXISTS "${GEKKOAOT_PGO_PROFILE}")
       message(FATAL_ERROR "GEKKOAOT_PGO_PROFILE is required for PGO-use")
     endif()
+    target_compile_options(${MODULE_NAME} PRIVATE "-fprofile-use=${GEKKOAOT_PGO_PROFILE}")
     message(STATUS "GekkoAOT PGO: optimized profile ${GEKKOAOT_PGO_PROFILE}")
   else()
     message(FATAL_ERROR "GEKKOAOT_PGO_MODE must be off, gen or use")
@@ -106,9 +136,26 @@ if(DOLRECOMP_BACKEND STREQUAL "llvm-thinlto")
   target_compile_options(${MODULE_NAME} PRIVATE -flto=thin)
   target_link_options(${MODULE_NAME} PRIVATE -flto=thin -O3 -fno-semantic-interposition)
   message(STATUS "GekkoAOT game module ThinLTO: enabled (link-O3, cross-partition hot-path import)")
+  # v328: the AOT thread is frontend bound. With PGO counters in the bitcode,
+  # the LTO code generator can move cold blocks out of every function and lld
+  # keeps those .text.split parts away from the hot code.
+  option(GEKKOAOT_SPLIT_MACHINE_FUNCTIONS "Profile-guided machine function splitting" OFF)
+  if(GEKKOAOT_SPLIT_MACHINE_FUNCTIONS AND GEKKOAOT_PGO_MODE STREQUAL "use")
+    # GNU ld ignores keep-text-section-prefix, and lld's ThinLTO pipeline
+    # re-adds the "CG Profile" module flag that DolRecomp's IR-PGO already
+    # owns. Keep the default GNU ld + LLVM plugin and group .text.split.* in a
+    # separate output section with an augmenting script.
+    target_link_options(${MODULE_NAME} PRIVATE -fsplit-machine-functions
+      "LINKER:-T,${CMAKE_CURRENT_SOURCE_DIR}/split-text.ld")
+    set_property(TARGET ${MODULE_NAME} APPEND PROPERTY LINK_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/split-text.ld")
+    message(STATUS "GekkoAOT game module: profile-guided machine function splitting")
+  endif()
 endif()
 if(UNIX AND NOT APPLE)
   target_link_options(${MODULE_NAME} PRIVATE "LINKER:--version-script=${GEKKOAOT_ROOT}/runtime/module/module.exports")
+  set_property(TARGET ${MODULE_NAME} APPEND PROPERTY LINK_DEPENDS
+    "${GEKKOAOT_ROOT}/runtime/module/module.exports")
 endif()
 if(MSVC)
   target_compile_options(${MODULE_NAME} PRIVATE /O2 /fp:strict)

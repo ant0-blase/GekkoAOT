@@ -1,0 +1,95 @@
+--- a/src/backend/llvm/psq_convert.cpp
++++ b/src/backend/llvm/psq_convert.cpp
+@@ -1,14 +1,20 @@
+ #include "backend/llvm/psq_convert.h"
+ 
+ #include <llvm/IR/Constants.h>
++#include <llvm/IR/Function.h>
+ #include <llvm/IR/Intrinsics.h>
++#include <llvm/IR/MDBuilder.h>
+ #include <llvm/IR/Module.h>
++#include <llvm/TargetParser/Triple.h>
++
++#include <cstdlib>
+ 
+ namespace dolllvm {
+ 
+ using namespace llvm;
+ 
+-Value *extendPSQFloat(IRBuilder<> &builder, Module &module, Value *bits) {
++static Value *exactExtendPSQFloat(IRBuilder<> &builder, Module &module,
++                                  Value *bits) {
+   Type *i32 = Type::getInt32Ty(module.getContext());
+   Type *i64 = Type::getInt64Ty(module.getContext());
+   Value *x = builder.CreateZExt(bits, i64);
+@@ -56,6 +62,70 @@
+       Type::getDoubleTy(module.getContext()));
+ }
+ 
++// GEKKOAOT_PSQ_EXTEND_FAST_V331: the exact single->double expansion above is
++// ~30 host instructions per lane and was always evaluated (if-converted), on
++// every psq_l f32 lane. For zero, normal and infinite inputs the host widening
++// is exact and independent of rounding mode and DAZ, so it is the common path;
++// subnormals (DAZ under FPSCR[NI]) and NaNs (SNaN quieting) call the exact
++// expansion out of line.
++static Function *exactExtendPSQFloatFunction(Module &module) {
++  constexpr const char *name = "psq_extend_exact_f32";
++  if (Function *existing = module.getFunction(name))
++    return existing;
++  LLVMContext &context = module.getContext();
++  Function *function = Function::Create(
++      FunctionType::get(Type::getDoubleTy(context), {Type::getInt32Ty(context)},
++                        false),
++      GlobalValue::InternalLinkage, name, module);
++  function->setCallingConv(CallingConv::PreserveAll);
++  function->addFnAttr(Attribute::Cold);
++  function->addFnAttr(Attribute::NoInline);
++  function->addFnAttr(Attribute::NoUnwind);
++  function->addFnAttr(Attribute::WillReturn);
++  function->setMemoryEffects(MemoryEffects::none());
++  if (!Triple(module.getTargetTriple()).isOSBinFormatMachO())
++    function->setSection(".text.unlikely." + function->getName().str());
++  IRBuilder<> body(BasicBlock::Create(context, "entry", function));
++  body.CreateRet(exactExtendPSQFloat(body, module, function->getArg(0)));
++  return function;
++}
++
++Value *extendPSQFloat(IRBuilder<> &builder, Module &module, Value *bits) {
++  static const bool fast = [] {
++    const char *setting = std::getenv("DOLRECOMP_PSQ_EXTEND_FAST");
++    return !setting || setting[0] != '0';
++  }();
++  BasicBlock *current = builder.GetInsertBlock();
++  if (!fast || !current || !current->getParent())
++    return exactExtendPSQFloat(builder, module, bits);
++  Function *parent = current->getParent();
++  LLVMContext &context = module.getContext();
++  Value *magnitude = builder.CreateAnd(bits, builder.getInt32(0x7fffffffu));
++  Value *subnormal = builder.CreateICmpULT(
++      builder.CreateSub(magnitude, builder.getInt32(1)),
++      builder.getInt32(0x007fffffu));
++  Value *nan = builder.CreateICmpUGT(magnitude, builder.getInt32(0x7f800000u));
++  BasicBlock *common = BasicBlock::Create(context, "psq_extend_fast", parent);
++  BasicBlock *exact = BasicBlock::Create(context, "psq_extend_exact", parent);
++  BasicBlock *join = BasicBlock::Create(context, "psq_extend_join", parent);
++  builder.CreateCondBr(builder.CreateOr(subnormal, nan), exact, common,
++                       MDBuilder(context).createBranchWeights(1, 2000));
++  builder.SetInsertPoint(common);
++  Value *widened = builder.CreateFPExt(
++      builder.CreateBitCast(bits, builder.getFloatTy()), builder.getDoubleTy());
++  builder.CreateBr(join);
++  builder.SetInsertPoint(exact);
++  CallInst *slow =
++      builder.CreateCall(exactExtendPSQFloatFunction(module), {bits});
++  slow->setCallingConv(CallingConv::PreserveAll);
++  builder.CreateBr(join);
++  builder.SetInsertPoint(join);
++  PHINode *result = builder.CreatePHI(builder.getDoubleTy(), 2);
++  result->addIncoming(widened, common);
++  result->addIncoming(slow, exact);
++  return result;
++}
++
+ Value *dequantizePSQInteger(IRBuilder<> &builder, Value *value, Value *scale,
+                             bool isSigned) {
+   Value *single = isSigned ? builder.CreateSIToFP(value, builder.getFloatTy())

@@ -1,0 +1,58 @@
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -210,6 +210,34 @@
+           materialize(entry_pc_);
+         }
+ 
++        // GEKKOAOT_NATIVE_SDK_CLOCK_LOWERING_V238: exact manifest-proven
++        // getters can be emitted as scalar host instructions. Retain the
++        // existing materialization, saturated event epoch and whole-chain
++        // return so device/time scheduling sees precisely the same boundary.
++        // This is an explicit GekkoAOT ABI contract, not generic mftb folding.
++        const char* clockLowering = std::getenv("DOLRECOMP_NATIVE_SDK_CLOCK_LOWERING");
++        const bool lowerClock = !modern_runtime_ && clockLowering &&
++            std::string(clockLowering) == "1" &&
++            (entry.direct_token == 0xfffc0000u || entry.direct_token == 0xfffc0001u);
++        if (lowerClock) {
++          Value* timebase = loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, timebase));
++          const bool fullTime = entry.direct_token == 0xfffc0000u;
++          storeContext(static_cast<DolIRStateSlot>(DOLIR_STATE_GPR0 + 3),
++              builder_.CreateTrunc(fullTime ? builder_.CreateLShr(timebase, 32) : timebase,
++                                   Type::getInt32Ty(context_)));
++          if (fullTime)
++            storeContext(static_cast<DolIRStateSlot>(DOLIR_STATE_GPR0 + 4),
++                builder_.CreateTrunc(timebase, Type::getInt32Ty(context_)));
++          Value* epochAddress = bytePtr(offsetof(CPUState, external_write_count));
++          Value* epoch = builder_.CreateLoad(Type::getInt8Ty(context_), epochAddress);
++          builder_.CreateStore(builder_.CreateSelect(
++              builder_.CreateICmpEQ(epoch, builder_.getInt8(255)), epoch,
++              builder_.CreateAdd(epoch, builder_.getInt8(1))), epochAddress);
++          storeContext(DOLIR_STATE_PC, loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, lr)));
++          returnFromBody();
++          continue;
++        }
++
+         Value* handled = builder_.CreateCall(
+             hostCallType, hostCall,
+             {ctx_, builder_.getInt32(entry.direct_token)});
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -240,13 +240,16 @@
+       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+       "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
+       "x86-return-registers=3|"
+-      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module",
++      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s",
+       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+       static_cast<unsigned>(options ? options->native_abi_policy
+                                     : DOLLLVM_NATIVE_ABI_UNRESTRICTED),
+       static_cast<unsigned>(options ? options->runtime
+                                     : DOLLLVM_RUNTIME_RECOMPCORE),
+-      DOLIR_STATE_MASK_WORDS, DOLIR_STATE_COUNT);
++      DOLIR_STATE_MASK_WORDS, DOLIR_STATE_COUNT,
++      std::getenv("DOLRECOMP_NATIVE_SDK_CLOCK_LOWERING") &&
++          std::string(std::getenv("DOLRECOMP_NATIVE_SDK_CLOCK_LOWERING")) == "1"
++          ? "|sdk-clock-lowering=238" : "");
+   return written >= 0 && static_cast<size_t>(written) < size;
+ }

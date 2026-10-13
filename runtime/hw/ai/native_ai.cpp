@@ -100,6 +100,22 @@ bool NativeAI::InterruptPending() const {
   return (control_ & kAiInt) != 0u && (control_ & kAiIntMask) != 0u;
 }
 
+std::uint64_t NativeAI::CyclesUntilInterrupt() const {
+  constexpr std::uint64_t kNever = std::numeric_limits<std::uint64_t>::max();
+  if (InterruptPending()) return 0u;
+  if (!IsPlaying() || (control_ & kAiIntMask) == 0u || interrupt_timing_ == 0u)
+    return kNever;
+
+  std::uint64_t samples = static_cast<std::uint32_t>(interrupt_timing_ - sample_counter_);
+  if (samples == 0u) samples = 1ull << 32u;
+
+  // sample_phase_ is (elapsed_cpu_cycles * rate) modulo kCpuClockHz. Solve
+  // phase + cycles*rate >= samples*kCpuClockHz without advancing device state.
+  const std::uint64_t scaled = samples * kCpuClockHz;
+  const std::uint64_t remaining = scaled > sample_phase_ ? scaled - sample_phase_ : 1u;
+  return std::max<std::uint64_t>(1u, (remaining + kStream48Hz - 1u) / kStream48Hz);
+}
+
 void NativeAI::AdvanceSamples(std::uint32_t samples) {
   if (samples == 0u) return;
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "hw/si/native_si.h"
+#include <limits>
 
 namespace GekkoAOT::HW::SI {
 
@@ -12,6 +13,10 @@ void NativeSI::Reset() {
   status_ = 0;
   exi_clock_count_ = 0;
   buffer_.fill(0);
+  transfer_buffer_.fill(0);
+  transfer_cycles_ = 0;
+  transfer_response_ = 0;
+  transfer_channel_ = 0;
 }
 
 bool NativeSI::Handles(std::uint32_t address) const {
@@ -121,13 +126,36 @@ void NativeSI::RunBufferTransfer() {
   const std::uint32_t request_length = DecodeLength((com_csr_ & kComOutLengthMask) >> 16);
   const std::uint32_t expected_length = DecodeLength((com_csr_ & kComInLengthMask) >> 8);
 
+  transfer_channel_ = channel;
+  transfer_buffer_ = buffer_;
   int response = -1; // no native device attached by default
   if (hooks_.buffer)
-    response = hooks_.buffer(hooks_.user, channel, buffer_.data(),
+    response = hooks_.buffer(hooks_.user, channel,
+                             transfer_events_ ? transfer_buffer_.data() : buffer_.data(),
                              request_length, expected_length);
+
+  transfer_response_ = response;
+  if (transfer_events_) {
+    // SI sends eight bits per byte and a stop bit for both request and
+    // response. Each bit takes 4 us; 486 CPU cycles/us. Keep the response
+    // private until that semantic completion boundary. No guest address or
+    // game-specific delay participates in this calculation.
+    constexpr std::uint64_t kCyclesPerBit = 486u * 4u;
+    transfer_cycles_ = (std::uint64_t(request_length + expected_length) * 8u + 2u) * kCyclesPerBit;
+    return;
+  }
+  CompleteBufferTransfer();
+}
+
+void NativeSI::CompleteBufferTransfer() {
+  const auto response = transfer_response_;
+  const auto channel = transfer_channel_;
 
   if (response == 0)
     return; // asynchronous device deliberately left TSTART asserted
+
+  if (transfer_events_ && response > 0)
+    buffer_ = transfer_buffer_;
 
   com_csr_ &= ~kComTStart;
   if (response < 0) {
@@ -138,6 +166,27 @@ void NativeSI::RunBufferTransfer() {
   }
   com_csr_ |= kComTcInt;
   UpdateInterruptState();
+}
+
+std::uint64_t NativeSI::CyclesUntilTransfer() const {
+  return transfer_cycles_ ? transfer_cycles_ : std::numeric_limits<std::uint64_t>::max();
+}
+
+void NativeSI::AdvanceCycles(std::uint64_t cycles) {
+  if (!transfer_cycles_ || !cycles) return;
+  if (cycles < transfer_cycles_) {
+    transfer_cycles_ -= cycles;
+    return;
+  }
+  transfer_cycles_ = 0;
+  if (!(com_csr_ & kComTStart)) return;
+  if (transfer_response_ == 0) {
+    // A device which explicitly reports pending owns its eventual reply.
+    // Retry only at a scheduled boundary, retaining the ordinary bus hook.
+    RunBufferTransfer();
+    return;
+  }
+  CompleteBufferTransfer();
 }
 
 void NativeSI::SendDirectCommands() {

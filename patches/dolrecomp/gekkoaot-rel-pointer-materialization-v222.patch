@@ -1,0 +1,91 @@
+diff --git a/src/backend/llvm/special_instructions.cpp b/src/backend/llvm/special_instructions.cpp
+--- a/src/backend/llvm/special_instructions.cpp
++++ b/src/backend/llvm/special_instructions.cpp
+@@ -1,5 +1,6 @@
+ #include "backend/llvm/emitter.h"
+ #include "cpu/cpu.h"
++#include "backend/llvm/rel_pointer_manifest.h"
+ 
+ #include <llvm/ADT/SmallVector.h>
+ #include <llvm/IR/Constants.h>
+@@ -14,6 +15,15 @@
+ void FunctionEmitter::emitStateWrite(const DolIRInstruction &inst) {
+   auto slot = static_cast<DolIRStateSlot>(inst.aux);
+   Value *value = operand(inst, 0);
++  // Materialize relocated ADDI/ORI pointers as real OSLink addresses before
++  // they enter architectural GPR state, stack spills or another guest callee.
++  if (slot >= DOLIR_STATE_GPR0 && slot <= DOLIR_STATE_GPR31 &&
++      relPointerKindV222(inst.guest_pc) == 'p') {
++    auto *translateType = FunctionType::get(builder_.getInt32Ty(),
++                                            {ctx_->getType(), builder_.getInt32Ty()}, false);
++    auto translate = module_.getOrInsertFunction("gekkoaot_rel_translate_address", translateType);
++    value = builder_.CreateCall(translate, {ctx_, value}, "rel.pointer.live");
++  }
+   if (slot != DOLIR_STATE_MSR) {
+     builder_.CreateStore(value, state_[inst.aux]);
+     noteStateWrite(slot, value);
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -1,3 +1,4 @@
++#include "backend/llvm/rel_pointer_manifest.h"
+ #include "backend/llvm/emitter.h"
+ #include "cpu/cpu.h"
+ #include <cstdlib>
+@@ -125,9 +126,10 @@
+   // pointers loaded from heap/stack/guest RAM carry no provenance sentinel and
+   // remain identity-mapped even if their numeric value overlaps the REL window.
+   if (relTranslate && relTranslate[0] && relTranslate[0] != '0' &&
+-      instruction.address_domain == DOLIR_ADDRESS_MEM1 &&
+-      (instruction.address_lower == instruction.address_upper ||
+-       instruction.address_upper == 0xffffffffu)) {
++      (relPointerKindV222(instruction.guest_pc) == 'a' ||
++       (instruction.address_domain == DOLIR_ADDRESS_MEM1 &&
++        (instruction.address_lower == instruction.address_upper ||
++         instruction.address_upper == 0xffffffffu)))) {
+     Type *i32 = Type::getInt32Ty(context_);
+     auto *translateType = FunctionType::get(
+         i32, {ctx_->getType(), i32}, false);
+@@ -319,9 +321,10 @@
+   // Same provenance rule as loads: indexed table accesses derived from a
+   // static REL base need translation, while loaded/heap pointers stay live EAs.
+   if (relTranslate && relTranslate[0] && relTranslate[0] != '0' &&
+-      instruction.address_domain == DOLIR_ADDRESS_MEM1 &&
+-      (instruction.address_lower == instruction.address_upper ||
+-       instruction.address_upper == 0xffffffffu)) {
++      (relPointerKindV222(instruction.guest_pc) == 'a' ||
++       (instruction.address_domain == DOLIR_ADDRESS_MEM1 &&
++        (instruction.address_lower == instruction.address_upper ||
++         instruction.address_upper == 0xffffffffu)))) {
+     Type *i32 = Type::getInt32Ty(context_);
+     auto *translateType = FunctionType::get(
+         i32, {ctx_->getType(), i32}, false);
+diff --git a/src/backend/llvm/rel_pointer_manifest.h b/src/backend/llvm/rel_pointer_manifest.h
+new file mode 100644
+--- /dev/null
++++ b/src/backend/llvm/rel_pointer_manifest.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include <cstdlib>
++#include <fstream>
++#include <stdexcept>
++#include <unordered_map>
++namespace dolllvm {
++inline char relPointerKindV222(unsigned pc) {
++  const char* enabled = std::getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
++  if (!enabled || !enabled[0] || enabled[0] == '0') return 0;
++  // This is proof from the REL relocation stream, not a numeric RAM heuristic.
++  static const auto kinds = [] {
++    std::unordered_map<unsigned, char> result;
++    const char* path = std::getenv("DOLRECOMP_REL_POINTER_MANIFEST");
++    if (!path || !path[0]) return result;
++    std::ifstream input(path);
++    if (!input) throw std::runtime_error("cannot open REL pointer manifest");
++    unsigned address; char kind;
++    while (input >> std::hex >> address >> kind) result.emplace(address, kind);
++    return result;
++  }();
++  auto found = kinds.find(pc);
++  return found == kinds.end() ? 0 : found->second;
++}
++}

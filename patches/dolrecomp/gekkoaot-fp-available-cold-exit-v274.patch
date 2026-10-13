@@ -1,0 +1,51 @@
+diff --git a/src/backend/llvm/special_instructions.cpp b/src/backend/llvm/special_instructions.cpp
+index c2cafb7..63c5af2 100644
+--- a/src/backend/llvm/special_instructions.cpp
++++ b/src/backend/llvm/special_instructions.cpp
+@@ -88,7 +88,6 @@ Value *FunctionEmitter::emitFPAvailable(u32 pc) {
+   Value *enabled = builder_.CreateICmpNE(
+       builder_.CreateAnd(msr, builder_.getInt32(1u << 13)),
+       builder_.getInt32(0));
+-  BasicBlock *fast = builder_.GetInsertBlock();
+   BasicBlock *good = BasicBlock::Create(context_, "fp_ok", function_);
+   BasicBlock *cold = BasicBlock::Create(context_, "fp_check", function_);
+   builder_.CreateCondBr(enabled, good, cold);
+@@ -109,27 +108,20 @@ Value *FunctionEmitter::emitFPAvailable(u32 pc) {
+                                             {PointerType::getUnqual(context_),
+                                              Type::getInt32Ty(context_)},
+                                             false));
+-  Value *available = builder_.CreateCall(callee, {ctx_, builder_.getInt32(pc)});
+-  BasicBlock *reload = BasicBlock::Create(context_, "fp_reload", function_);
+-  BasicBlock *bad = BasicBlock::Create(context_, "fp_exit", function_);
+-  builder_.CreateCondBr(available, reload, bad);
+-  builder_.SetInsertPoint(bad);
++  // GEKKOAOT_DOLRECOMP_FP_AVAILABLE_COLD_EXIT_V274:
++  // This block runs only when the inline test saw MSR[FP]=0, and materialize()
++  // just published that same MSR, so ppc_fp_available() takes the
++  // FP-unavailable exception. Always leave the body afterwards: if the helper
++  // ever reports FP available, CPUState holds the exact state with PC at this
++  // instruction and the dispatcher re-executes it. The previous code rejoined
++  // the fast path after the call, so every FP instruction group had to reload
++  // all used guest registers from CPUState, defeating value forwarding of
++  // FPR/PS1 stores and stalling on split 8-byte stores reloaded as pairs.
++  builder_.CreateCall(callee, {ctx_, builder_.getInt32(pc)});
+   returnFromBody();
+-  builder_.SetInsertPoint(reload);
+-  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+-    if (used_[slot]) {
+-      auto stateSlot = static_cast<DolIRStateSlot>(slot);
+-      Value *reloaded = loadContext(stateSlot);
+-      builder_.CreateStore(reloaded, state_[slot]);
+-    }
+-  }
+-  builder_.CreateBr(good);
+   builder_.SetInsertPoint(good);
+-  PHINode *checked = builder_.CreatePHI(Type::getInt1Ty(context_), 2);
+-  checked->addIncoming(ConstantInt::getTrue(context_), fast);
+-  checked->addIncoming(available, reload);
+   fp_available_checked_ = true;
+-  return checked;
++  return ConstantInt::getTrue(context_);
+ }
+ 
+ } // namespace dolllvm

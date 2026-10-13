@@ -26,6 +26,18 @@ constexpr std::uint32_t kDspResume = 0xDCD10001u;
 constexpr std::uint32_t kDspYield = 0xDCD10002u;
 constexpr std::uint64_t kAxCompletionPpcCycles = 2500u;
 
+// SDK AX variants are identified by the historical DSP image hash, not by
+// CRC32. Keep CRC32 for diagnostics, but do not compare it to an image-hash
+// constant when selecting the guest parameter-block ABI.
+std::uint32_t AxImageHash(const std::uint8_t* bytes, std::size_t size) {
+  std::uint32_t hash = 0u;
+  for (std::size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash = (hash << 3u) | (hash >> 29u);
+  }
+  return hash;
+}
+
 // Canonical AXPB word offsets. The original 0x4e8a8b21/6a696ce7 AX uCode
 // omits words [93, 97) (LPF) from its MRAM representation.
 constexpr std::size_t PB_NEXT_HI = 0;
@@ -150,15 +162,18 @@ bool NativeAXHLE::ProbeTask(std::uint32_t code_address, std::uint32_t code_size)
   if (!LooksLikeGcAx(code.data(), code.size())) return false;
 
   ucode_crc32_ = Crc32(code.data(), code_size != 0u ? std::min<std::size_t>(code_size, code.size()) : code.size());
-  // The classic AX image used by NDDemo/Monkey Ball/Crazy Taxi is documented
-  // as DSP_UC_6A696CE7 and is the sole GC AX PB layout that omits the LPF words.
-  old_no_lpf_layout_ = (ucode_crc32_ == 0x6a696ce7u);
+  const std::uint32_t image_hash = AxImageHash(code.data(),
+      code_size != 0u ? std::min<std::size_t>(code_size, code.size()) : code.size());
+  // AX 4e8a8b21 omits the four LPF words. Reading/writing the newer ABI here
+  // would cross into the next parameter block and use the wrong mixer bits.
+  old_no_lpf_layout_ = (image_hash == 0x4e8a8b21u);
   active_ = true;
   mail_state_ = MailState::WaitingForCommandSize;
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_AX_HLE_V50=1 ucode_crc32=%08x layout=%s probe=babe+dcd1 "
-               "rom_required=0 lle_fallback=1\n",
-               ucode_crc32_, old_no_lpf_layout_ ? "gc-ax-old-no-lpf" : "gc-ax");
+               "rom_required=0 lle_fallback=1 image_hash=%08x code=%08x bytes=%zu\n",
+               ucode_crc32_, old_no_lpf_layout_ ? "gc-ax-old-no-lpf" : "gc-ax",
+               image_hash, code_address, code_size != 0u ? std::min<std::size_t>(code_size, code.size()) : code.size());
   return true;
 }
 

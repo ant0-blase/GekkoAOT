@@ -33,4 +33,7 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
 bool RegisterNativeSdkManifest(HostRuntime& runtime,
                                const std::filesystem::path& manifest_path);
 
+// Retail SDK name of a SimpleHleKind index ("?" when out of range).
+const char* SimpleServiceName(unsigned kind);
+
 } // namespace GekkoAOT::Native

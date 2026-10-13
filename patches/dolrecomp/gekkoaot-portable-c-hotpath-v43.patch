@@ -1,0 +1,234 @@
+diff --git a/src/backend/c_cfg.h b/src/backend/c_cfg.h
+--- a/src/backend/c_cfg.h
++++ b/src/backend/c_cfg.h
+@@ -1,1 +1,1 @@
+     u8* materialize_pc;
+     u8* return_targets;
+     u32* loop_ends;
++    u8* poll_backedges;
+ } CFunctionCFG;
+diff --git a/src/backend/c_cfg.c b/src/backend/c_cfg.c
+--- a/src/backend/c_cfg.c
++++ b/src/backend/c_cfg.c
+@@ -1,1 +1,1 @@
+ static bool instruction_is_outlinable(const PPCInst* inst) {
+@@ -1,1 +1,1 @@
+ }
++
++/* GekkoAOT v43: conservative Portable-C busy-wait recognition.  This is the
++ * C-backend counterpart of the LLVM poll park: only a tiny local conditional
++ * backedge containing one non-updating scalar load plus compare/bit-test
++ * operations qualifies.  Pointer walking, stores, calls, CTR loops and any
++ * other progress-producing instruction fail closed to the ordinary loop path. */
++static bool instruction_is_poll_load(const PPCInst* inst) {
++    switch (inst->op) {
++    case PPC_OP_LWZ:
++    case PPC_OP_LBZ:
++    case PPC_OP_LHZ:
++    case PPC_OP_LHA:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static bool instruction_is_poll_transform(const PPCInst* inst) {
++    switch (inst->op) {
++    case PPC_OP_CMPI:
++    case PPC_OP_CMPLI:
++    case PPC_OP_CMP:
++    case PPC_OP_CMPL:
++    case PPC_OP_ANDI:
++    case PPC_OP_ANDIS:
++    case PPC_OP_RLWINM:
++    case PPC_OP_EXTSB:
++    case PPC_OP_EXTSH:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static bool loop_is_pure_poll(const PPCInst* insts, u32 first, u32 last) {
++    if (last <= first || last - first > 7u)
++        return false;
++    const PPCInst* branch = &insts[last];
++    if (branch->op != PPC_OP_BC || branch->lk)
++        return false;
++    /* BO[2] == 1 means CTR is ignored. A counted loop is real guest work. */
++    if ((branch->bo & 0x04u) == 0u)
++        return false;
++
++    u32 loads = 0u;
++    for (u32 i = first; i < last; ++i) {
++        if (instruction_is_poll_load(&insts[i])) {
++            if (++loads != 1u)
++                return false;
++            continue;
++        }
++        if (!instruction_is_poll_transform(&insts[i]))
++            return false;
++    }
++    return loads == 1u;
++}
+@@ -1,1 +1,1 @@
+     cfg->loop_ends =
+         (u32*)malloc((count ? count : 1u) * sizeof(*cfg->loop_ends));
++    cfg->poll_backedges =
++        (u8*)calloc(count ? count : 1u, sizeof(*cfg->poll_backedges));
+     if (!cfg->leaders || !cfg->block_cycles || !cfg->materialize_pc ||
+-        !cfg->return_targets || !cfg->loop_ends) {
++        !cfg->return_targets || !cfg->loop_ends || !cfg->poll_backedges) {
+@@ -1,1 +1,1 @@
+         u32 first =
+             (insts[last].branch_target - function_address) / 4u;
++        if (loop_is_pure_poll(insts, first, last))
++            cfg->poll_backedges[last] = 1u;
+@@ -1,1 +1,1 @@
+     free(cfg->return_targets);
+     free(cfg->loop_ends);
++    free(cfg->poll_backedges);
+     memset(cfg, 0, sizeof(*cfg));
+ }
+diff --git a/src/backend/emitter.c b/src/backend/emitter.c
+--- a/src/backend/emitter.c
++++ b/src/backend/emitter.c
+@@ -1,1 +1,1 @@
+ static void emit_direct_branch(FILE* out, const PPCInst* inst,
+-                               bool local_target, bool direct_backedge,
++                               bool local_target, bool direct_backedge,
++                               bool poll_backedge,
+                                u32 func_start, u32 func_end) {
+@@ -1,1 +1,1 @@
+             if (local_backward) {
+-                fprintf(out, "            if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) {\n");
++                fprintf(out, "            if (ctx->downcount <= -(s64)%s) {\n",
++                        poll_backedge ? "DOLRECOMP_C_POLL_CYCLE_BUDGET" :
++                                        "DOLRECOMP_C_LOOP_CYCLE_BUDGET");
++                if (poll_backedge)
++                    fprintf(out, "                ctx->external_rid = 0xFDu;\n");
+                 fprintf(out, "                ctx->pc = 0x%08Xu;\n", inst->branch_target);
+@@ -1,1 +1,1 @@
+         if (direct_backedge) {
+-            fprintf(out, "            if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) {\n");
++            fprintf(out, "            if (ctx->downcount <= -(s64)%s) {\n",
++                    poll_backedge ? "DOLRECOMP_C_POLL_CYCLE_BUDGET" :
++                                    "DOLRECOMP_C_LOOP_CYCLE_BUDGET");
++            if (poll_backedge)
++                fprintf(out, "                ctx->external_rid = 0xFDu;\n");
+             fprintf(out, "                ctx->pc = 0x%08Xu;\n", inst->branch_target);
+@@ -1,1 +1,1 @@
+         "#define DOLRECOMP_C_LOOP_CYCLE_BUDGET 256\n"
+         "#endif\n"
++        "#ifndef DOLRECOMP_C_POLL_CYCLE_BUDGET\n"
++        "#define DOLRECOMP_C_POLL_CYCLE_BUDGET 128\n"
++        "#endif\n"
+@@ -1,1 +1,1 @@
+ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
+                                         u32 func_start, u32 func_end,
+                                         bool direct_backedge,
++                                        bool poll_backedge,
+                                         bool route_local_returns) {
+@@ -1,1 +1,1 @@
+         emit_direct_branch(out, inst,
+                            branch_target_is_local(func_start, func_end, inst->branch_target),
+-                           direct_backedge, func_start, func_end);
++                           direct_backedge, poll_backedge, func_start, func_end);
+@@ -1,1 +1,1 @@
+         emit_direct_branch(out, inst,
+                            branch_target_is_local(func_start, func_end, inst->branch_target),
+-                           direct_backedge, func_start, func_end);
++                           direct_backedge, poll_backedge, func_start, func_end);
+@@ -1,1 +1,1 @@
+ void emit_instruction(FILE* out, const PPCInst* inst) {
+-    emit_instruction_with_range(out, inst, 0, (u32)-1, false, false);
++    emit_instruction_with_range(out, inst, 0, (u32)-1, false, false, false);
+ }
+@@ -1,1 +1,1 @@
+         emit_instruction_with_range(out, &insts[i], function_address,
+-                                    function_end, i == last, false);
++                                    function_end, i == last,
++                                    i == last && cfg->poll_backedges[last], false);
+@@ -1,1 +1,1 @@
+         emit_instruction_with_range(
+             out, &insts[i], func_addr, func_end,
+             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
++            cfg.poll_backedges[i] != 0u,
+             has_local_returns);
+diff --git a/src/backend/dispatch.c b/src/backend/dispatch.c
+--- a/src/backend/dispatch.c
++++ b/src/backend/dispatch.c
+@@ -1,1 +1,1 @@
+ static DispatchLookupMode dispatch_lookup_mode(void) {
+@@ -1,1 +1,1 @@
+ }
++
++static int static_intercept_compare(const void* left, const void* right) {
++    const u32 a = *(const u32*)left;
++    const u32 b = *(const u32*)right;
++    return a < b ? -1 : a > b ? 1 : 0;
++}
++
++/* Emit a compile-time positive filter for GekkoAOT's SDK/HLE manifest.  The
++ * portable-C dispatcher used to call CPUState::host_call before attempting
++ * local AOT dispatch for every guest edge.  With a complete manifest, only
++ * exact intercepted entrypoints need that boundary.  Missing/malformed input
++ * deliberately emits `return 1`, preserving upstream dynamic behaviour. */
++static void emit_static_hostcall_filter(FILE* out) {
++    const char* path = getenv("DOLRECOMP_STATIC_INTERCEPTS");
++    FILE* in = path && path[0] ? fopen(path, "r") : NULL;
++    u32* addresses = NULL;
++    u32 count = 0u, capacity = 0u;
++    int valid = in != NULL;
++    char line[1024];
++
++    while (valid && fgets(line, sizeof(line), in)) {
++        char* p = line;
++        while (*p == ' ' || *p == '\t') ++p;
++        if (*p == '\0' || *p == '\n' || *p == '#') continue;
++        char* end = NULL;
++        unsigned long value = strtoul(p, &end, 0);
++        if (end == p || value > 0xfffffffful) { valid = 0; break; }
++        if (count == capacity) {
++            u32 next = capacity ? capacity * 2u : 64u;
++            u32* grown = (u32*)realloc(addresses, next * sizeof(*addresses));
++            if (!grown) { valid = 0; break; }
++            addresses = grown;
++            capacity = next;
++        }
++        addresses[count++] = (u32)value;
++    }
++    if (in) fclose(in);
++
++    if (!valid) {
++        fprintf(out, "\nstatic inline int dolrecomp_static_hostcall_candidate(u32 address) { (void)address; return 1; }\n");
++        free(addresses);
++        return;
++    }
++
++    qsort(addresses, count, sizeof(*addresses), static_intercept_compare);
++    fprintf(out, "\nstatic inline int dolrecomp_static_hostcall_candidate(u32 address) {\n");
++    fprintf(out, "    switch (address) {\n");
++    u32 previous = 0u;
++    int have_previous = 0;
++    for (u32 i = 0; i < count; ++i) {
++        if (have_previous && addresses[i] == previous) continue;
++        previous = addresses[i]; have_previous = 1;
++        fprintf(out, "    case 0x%08Xu: return 1;\n", addresses[i]);
++    }
++    fprintf(out, "    default: return 0;\n    }\n}\n");
++    free(addresses);
++}
+@@ -1,1 +1,1 @@
+ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point) {
+@@ -1,1 +1,1 @@
+     if (dispatch_lookup_mode() != DISPATCH_LOOKUP_INDEXED ||
+         !emit_lookup_indexed(out, funcs))
+         emit_function_lookup(out, funcs, "");
++    emit_static_hostcall_filter(out);
+@@ -1,1 +1,1 @@
+-    fprintf(out, "    if (ctx->host_call && ppc_host_call(ctx, address)) return 1;\n");
++    fprintf(out, "    if (dolrecomp_static_hostcall_candidate(address) && ctx->host_call && ppc_host_call(ctx, address)) return 1;\n");
+@@ -1,1 +1,1 @@
+-    fprintf(out, "        if (ctx->host_call && ppc_host_call(ctx, alias)) return 1;\n");
++    fprintf(out, "        if (dolrecomp_static_hostcall_candidate(alias) && ctx->host_call && ppc_host_call(ctx, alias)) return 1;\n");

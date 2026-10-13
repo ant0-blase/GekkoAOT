@@ -1,34 +1,52 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // GekkoAOT direct retail GX -> Aurora bridge. No emulator runtime.
 #include <aurora/aurora.h>
+#include "../native_index_range_cache.h"
+#include "../native_attribute_plan.h"
+#include "../native_vertex_program.h"
+#include "../native_vertex_gather.h"
+#include "../native_command_stream.h"
 #include <aurora/event.h>
+#include <aurora/gfx.h>
 #include <dolphin/gx/GXCommandList.h>
 #include <dolphin/gx/GXEnum.h>
 #include <dolphin/gx/GXAurora.h>
 #include "gx/command_processor.hpp"
+#include "gx/regs.hpp"
 #include "gx/gx.hpp"
 #include "gx/texture.hpp"
 #include "gfx/render_worker.hpp"
+#include "gfx/clear.hpp"
+#include "gfx/recording.hpp"
 #include "gfx/color_peek.hpp"
 #include "gfx/depth_peek.hpp"
 #include "gfx/frame.hpp"
 #include "gfx/texture.hpp"
+#include "dolphin/vi/vi_internal.hpp"
 #include "webgpu/gpu.hpp"
 #include <SDL3/SDL.h>
 #include "window.hpp"
 #include "../host/tlut_memory.h"
+#include "bounding_box.h"
 
 #include <algorithm>
+#include "../widescreen_policy.h"
+#include "../array_upload_policy.h"
+#include "../compact_array_window.h"
+#include "../cached_scanout.h"
+#include "interpolation_shader.h"
 #include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 #ifndef GEKKOAOT_VERSION
 #define GEKKOAOT_VERSION "dev"
@@ -69,10 +87,14 @@ bool g_frame_open = false;
 // exact 4:3, or a live window-aspect mode with projection compensation.
 std::atomic<std::uint32_t> g_aspect_mode{0u};
 bool g_alt_enter_latched = false;
+bool g_screen_fill_draw = false;
 AuroraInfo g_info{};
 std::vector<std::uint8_t> g_fifo;
 std::size_t g_fifo_read = 0;
 std::size_t g_fifo_need = 1;
+GekkoAOT::GX::NativeCommandStream g_native_commands;
+bool g_typed_arrays = false;
+bool g_direct_matrices = false;
 std::array<std::uint32_t, 8> g_vertex_size_cache{};
 std::uint8_t g_vertex_size_valid = 0;
 
@@ -88,10 +110,23 @@ struct IndexScanLayout {
   std::uint16_t stride = 0;
   std::uint8_t field_count = 0;
   std::uint8_t valid = 0;
+  std::uint8_t has_index8 = 0;  // v336: skip the eager INDEX8 pass when none
   std::array<IndexScanField, 12> fields{};
+  GekkoAOT::GX::NativeAttributePlan bindings{};
+  GekkoAOT::GX::NativeVertexProgram native{};
+  GekkoAOT::GX::NativeVertexGather gather{};
 };
 std::array<IndexScanLayout, 8> g_index_scan_layout{};
 std::uint8_t g_index_scan_valid = 0;
+GekkoAOT::GX::NativeIndexRangeCache g_native_index_ranges;
+bool g_native_index_range_cache=false;
+bool g_native_attribute_plan=true;
+bool g_native_vertex_program=false;
+bool g_native_vertex_gather=false;
+std::uint64_t g_native_gather_draws=0,g_native_gather_bytes=0,g_native_gather_windows=0;
+GekkoAOT::GX::NativeVertexGather::Workspace g_native_gather_workspace;
+bool g_native_vertex_profile=false;
+std::uint64_t g_native_vertex_draws=0, g_native_vertex_vertices=0;
 std::array<std::uint32_t, 8> g_texture_image3_word{};
 std::array<std::uint32_t, 8> g_texture_mapped_image0{};
 std::array<std::uint32_t, 8> g_texture_mapped_mips{};
@@ -102,12 +137,76 @@ std::array<std::uint32_t, GX_VA_MAX_ATTR> g_array_available{};
 // vertex data to GX; use that boundary to invalidate only overlapping GPU
 // snapshots instead of hashing vertex arrays on every draw.
 std::array<std::uint32_t, GX_VA_MAX_ATTR> g_array_guest_base{};
+
+// v161h: persistent GPU-side snapshots for indexed GX arrays.
+struct PersistentArraySlot {
+  std::uint32_t offset = 0;
+  std::uint32_t capacity = 0;
+  const void* identity = nullptr;
+  std::uint32_t last_frame = UINT32_MAX;
+  std::shared_ptr<const std::uint8_t[]> snapshot;
+  std::uint32_t snapshot_size = 0;
+};
+std::array<PersistentArraySlot, GX_VA_MAX_ATTR> g_persistent_array_slots{};
+std::array<GekkoAOT::GX::ArrayUploadPolicy, GX_VA_MAX_ATTR> g_array_upload_policy{};
+bool g_adaptive_array_upload = true;
+bool g_content_array_cache = true;
+std::uint64_t g_content_array_hits = 0;
+std::uint32_t g_persistent_array_cursor = 0;
+std::uint32_t g_persistent_array_frame = UINT32_MAX;
+bool g_persistent_array_reset_pending = false;
+bool g_persistent_array_cache = true;
+std::uint32_t g_persistent_array_min_bytes = 8u * 1024u;
+std::uint64_t g_persistent_array_uploads = 0;
+std::uint64_t g_persistent_array_upload_bytes = 0;
+std::uint64_t g_persistent_array_hits = 0;
+std::uint64_t g_persistent_array_fallbacks = 0;
+GekkoAOT::GX::CachedScanout g_cached_scanout;
+std::uint64_t g_adaptive_array_fallbacks = 0;
+bool g_compact_array_windows = false;
+bool g_native_array_tiles = false;
+bool g_native_array_snapshots = false;
+std::uint64_t g_native_array_snapshot_stages = 0;
+std::uint64_t g_compact_array_uploads = 0;
+std::uint64_t g_compact_array_bytes = 0;
+std::uint64_t g_compact_array_prefix_bytes = 0;
+std::uint64_t g_compact_array_rollovers = 0;
+std::uint64_t g_compact_array_fallbacks = 0;
+using CompactArrayPlan = std::array<GekkoAOT::GX::CompactArrayWindow, GX_VA_MAX_ATTR>;
+
 std::uint64_t g_array_cache_control_events = 0;
 std::uint64_t g_array_cache_invalidations = 0;
 unsigned g_array_cache_control_logs = 0;
 std::uint8_t g_texture_image3_valid = 0;
 std::uint64_t g_texture_generation = 1;
+// v174: Terminator 3 needs in-place font/UI texture changes to invalidate a
+// stable IMAGE3 binding, but forcing a new texture version on every low-bit
+// format rebind also hits the bitmap-heavy Monkey Ball render path. Remember
+// the source bytes instead and only break the stable-bind fast path on a real
+// content change.
+std::array<std::uint64_t, 8> g_texture_ui_source_hash{};
+std::uint8_t g_texture_ui_source_hash_valid = 0;
+// v159: retail games issue many draws between texture-state changes. Avoid
+// rescanning all eight image/TLUT slots before every draw; BP writes and memory
+// publication events mark only the expensive resolver passes dirty.
+bool g_texture_mapping_scan_dirty = true;
+bool g_tlut_binding_scan_dirty = true;
+std::uint64_t g_texture_memory_invalidations = 0;
+std::uint64_t g_texture_cache_only_invalidations = 0;
 std::uint64_t g_display_copy_count = 0;
+// Observe the camera on a real 3D draw, before later HUD projections replace
+// GX's current projection. Publish one packed pair without reading GX state
+// from the CPU worker at a frame boundary.
+std::atomic<std::uint64_t> g_camera_signature{0};
+std::atomic<std::uint64_t> g_camera_observed_copy{0};
+std::atomic<std::uint64_t> g_camera_copy_epoch{0};
+std::uint64_t g_camera_area_epoch = ~std::uint64_t{0};
+float g_camera_best_area = 0.f;
+std::array<float,4> g_camera_coefficients{};
+std::uint64_t g_camera_cached_signature = 0;
+std::uint64_t g_camera_published_signature = 0;
+std::uint64_t g_camera_published_copy = ~std::uint64_t{0};
+
 // Opt-in binary trace of retail draw commands. Records have four u64 fields:
 // kind (1=draw, 2=GXCopyDisp), frame, command hash/monotonic ns, opcode/length.
 // This lets a captured glitch be aligned with the command stream without
@@ -160,18 +259,143 @@ void CaptureFrameBoundary() {
 // XFB rotation; this only exposes that completed frame as an optional host
 // presentation boundary. Latest frame wins if several copies occur in one AOT
 // slice, avoiding a stale-present burst.
-bool g_frame_ready_pending = false;
-std::uint32_t g_frame_ready_xfb = 0;
+// Single atomic snapshot: producer and CPU may coalesce completed frames,
+// without exposing a mismatched pending flag/XFB address pair.
+std::atomic_uint32_t g_frame_ready_xfb{0};
 // v48 universal presentation interpolation. These are dedicated single-sample
 // GPU snapshots, so the previous frame remains immutable even when a game
 // reuses the same XFB address every frame. One GPU copy is paid per guest frame;
 // intermediate host presents never touch guest memory or advance VI/DSP/AI.
-bool g_frame_interpolation_enabled = true;
+bool g_frame_interpolation_enabled = false;
+// v196 universal final-XFB presentation filter. The Balanced defaults mirror
+// the restrained HPCOS Remaster look; Cinematic enables the stronger MOH-style
+// filmic/edge-soft presentation without touching guest EFB/RAM semantics.
+bool g_post_processing_enabled = true;
+float g_post_sharpen = 0.28f;
+float g_post_bloom = 0.10f;
+float g_post_vignette = 0.06f;
+float g_post_grain = 0.0f;
+float g_post_tone = 0.15f;
+float g_post_local_contrast = 0.08f;
+float g_post_cinematic = 0.0f;
+std::string g_post_preset = "balanced";
+std::uint64_t g_post_frame = 0;
 bool g_interp_previous_valid = false;
 bool g_interp_current_valid = false;
 aurora::webgpu::TextureWithSampler g_interp_previous;
 aurora::webgpu::TextureWithSampler g_interp_current;
 std::uint64_t g_interp_snapshot_count = 0;
+
+struct PendingEfbPoke {
+  bool valid = false;
+  std::uint16_t x = 0;
+  std::uint16_t y = 0;
+  std::uint16_t width = 0;
+  std::uint16_t height = 1;
+  std::uint16_t completed_y = 0;
+  std::uint16_t completed_height = 0;
+  std::uint32_t value = 0;
+};
+std::array<PendingEfbPoke, 2> g_pending_efb_pokes{};
+bool g_efb_poke_batch = true;
+bool g_efb_poke_stats = false;
+bool g_efb_poke_first_flush_logged = false;
+std::uint64_t g_efb_poke_writes = 0;
+std::uint64_t g_efb_poke_draws = 0;
+
+void EmitEfbPoke(const PendingEfbPoke& poke, bool depth) {
+  if (!poke.valid || !g_frame_open) return;
+  const auto size=aurora::gfx::get_render_target_size();
+  if (size.x==0u || size.y==0u) return;
+  const auto scaled=[](std::uint32_t pixel, std::uint32_t extent,
+                       std::uint32_t native_extent) {
+    return static_cast<std::int32_t>((std::uint64_t(pixel)*extent)/native_extent);
+  };
+  const auto left=scaled(poke.x,size.x,640u);
+  const auto top=scaled(poke.y,size.y,528u);
+  const auto right=static_cast<std::int32_t>(
+      (std::uint64_t(poke.x+poke.width)*size.x+639u)/640u);
+  const auto bottom=static_cast<std::int32_t>(
+      (std::uint64_t(poke.y+poke.height)*size.y+527u)/528u);
+  if (left>=static_cast<std::int32_t>(size.x) || top>=static_cast<std::int32_t>(size.y))
+    return;
+  const auto value=poke.value;
+  const float z=static_cast<float>(value & 0x00ffffffu)/16777215.0f;
+  aurora::gfx::push_draw_command(aurora::gfx::clear::DrawData{
+      .pipeline=aurora::gfx::pipeline_ref(aurora::gfx::clear::PipelineConfig{
+          .clearColor=!depth, .clearAlpha=!depth, .clearDepth=depth}),
+      .color=wgpu::Color{
+          .r=double((value>>16u)&0xffu)/255.0,
+          .g=double((value>>8u)&0xffu)/255.0,
+          .b=double(value&0xffu)/255.0,
+          .a=double((value>>24u)&0xffu)/255.0},
+      .depth=aurora::gfx::uses_reversed_z() ? 1.0f-z : z,
+      .rect={.x=left,.y=top,
+             .width=std::max(1,std::min(right,static_cast<std::int32_t>(size.x))-left),
+             .height=std::max(1,std::min(bottom,static_cast<std::int32_t>(size.y))-top)}});
+  ++g_efb_poke_draws;
+}
+
+void FlushOneEfbPoke(PendingEfbPoke& poke, bool depth) {
+  if (poke.completed_height) {
+    if (poke.x==0u && poke.width==640u &&
+        poke.y==std::uint32_t(poke.completed_y)+poke.completed_height) {
+      ++poke.completed_height;
+      poke.valid=false;
+    }
+    EmitEfbPoke(PendingEfbPoke{.valid=true,.x=0u,.y=poke.completed_y,
+                               .width=640u,.height=poke.completed_height,
+                               .value=poke.value},depth);
+  }
+  EmitEfbPoke(poke,depth);
+  poke={};
+}
+
+void FlushEfbPokes() {
+  const auto draws_before=g_efb_poke_draws;
+  for (unsigned depth=0; depth<g_pending_efb_pokes.size(); ++depth)
+    FlushOneEfbPoke(g_pending_efb_pokes[depth],depth!=0u);
+  if (g_efb_poke_stats && !g_efb_poke_first_flush_logged &&
+      g_efb_poke_writes>=100000u && g_efb_poke_draws!=draws_before) {
+    g_efb_poke_first_flush_logged=true;
+    std::fprintf(stderr,"GEKKOAOT_EFB_POKE_V164_FIRST_FLUSH writes=%llu draws=%llu\n",
+                 static_cast<unsigned long long>(g_efb_poke_writes),
+                 static_cast<unsigned long long>(g_efb_poke_draws));
+  }
+}
+
+void QueueEfbPoke(std::uint16_t x, std::uint16_t y, std::uint32_t value,
+                  bool depth) {
+  if (!g_efb_poke_batch) {
+    EmitEfbPoke(PendingEfbPoke{.valid=true,.x=x,.y=y,.width=1u,.value=value},depth);
+    ++g_efb_poke_writes;
+    if (g_efb_poke_stats && g_efb_poke_writes%100000u==0u)
+      std::fprintf(stderr,"GEKKOAOT_EFB_POKE_V164_STATS writes=%llu draws=%llu\n",
+                   static_cast<unsigned long long>(g_efb_poke_writes),
+                   static_cast<unsigned long long>(g_efb_poke_draws));
+    return;
+  }
+  auto& poke=g_pending_efb_pokes[depth ? 1u : 0u];
+  if (poke.valid && poke.y==y && poke.value==value &&
+      std::uint32_t(poke.x)+poke.width==x) {
+    ++poke.width;
+  } else if (poke.valid && poke.value==value && poke.x==0u &&
+             poke.width==640u && x==0u && y==std::uint32_t(poke.y)+1u) {
+    if (poke.completed_height==0u) poke.completed_y=poke.y;
+    ++poke.completed_height;
+    poke.x=0u;
+    poke.y=y;
+    poke.width=1u;
+  } else {
+    FlushOneEfbPoke(poke,depth);
+    poke={.valid=true,.x=x,.y=y,.width=1u,.value=value};
+  }
+  ++g_efb_poke_writes;
+  if (g_efb_poke_stats && g_efb_poke_writes%100000u==0u)
+    std::fprintf(stderr,"GEKKOAOT_EFB_POKE_V164_STATS writes=%llu draws=%llu\n",
+                 static_cast<unsigned long long>(g_efb_poke_writes),
+                 static_cast<unsigned long long>(g_efb_poke_draws));
+}
 
 // Native zero-copy XFB cache. Each slot owns the Aurora EFB render targets
 // that were active when GXCopyDisp targeted the guest physical XFB address.
@@ -182,6 +406,8 @@ struct XfbZeroCopySlot {
   std::uint32_t native_height = 0;
   std::uint64_t span_bytes = 0;
   std::uint64_t generation = 0;
+  // Profile only: last generation handed to VI scanout (dead-copy accounting).
+  std::uint64_t presented_generation = 0;
   bool valid = false;
   // Own the resolved XFB independently from the live EFB.  This is the key
   // difference from the old render-target rotation path: later EFB clears or
@@ -193,6 +419,133 @@ struct XfbZeroCopySlot {
 constexpr std::size_t kXfbZeroCopySlots = 8u;
 std::array<XfbZeroCopySlot, kXfbZeroCopySlots> g_xfb_slots{};
 std::uint64_t g_xfb_generation = 0;
+// GXCopyDisp results replaced before VI ever scanned them (their GPU work was invisible).
+std::uint64_t g_xfb_unpresented_overwrites = 0;
+
+// v320 profile: what separates consecutive draws (merge-blocker census).
+// Bits: 1 BP-texture 2 BP-TEV/blend/z 4 BP-other 8 CP-array-base/stride
+// 16 CP-VCD/VAT 32 XF-matrix-mem 64 XF-other 128 INDX-load 256 CALL_DL 512 copy.
+std::uint32_t g_draw_gap_mask = 0;
+bool g_draw_census = false;
+std::array<std::uint64_t, 1024> g_draw_gap_hist{};
+std::array<std::uint64_t, 6> g_draw_size_hist{};  // vertices: <=4 <=8 <=16 <=64 <=256 >256
+std::uint64_t g_draw_census_draws = 0;
+std::uint64_t g_draw_run_runs = 0, g_draw_run_members = 0;  // v320 draw-run coalescing
+// Draw commands directly followed by another draw that did not join a run:
+// [0] different VAT, [1] member too large/invalid, [2] state, [3] line/point.
+std::array<std::uint64_t, 4> g_draw_run_misses{};
+// v324 texture re-version census: BP66 invalidations, non-stable IMAGE3 binds,
+// forced re-versions after BP66 and the source bytes each one makes Aurora hash.
+std::uint64_t g_tex_census_bp66 = 0, g_tex_census_binds = 0, g_tex_census_forced = 0;
+std::uint64_t g_tex_census_bind_bytes = 0, g_tex_census_forced_bytes = 0;
+
+// v324: texture source versions between TMEM invalidations. Every non-stable
+// IMAGE3 bind (a unit switching to another texture) used to take a brand-new
+// texDataVersion, so Aurora re-hashed the whole source (XXH3-128, HPCOS
+// ~670 MB/s) only to find the decoded texture it already had. Reuse the
+// version an identical source (address, IMAGE0, mip count) received at its
+// previous bind. The table is cleared on BP66 (GXInvalidateTex*: v237 source
+// re-check policy) and on texture copies, and loses every entry whose guest
+// range is written, so a reused version never outlives a known mutation.
+struct TextureSourceVersion {
+  std::uint32_t guest = 0, image0 = 0, span = 0, version = 0;
+  std::uint8_t mips = 0;
+};
+std::array<TextureSourceVersion, 512> g_texture_source_versions{};
+std::uint32_t g_texture_source_lo = 0xffffffffu, g_texture_source_hi = 0u;
+bool g_texture_version_reuse = true;
+std::uint64_t g_tex_census_reused = 0;
+
+void ForgetTextureSourceVersions() {
+  if (g_texture_source_hi == 0u) return;
+  g_texture_source_versions.fill({});
+  g_texture_source_lo = 0xffffffffu;
+  g_texture_source_hi = 0u;
+}
+
+void ForgetTextureSourceRange(std::uint32_t address, std::uint32_t size) {
+  const std::uint64_t end = std::uint64_t(address) + size;
+  if (size == 0u || address >= g_texture_source_hi || end <= g_texture_source_lo) return;
+  for (auto& entry : g_texture_source_versions)
+    if (entry.version != 0u && address < std::uint64_t(entry.guest) + entry.span && entry.guest < end)
+      entry = {};
+}
+
+TextureSourceVersion& TextureSourceSlot(std::uint32_t guest, std::uint32_t image0, std::uint8_t mips) {
+  const std::uint32_t h = (guest >> 5u) * 0x9E3779B1u ^ image0 * 0x85EBCA77u ^ mips;
+  return g_texture_source_versions[(h >> 7u) & (g_texture_source_versions.size() - 1u)];
+}
+
+void RememberTextureSourceVersion(std::uint32_t guest, std::uint32_t image0, std::uint8_t mips,
+                                  std::uint32_t span, std::uint32_t version) {
+  if (!g_texture_version_reuse || span == 0u) return;
+  TextureSourceSlot(guest, image0, mips) = {guest, image0, span, version, mips};
+  g_texture_source_lo = std::min(g_texture_source_lo, guest);
+  g_texture_source_hi = static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(0xffffffffu, std::max<std::uint64_t>(g_texture_source_hi, std::uint64_t(guest) + span)));
+}
+
+// Version for a non-stable bind: the remembered one, or a new generation.
+std::uint32_t BindTextureSourceVersion(std::uint32_t guest, std::uint32_t image0, std::uint8_t mips,
+                                       std::uint32_t span, std::uint32_t generation) {
+  if (g_texture_version_reuse && span != 0u) {
+    const auto& entry = TextureSourceSlot(guest, image0, mips);
+    if (entry.version != 0u && entry.guest == guest && entry.image0 == image0 &&
+        entry.mips == mips && entry.span == span) {
+      if (g_draw_census) ++g_tex_census_reused;
+      return entry.version;
+    }
+  }
+  RememberTextureSourceVersion(guest, image0, mips, span, generation);
+  return generation;
+}
+inline void NoteDrawGap(std::uint32_t bit) { if (g_draw_census) g_draw_gap_mask |= bit; }
+void NoteDraw(std::uint32_t vertices) {
+  if (!g_draw_census) return;
+  ++g_draw_census_draws;
+  ++g_draw_gap_hist[g_draw_gap_mask & 1023u];
+  g_draw_gap_mask = 0;
+  const unsigned bucket = vertices <= 4u ? 0u : vertices <= 8u ? 1u : vertices <= 16u ? 2u
+                        : vertices <= 64u ? 3u : vertices <= 256u ? 4u : 5u;
+  ++g_draw_size_hist[bucket];
+}
+void ReportDrawCensus() {
+  if (!g_draw_census || g_draw_census_draws == 0u) return;
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> top;
+  for (std::uint32_t m = 0; m < g_draw_gap_hist.size(); ++m)
+    if (g_draw_gap_hist[m]) top.emplace_back(g_draw_gap_hist[m], m);
+  std::sort(top.begin(), top.end(), std::greater<>());
+  std::string line;
+  for (std::size_t i = 0; i < top.size() && i < 10u; ++i) {
+    char item[40];
+    std::snprintf(item, sizeof(item), " %03x:%.1f%%", top[i].second,
+                  100.0 * double(top[i].first) / double(g_draw_census_draws));
+    line += item;
+  }
+  std::fprintf(stderr, "GEKKOAOT_DRAW_RUNS_V320_STATS runs=%llu members=%llu misses(vat,size,state,line)=%llu,%llu,%llu,%llu\n",
+               static_cast<unsigned long long>(std::exchange(g_draw_run_runs, 0u)),
+               static_cast<unsigned long long>(std::exchange(g_draw_run_members, 0u)),
+               static_cast<unsigned long long>(g_draw_run_misses[0]),
+               static_cast<unsigned long long>(g_draw_run_misses[1]),
+               static_cast<unsigned long long>(g_draw_run_misses[2]),
+               static_cast<unsigned long long>(g_draw_run_misses[3]));
+  g_draw_run_misses.fill(0u);
+  std::fprintf(stderr, "GEKKOAOT_TEXTURE_REVERSION_V324 bp66=%llu binds=%llu reused=%llu bind_kb=%llu forced=%llu forced_kb=%llu\n",
+               static_cast<unsigned long long>(std::exchange(g_tex_census_bp66, 0u)),
+               static_cast<unsigned long long>(std::exchange(g_tex_census_binds, 0u)),
+               static_cast<unsigned long long>(std::exchange(g_tex_census_reused, 0u)),
+               static_cast<unsigned long long>(std::exchange(g_tex_census_bind_bytes, 0u) >> 10u),
+               static_cast<unsigned long long>(std::exchange(g_tex_census_forced, 0u)),
+               static_cast<unsigned long long>(std::exchange(g_tex_census_forced_bytes, 0u) >> 10u));
+  std::fprintf(stderr, "GEKKOAOT_DRAW_CENSUS_V320=1 draws=%llu sizes(<=4,8,16,64,256,>)=%llu,%llu,%llu,%llu,%llu,%llu gaps%s\n",
+               static_cast<unsigned long long>(g_draw_census_draws),
+               static_cast<unsigned long long>(g_draw_size_hist[0]), static_cast<unsigned long long>(g_draw_size_hist[1]),
+               static_cast<unsigned long long>(g_draw_size_hist[2]), static_cast<unsigned long long>(g_draw_size_hist[3]),
+               static_cast<unsigned long long>(g_draw_size_hist[4]), static_cast<unsigned long long>(g_draw_size_hist[5]),
+               line.c_str());
+  g_draw_gap_hist.fill(0u); g_draw_size_hist.fill(0u); g_draw_census_draws = 0u;
+}
+
 
 // v57: some retail titles (notably FMV/video paths) write YUVY XFBs directly
 // into MEM1 and point VI at them without ever issuing GXCopyDisp. Keep the
@@ -232,6 +585,36 @@ bool g_array_frame_refresh = false;
 bool g_array_base_trace = false;
 bool g_z16r_copy_trace = false;
 bool g_ztexture_trace = false;
+// Selective EFB continuation policy.
+//
+// v176 kept a host recording open across color-preserving depth clears. That
+// preserves guest EFB semantics, but titles which emit many such GXCopyDisp
+// operations (notably HPCOS) can accumulate tens of thousands of draws in one
+// Aurora frame and exhaust the per-frame vertex/index/storage arenas.
+//
+// v177 fixed the unbounded frame by ending at every GXCopyDisp and loading the
+// post-copy EFB into the next recording, but loading *all* color+depth state for
+// every display copy regressed HPCOS.
+//
+// The default below is the narrow version: every GXCopyDisp remains a bounded
+// host producer boundary, while masked clear copies carry forward only the EFB
+// attachment(s) that the guest did NOT clear. This is sufficient for the MOH
+// Frontline viewmodel path and Terminator 3 channel-masked clears without
+// globally inheriting stale EFB/depth state.
+bool g_partial_clear_copy_continuation = false; // legacy v176 opt-in only
+bool g_masked_clear_efb_continuity = true;
+bool g_efb_boundary_continuity = false; // legacy/global v177 diagnostic opt-in
+unsigned g_display_copy_state_logs = 0;
+unsigned g_partial_clear_copy_logs = 0;
+// v36: environment variables are immutable for one renderer instance.  Never
+// call getenv() from FIFO/texture hot paths; cache diagnostic/coherency toggles
+// once during gekkoaot_native_gx_init().
+bool g_trace_gx_copy = false;
+bool g_trace_video = false;
+bool g_invalidate_texture_sources = true;
+bool g_texture_source_invalidation_pending = false;
+bool g_trace_font = false;
+bool g_paranoid_texture_hash = false;
 unsigned g_ztexture_logs = 0;
 std::uint32_t g_z16r_copy_dest = 0;
 std::uint32_t g_z16r_copy_span = 0;
@@ -275,6 +658,12 @@ struct FifoCommandTrace {
 };
 std::array<FifoWriteTrace, 32> g_fifo_write_trace{};
 std::array<FifoCommandTrace, 32> g_fifo_command_trace{};
+bool g_fifo_forensic_trace = false;
+bool g_fifo_streaming = true; // Default streaming policy; explicit =0 keeps the buffered path
+bool g_fifo_stream_stats = false;
+std::uint64_t g_fifo_submitted_bytes = 0;
+std::uint64_t g_fifo_copied_bytes = 0;
+std::uint64_t g_fifo_direct_bytes = 0;
 std::size_t g_fifo_command_trace_head = 0;
 std::size_t g_fifo_command_trace_count = 0;
 std::uint64_t g_fifo_stream_base = 0;
@@ -301,6 +690,11 @@ unsigned EnvUnsigned(const char* name, unsigned fallback) {
   char* end=nullptr; const unsigned long x=std::strtoul(v,&end,0);
   return end!=v && *end=='\0' && x<=std::numeric_limits<unsigned>::max() ? static_cast<unsigned>(x) : fallback;
 }
+float EnvFloat(const char* name, float fallback, float minimum, float maximum) {
+  const char* v=std::getenv(name); if(!v||!*v) return fallback;
+  char* end=nullptr; const float x=std::strtof(v,&end);
+  return end!=v && *end=='\0' && std::isfinite(x) && x>=minimum && x<=maximum ? x : fallback;
+}
 bool EqualNoCase(const char* a, const char* b) {
   if (!a || !b) return false;
   while (*a && *b) {
@@ -321,12 +715,36 @@ std::uint32_t AspectModeFromText(const char* text) {
   return 0u;
 }
 
-float HostWindowAspect() noexcept {
+// v276: the widescreen scissor/projection helpers run for every GX draw. Each
+// SDL3 window query validates the window under SDL's global object rwlock, so
+// querying the live size per draw cost three rwlock acquisitions per primitive.
+// Draws read this snapshot instead; PollEvents() refreshes it at every event
+// poll (present/frame cadence), which observes every resize, display-scale,
+// fullscreen and embedding change before the next frame is recorded.
+std::atomic<std::uint32_t> g_host_window_aspect_bits{0u};
+
+float QueryHostWindowAspect() noexcept {
   const auto size = aurora::window::get_window_size();
   const std::uint32_t width = size.native_fb_width != 0u ? size.native_fb_width : size.fb_width;
   const std::uint32_t height = size.native_fb_height != 0u ? size.native_fb_height : size.fb_height;
   if (width == 0u || height == 0u) return 4.0f / 3.0f;
   return static_cast<float>(width) / static_cast<float>(height);
+}
+
+float RefreshHostWindowAspect() noexcept {
+  const float aspect = QueryHostWindowAspect();
+  std::uint32_t bits = 0u;
+  std::memcpy(&bits, &aspect, sizeof(bits));
+  g_host_window_aspect_bits.store(bits, std::memory_order_relaxed);
+  return aspect;
+}
+
+float HostWindowAspect() noexcept {
+  const std::uint32_t bits = g_host_window_aspect_bits.load(std::memory_order_relaxed);
+  if (bits == 0u) return RefreshHostWindowAspect();
+  float aspect = 0.0f;
+  std::memcpy(&aspect, &bits, sizeof(aspect));
+  return aspect;
 }
 
 float TargetAspectForMode(std::uint32_t mode) noexcept {
@@ -335,8 +753,7 @@ float TargetAspectForMode(std::uint32_t mode) noexcept {
 
 float ProjectionXScaleForMode(std::uint32_t mode) noexcept {
   if (mode != 1u) return 1.0f;
-  const float target = HostWindowAspect();
-  return target > 0.0f ? (4.0f / 3.0f) / target : 1.0f;
+  return GekkoAOT::GX::UiXScale(HostWindowAspect());
 }
 
 aurora::webgpu::Viewport PresentViewportForAspect(std::uint32_t surface_width,
@@ -379,20 +796,13 @@ aurora::webgpu::Viewport PresentViewportForAspect(std::uint32_t surface_width,
 }
 
 bool FrameInterpolationForAspect(std::uint32_t mode) {
-  const bool requested = EnvBool("GEKKOAOT_FRAME_INTERPOLATION", true);
-  if (!requested) return false;
-
-  // v158: the persistent MKDD double-image/seam survived with interpolation
-  // completely disabled, so it was not caused by the temporal blend. Restore
-  // interpolation in widescreen by default. It can still be disabled without
-  // touching guest timing with GEKKOAOT_WIDESCREEN_INTERPOLATION=0.
-  if (mode == 1u && !EnvBool("GEKKOAOT_WIDESCREEN_INTERPOLATION", true))
-    return false;
-  return true;
+  (void)mode;
+  return false;
 }
 
 void ApplyAspectMode(std::uint32_t mode, bool log_change) {
   mode = mode == 1u ? 1u : 0u;
+  if (g_info.window) RefreshHostWindowAspect();
   const std::uint32_t previous = g_aspect_mode.exchange(mode, std::memory_order_acq_rel);
   const bool stretch_to_window = mode == 1u;
 
@@ -578,6 +988,76 @@ void InvalidateVertexSize(std::uint8_t reg) {
   }
 }
 
+bool ClassifyScreenFill(const std::uint8_t* data,std::size_t length,
+                        GXPrimitive primitive,GXVtxFmt format,unsigned count) {
+  using namespace aurora::gx;
+  const auto& state=g_gxState;
+  if (state.projType!=GX_ORTHOGRAPHIC ||
+      !((count==4u && (primitive==GX_QUADS || primitive==GX_TRIANGLESTRIP)) ||
+        (count==6u && primitive==GX_TRIANGLES)) ||
+      state.numTexGens!=1u || state.numTevStages>2u ||
+      state.blendMode!=GX_BM_NONE) return false;
+  const auto display=aurora::vi::configured_fb_size();
+  const auto& viewport=state.logicalViewport;
+  if (viewport.width<display.x*.95f || viewport.height<display.y*.95f) return false;
+  const unsigned stride=VertexSize(format);
+  if (!stride || length!=3u+count*stride) return false;
+  unsigned position_offset=0, matrix_offset=0;
+  bool indexed_matrix=false;
+  for (int attr=GX_VA_PNMTXIDX;attr<GX_VA_POS;++attr) {
+    const auto desc=state.vtxDesc[attr];
+    if (desc==GX_NONE) continue;
+    if (desc!=GX_DIRECT) return false;
+    if (attr==GX_VA_PNMTXIDX) { indexed_matrix=true;matrix_offset=position_offset; }
+    const auto& f=state.vtxFmts[format].attrs[attr];
+    position_offset+=unsigned(comp_type_size(static_cast<GXAttr>(attr),f.type))*
+                     comp_cnt_count(static_cast<GXAttr>(attr),f.cnt);
+  }
+  const auto desc=state.vtxDesc[GX_VA_POS];
+  const auto& posfmt=state.vtxFmts[format].attrs[GX_VA_POS];
+  const unsigned components=comp_cnt_count(GX_VA_POS,posfmt.cnt);
+  const unsigned size=comp_type_size(GX_VA_POS,posfmt.type);
+  if (components<2u || components>3u || !size) return false;
+  std::array<std::array<float,2>,6> corners{};
+  for (unsigned i=0;i<count;++i) {
+    const auto* vertex=data+3u+i*stride;
+    const auto* pos=vertex+position_offset;
+    bool little=false;
+    if (desc==GX_INDEX8 || desc==GX_INDEX16) {
+      const unsigned index=desc==GX_INDEX8 ? *pos : Be16(pos);
+      const auto& array=state.arrays[GX_VA_POS];
+      const std::uint64_t offset=std::uint64_t(index)*array.stride;
+      if (!array.data || offset+components*size>array.size) return false;
+      pos=static_cast<const std::uint8_t*>(array.data)+offset;little=array.le;
+    } else if (desc!=GX_DIRECT || position_offset+components*size>stride) return false;
+    float xyz[4]={0,0,0,1};
+    for (unsigned axis=0;axis<components;++axis) {
+      const auto* q=pos+axis*size;
+      const unsigned bits=size==1u ? *q : size==2u ?
+          (little ? unsigned(q[0])|(unsigned(q[1])<<8u) : Be16(q)) :
+          (little ? unsigned(q[0])|(unsigned(q[1])<<8u)|(unsigned(q[2])<<16u)|(unsigned(q[3])<<24u) : Be32(q));
+      switch (posfmt.type) {
+      case GX_F32: std::memcpy(&xyz[axis],&bits,4u);break;
+      case GX_U8: case GX_U16: xyz[axis]=std::ldexp(float(bits),-posfmt.frac);break;
+      case GX_S8: xyz[axis]=std::ldexp(float(static_cast<std::int8_t>(bits)),-posfmt.frac);break;
+      case GX_S16: xyz[axis]=std::ldexp(float(static_cast<std::int16_t>(bits)),-posfmt.frac);break;
+      default: return false;
+      }
+    }
+    const unsigned matrix=indexed_matrix ? (vertex[matrix_offset]&63u) : state.currentPnMtx;
+    if (matrix+2u>=state.xfPosRows.size()) return false;
+    float transformed[2]={0,0};
+    for (unsigned axis=0;axis<2;++axis)
+      for (unsigned j=0;j<4;++j) transformed[axis]+=state.xfPosRows[matrix+axis][j]*xyz[j];
+    corners[i]={state.proj.m0[0]*transformed[0]+state.proj.m0[3],
+                state.proj.m1[1]*transformed[1]+state.proj.m1[3]};
+  }
+  if (count==6u) return GekkoAOT::GX::IsScreenFillTriangles(corners);
+  std::array<std::array<float,2>,4> quad{};
+  std::copy_n(corners.begin(),4u,quad.begin());
+  return GekkoAOT::GX::IsScreenFillQuad(quad,primitive==GX_TRIANGLESTRIP);
+}
+
 void MapArrayBase(std::uint8_t reg, std::uint32_t value) {
   using namespace aurora::gx;
   const std::uint32_t attr=std::uint32_t(reg-0xA0u)+GX_VA_POS;
@@ -668,6 +1148,7 @@ bool BuildIndexScanLayout(GXVtxFmt fmt, IndexScanLayout* out) {
                                          ? 3u : comp_cnt_count(attr,af.cnt);
       const std::uint32_t element_size=std::uint32_t(comp_type_size(attr,af.type))*components;
       if(element_size>std::numeric_limits<std::uint16_t>::max()) return false;
+      if(!layout.bindings.Add(static_cast<unsigned>(i))) return false;
       layout.fields[layout.field_count++]={
           static_cast<std::uint8_t>(i),static_cast<std::uint8_t>(width),
           static_cast<std::uint8_t>(count),0,
@@ -686,6 +1167,28 @@ bool BuildIndexScanLayout(GXVtxFmt fmt, IndexScanLayout* out) {
     return false;
   }
   layout.stride=static_cast<std::uint16_t>(offset);
+  for(unsigned f=0;f<layout.field_count;++f)
+    if(layout.fields[f].index_width==1u) layout.has_index8=1;
+  if(layout.field_count>=2u && layout.field_count<=4u) {
+    std::array<std::uint16_t,4> offsets{};
+    bool eligible=true;
+    for(unsigned f=0;f<layout.field_count;++f) {
+      const auto& field=layout.fields[f];
+      offsets[f]=field.offset;
+      eligible=eligible && field.index_width==2u && field.index_count==1u;
+    }
+    if(eligible) layout.native.Compile(layout.stride,{offsets.data(),layout.field_count});
+  }
+  if(layout.field_count && layout.field_count<=GekkoAOT::GX::NativeVertexGather::MaxFields) {
+    std::array<GekkoAOT::GX::NativeVertexGather::Field,4> fields;
+    bool eligible=true;
+    for(unsigned f=0;f<layout.field_count;++f) {
+      const auto& field=layout.fields[f];
+      fields[f]={field.offset,field.element_size};
+      eligible=eligible && field.index_width==2u && field.index_count==1u;
+    }
+    if(eligible) layout.gather.Compile(layout.stride,{fields.data(),layout.field_count});
+  }
   layout.valid=1;
   *out=layout;
   return true;
@@ -702,7 +1205,9 @@ const IndexScanLayout* GetIndexScanLayout(GXVtxFmt fmt) {
   return &g_index_scan_layout[index];
 }
 
-bool PrepareIndexedArrayWindows(const std::uint8_t* p, std::size_t len) {
+bool PrepareIndexedArrayWindows(const std::uint8_t* p, std::size_t len,
+                                CompactArrayPlan* compact = nullptr,
+                                const GekkoAOT::GX::NativeAttributePlan** bindings = nullptr) {
   using namespace aurora::gx;
   if(!p || len<3u) return false;
 
@@ -710,6 +1215,7 @@ bool PrepareIndexedArrayWindows(const std::uint8_t* p, std::size_t len) {
   const std::uint32_t vtx_count=Be16(p+1);
   const auto* layout=GetIndexScanLayout(fmt);
   if(!layout) return false;
+  if(bindings) *bindings=&layout->bindings;
   const std::size_t vertex_bytes=std::size_t(vtx_count)*layout->stride;
   if(vertex_bytes!=len-3u) {
     std::fprintf(stderr,
@@ -731,7 +1237,7 @@ bool PrepareIndexedArrayWindows(const std::uint8_t* p, std::size_t len) {
   // Aurora cannot merge it across this memory-visibility boundary. The actual
   // cached ranges are cleared after the exact per-draw windows are established
   // below, avoiding the old multi-MiB whole-MEM1 upload behaviour.
-  if(g_indexed_draw_coherency) g_gxState.dirty |= DirtyImmediates;
+  if(g_indexed_draw_coherency || g_native_array_snapshots) g_gxState.dirty |= DirtyImmediates;
 
   // INDEX8 can address at most 256 elements. For the common small SDK arrays
   // it is cheaper to expose that complete bounded window once than to rescan
@@ -740,9 +1246,9 @@ bool PrepareIndexedArrayWindows(const std::uint8_t* p, std::size_t len) {
   // per-draw sizing and never recreate the old multi-MiB staging problem.
   constexpr std::uint64_t kEagerIndexWindowBytes=64u*1024u;
   std::array<bool,12> skip_scan{};
-  for(std::uint32_t f=0;f<layout->field_count;++f) {
+  for(std::uint32_t f=0;layout->has_index8 && f<layout->field_count;++f) {
     const auto& field=layout->fields[f];
-    if(field.index_width!=1u) continue;
+    if(field.index_width!=1u || (g_native_array_snapshots && compact)) continue;
     auto& array=g_gxState.arrays[field.attr];
     if(!array.data) return false;
     const std::uint64_t full=std::uint64_t(255u)*array.stride+field.element_size;
@@ -758,47 +1264,148 @@ bool PrepareIndexedArrayWindows(const std::uint8_t* p, std::size_t len) {
     skip_scan[f]=true;
   }
 
-  std::array<std::uint32_t,GX_VA_MAX_ATTR> max_index{};
-  std::array<bool,GX_VA_MAX_ATTR> seen{};
   const auto* const vertices=p+3;
 
   // Scan only the indexed fields. v1 walked every VCD attribute for every
   // vertex, which made ProcessOne a measurable hot spot. The cached layout
   // turns the inner loop into fixed-offset byte/halfword reads.
+  //
+  // v300: one pass over the vertices for all scanned fields. Retail draws are
+  // short (a few vertices) and a separate loop per field mispredicted at every
+  // draw-dependent exit; the common one-INDEX16-per-field layout also drops
+  // the per-vertex width/count branches. Results are identical (the minimum
+  // is only consumed for INDEX16 compact windows).
+  struct ScanState {
+    std::uint16_t offset;
+    std::uint8_t width;
+    std::uint8_t count;
+    std::uint8_t attr;
+    std::uint32_t maximum;
+    std::uint32_t minimum;
+  };
+  std::array<ScanState,std::tuple_size_v<decltype(layout->fields)>> scan;
+  std::uint32_t scan_count=0;
+  bool single_index16=true;
   for(std::uint32_t f=0;f<layout->field_count;++f) {
     if(skip_scan[f]) continue;
     const auto& field=layout->fields[f];
-    const auto attr=field.attr;
-    const auto* q=vertices+field.offset;
-    std::uint32_t maximum=0;
-    for(std::uint32_t v=0;v<vtx_count;++v,q+=layout->stride) {
-      if(field.index_width==1u) {
-        for(std::uint32_t n=0;n<field.index_count;++n)
-          maximum=std::max(maximum,std::uint32_t(q[n]));
-      } else {
-        for(std::uint32_t n=0;n<field.index_count;++n)
-          maximum=std::max(maximum,std::uint32_t(Be16(q+n*2u)));
+    scan[scan_count++]={field.offset,field.index_width,field.index_count,field.attr,0u,65535u};
+    single_index16=single_index16 && field.index_width==2u && field.index_count==1u;
+  }
+  const std::size_t vertex_stride=layout->stride;
+  // Fixed field counts unroll the per-vertex work; the vertex loop exit is the
+  // only data-dependent branch left on the common one-INDEX16-per-field path.
+  const auto scan_index16=[&]<std::uint32_t N>() {
+    std::array<std::uint32_t,N> offset{}, maximum{}, minimum{};
+    for(std::uint32_t k=0;k<N;++k) {
+      offset[k]=scan[k].offset;
+      minimum[k]=65535u;
+    }
+    const auto* base=vertices;
+    for(std::uint32_t v=0;v<vtx_count;++v,base+=vertex_stride) {
+      for(std::uint32_t k=0;k<N;++k) {
+        const auto index=std::uint32_t(Be16(base+offset[k]));
+        maximum[k]=std::max(maximum[k],index);
+        minimum[k]=std::min(minimum[k],index);
       }
     }
-    seen[attr]=true;
-    max_index[attr]=maximum;
+    for(std::uint32_t k=0;k<N;++k) {
+      scan[k].maximum=maximum[k];
+      scan[k].minimum=minimum[k];
+    }
+  };
+  // CPU-native decode cache: reuse exact bounds for repeated immutable draws.
+  // Include skip decisions because eager INDEX8 admission depends on arrays.
+  struct CacheLayout {IndexScanLayout layout;std::array<bool,12> skipped;};
+  CacheLayout cache_layout;
+  const GekkoAOT::GX::NativeIndexRangeCache::Bounds* cached=nullptr;
+  if(g_native_index_range_cache && scan_count) {
+    // Avoid constructing a large shadow at all on the default uncached path.
+    // Zero object representation as well: exact keys must not depend on padding.
+    std::memset(&cache_layout,0,sizeof cache_layout);
+    cache_layout.layout=*layout;cache_layout.skipped=skip_scan;
+    cached=g_native_index_ranges.Find(&cache_layout,sizeof cache_layout,vertices,vertex_bytes);
   }
-
+  if(cached) {
+    for(std::uint32_t k=0;k<scan_count;++k) {
+      scan[k].minimum=cached->minimum[k];scan[k].maximum=cached->maximum[k];
+    }
+  } else if(g_native_vertex_program && layout->native.fields==scan_count &&
+            layout->native.fields>=2u) {
+    std::array<GekkoAOT::GX::NativeVertexProgram::Bounds,4> bounds;
+    // Layout and draw-size were proved above. NBT3/mixed formats are not
+    // admitted and preserve the existing scan/visibility path below.
+    if(!layout->native.Execute({vertices,vertex_bytes},vtx_count,bounds)) return false;
+    for(unsigned k=0;k<scan_count;++k) {
+      scan[k].minimum=bounds[k].minimum;scan[k].maximum=bounds[k].maximum;
+    }
+    if(g_native_vertex_profile) {
+      ++g_native_vertex_draws;g_native_vertex_vertices+=vtx_count;
+    }
+  } else if(scan_count!=0u && single_index16) {
+    switch(scan_count) {
+    case 1u: scan_index16.template operator()<1u>(); break;
+    case 2u: scan_index16.template operator()<2u>(); break;
+    case 3u: scan_index16.template operator()<3u>(); break;
+    case 4u: scan_index16.template operator()<4u>(); break;
+    default: {
+      const auto* base=vertices;
+      for(std::uint32_t v=0;v<vtx_count;++v,base+=vertex_stride) {
+        for(std::uint32_t k=0;k<scan_count;++k) {
+          const auto index=std::uint32_t(Be16(base+scan[k].offset));
+          scan[k].maximum=std::max(scan[k].maximum,index);
+          scan[k].minimum=std::min(scan[k].minimum,index);
+        }
+      }
+      break;
+    }
+    }
+  } else if(scan_count!=0u) {
+    const auto* base=vertices;
+    for(std::uint32_t v=0;v<vtx_count;++v,base+=vertex_stride) {
+      for(std::uint32_t k=0;k<scan_count;++k) {
+        auto& state=scan[k];
+        const auto* q=base+state.offset;
+        if(state.width==1u) {
+          for(std::uint32_t n=0;n<state.count;++n) {
+            const auto index=std::uint32_t(q[n]);
+            state.maximum=std::max(state.maximum,index);
+            if(compact) state.minimum=std::min(state.minimum,index);
+          }
+        } else {
+          for(std::uint32_t n=0;n<state.count;++n) {
+            const auto index=std::uint32_t(Be16(q+n*2u));
+            state.maximum=std::max(state.maximum,index);
+            if(compact) state.minimum=std::min(state.minimum,index);
+          }
+        }
+      }
+    }
+  }
+  if(!cached && g_native_index_range_cache && scan_count) {
+    GekkoAOT::GX::NativeIndexRangeCache::Bounds bounds;
+    for(std::uint32_t k=0;k<scan_count;++k) {
+      bounds.minimum[k]=scan[k].minimum;bounds.maximum[k]=scan[k].maximum;
+    }
+    g_native_index_ranges.Insert(&cache_layout,sizeof cache_layout,vertices,vertex_bytes,bounds);
+  }
   static unsigned logs=0;
+  std::uint32_t scanned=0;
   for(std::uint32_t f=0;f<layout->field_count;++f) {
+    if(skip_scan[f]) continue;
     const auto& field=layout->fields[f];
+    const auto& bounds=scan[scanned++];
     const int i=field.attr;
-    if(!seen[i]) continue;
     auto& array=g_gxState.arrays[i];
     if(!array.data) return false;
 
     const std::uint64_t required=
-        std::uint64_t(max_index[i])*array.stride+field.element_size;
+        std::uint64_t(bounds.maximum)*array.stride+field.element_size;
     const std::uint32_t available=g_array_available[i];
     if(required>available || required>std::numeric_limits<std::uint32_t>::max()) {
       std::fprintf(stderr,
                    "GEKKOAOT_NATIVE_GX_ARRAY_WINDOW_V2=0 attr=%d max_index=%u stride=%u required=%llu available=%u action=reject\n",
-                   i,max_index[i],unsigned(array.stride),
+                   i,bounds.maximum,unsigned(array.stride),
                    static_cast<unsigned long long>(required),available);
       return false;
     }
@@ -818,19 +1425,26 @@ bool PrepareIndexedArrayWindows(const std::uint8_t* p, std::size_t len) {
       if(logs++<32u) {
         std::fprintf(stderr,
                      "GEKKOAOT_NATIVE_GX_ARRAY_WINDOW_V2=1 attr=%d max_index=%u stride=%u bytes=%u available=%u\n",
-                     i,max_index[i],unsigned(array.stride),required32,available);
+                     i,bounds.maximum,unsigned(array.stride),required32,available);
       }
+    }
+    if(compact && (field.index_width==2u || g_native_array_snapshots)) {
+      (*compact)[i]=GekkoAOT::GX::MakeCompactArrayWindow(
+          bounds.minimum,bounds.maximum,array.stride,field.element_size,
+          available,array.size,g_native_array_snapshots);
+      if(g_native_array_tiles)
+        (*compact)[i]=GekkoAOT::GX::TileCompactArrayWindow((*compact)[i],available,array.size);
     }
   }
 
-  if(g_indexed_draw_coherency) {
-    std::array<bool,GX_VA_MAX_ATTR> refreshed{};
+  if(g_indexed_draw_coherency || g_native_array_snapshots) {
     bool any=false;
     for(std::uint32_t f=0;f<layout->field_count;++f) {
       const auto attr=layout->fields[f].attr;
-      if(attr>=GX_VA_MAX_ATTR || refreshed[attr]) continue;
-      refreshed[attr]=true;
+      // BuildIndexScanLayout proves one field per attribute (NBT3 keeps its
+      // three indices in that single field). No per-draw duplicate map.
       auto& array=g_gxState.arrays[attr];
+      if(!g_indexed_draw_coherency && (!g_native_array_snapshots || array.size>8u*1024u)) continue;
       // Clear even when the visible window did not grow: guest RAM may have
       // changed in place since the previous draw. push_gx_draw() will upload
       // the current bytes into a fresh storage range for this draw.
@@ -909,43 +1523,361 @@ std::uint32_t NormalizeGuestCacheAddress(std::uint32_t address) noexcept {
   return (address & 0x80000000u)!=0u ? address & 0x3fffffffu : address;
 }
 
-bool GuestCacheLineOverlaps(std::uint32_t address, std::uint32_t base,
-                            std::uint64_t bytes) noexcept {
-  if(bytes==0u) return false;
-  const std::uint64_t line_begin=std::uint64_t(NormalizeGuestCacheAddress(address)&~31u);
-  const std::uint64_t line_end=line_begin+32u;
-  const std::uint64_t range_begin=NormalizeGuestCacheAddress(base);
-  const std::uint64_t range_end=range_begin+bytes;
-  return line_begin<range_end && range_begin<line_end;
+bool GuestRangeOverlaps(std::uint32_t address, std::uint32_t size,
+                        std::uint32_t base, std::uint64_t bytes) noexcept {
+  if(size==0u || bytes==0u) return false;
+  const std::uint64_t range_begin=NormalizeGuestCacheAddress(address);
+  const std::uint64_t range_end=range_begin+size;
+  const std::uint64_t object_begin=NormalizeGuestCacheAddress(base);
+  const std::uint64_t object_end=object_begin+bytes;
+  return range_begin<object_end && object_begin<range_end;
 }
 
-void NotifyGuestVertexCacheControl(std::uint8_t operation, std::uint32_t address) {
-  using namespace aurora::gx;
-  // 0/1/2 are dcbst/dcbf/dcbi in HostRuntime. These are the hardware
-  // publication/invalidation points for CPU-authored vertex data. icbi is code
-  // coherency and intentionally does not enter the renderer.
-  if(operation>2u) return;
-  ++g_array_cache_control_events;
+constexpr std::uint32_t PersistentArrayBytesV161H = 64u * 1024u * 1024u;
 
-  unsigned invalidated=0u;
+std::uint32_t AlignPersistentArraySize(std::uint32_t value) noexcept {
+  constexpr std::uint32_t kAlign = 256u;
+  return (value + kAlign - 1u) & ~(kAlign - 1u);
+}
+
+void BeginPersistentArrayFrameV161H(std::uint32_t frame) {
+  if (g_persistent_array_frame == frame) return;
+  g_persistent_array_frame = frame;
+  if (!g_persistent_array_reset_pending) return;
+
+  g_persistent_array_cursor = static_cast<std::uint32_t>(aurora::gfx::StorageBufferSize);
+  for (auto& slot : g_persistent_array_slots) slot = {};
+  for (auto& array : aurora::gx::g_gxState.arrays) array.cachedRange = {};
+  aurora::gx::g_gxState.dirty |= aurora::gx::DirtyImmediates;
+  g_persistent_array_reset_pending = false;
+  std::fprintf(stderr,
+               "GEKKOAOT_AURORA_ARRAY_CACHE_V178=1 action=reset frame=%u base=%u bytes=%u\n",
+               frame, static_cast<unsigned>(aurora::gfx::StorageBufferSize),
+               PersistentArrayBytesV161H);
+}
+
+bool UploadPersistentArrayV161H(std::uint32_t attr, std::uint32_t frame) {
+  using namespace aurora::gx;
+  if (!g_persistent_array_cache || attr >= GX_VA_MAX_ATTR) return false;
+  auto& array = g_gxState.arrays[attr];
+  // v178: the upper storage region survives frame rotation and guest-memory
+  // writes already invalidate cachedRange through NotifyGuestMemoryWriteRange.
+  // Promote medium/static indexed arrays too: otherwise the same 8-64 KiB
+  // window is memcpy'd through push_storage every frame. Tiny scratch arrays
+  // stay on mapped per-frame staging where Queue.WriteBuffer would cost more.
+  if (array.size < g_persistent_array_min_bytes) {
+    ++g_persistent_array_fallbacks;
+    return false;
+  }
+  if (array.cachedRange.size != 0u) {
+    ++g_persistent_array_hits;
+    return true;
+  }
+  if (array.data == nullptr || array.size == 0u) return false;
+
+  const std::uint32_t padded = AlignPersistentArraySize(array.size);
+  const std::uint32_t base = static_cast<std::uint32_t>(aurora::gfx::StorageBufferSize);
+  const std::uint32_t limit = base + PersistentArrayBytesV161H;
+  auto& slot = g_persistent_array_slots[attr];
+  // Guest invalidation remains authoritative. Once invalidated, exact byte
+  // equality can prove that the previous immutable GPU snapshot is still the
+  // right one. No hash or address/SDK assumption can admit different data.
+  if (g_content_array_cache && slot.snapshot && slot.offset >= base &&
+      slot.capacity >= padded && slot.snapshot_size >= array.size &&
+      std::memcmp(slot.snapshot.get(), array.data, array.size) == 0) {
+    array.cachedRange = {slot.offset, array.size};
+    slot.last_frame = frame;
+    ++g_content_array_hits;
+    return true;
+  }
+  if (g_adaptive_array_upload && !g_array_upload_policy[attr].UsePersistent(frame)) {
+    ++g_persistent_array_fallbacks;
+    ++g_adaptive_array_fallbacks;
+    return false;
+  }
+  const bool reusable = slot.offset >= base && slot.capacity >= padded &&
+                        slot.last_frame != frame;
+  std::uint32_t offset = reusable ? slot.offset : g_persistent_array_cursor;
+
+  if (!reusable) {
+    if (padded > PersistentArrayBytesV161H || offset > limit || padded > limit - offset) {
+      ++g_persistent_array_fallbacks;
+      g_persistent_array_reset_pending = true;
+      return false;
+    }
+    g_persistent_array_cursor = offset + padded;
+  }
+
+  const std::size_t write_size =
+      (static_cast<std::size_t>(array.size) + 3u) & ~std::size_t{3u};
+  // All payload bytes are overwritten; initialize only the 0-3 copy-alignment
+  // padding bytes. The slot and queued upload share this immutable snapshot.
+  std::shared_ptr<std::uint8_t[]> snapshot(new std::uint8_t[write_size]);
+  std::memcpy(snapshot.get(), array.data, array.size);
+  std::memset(snapshot.get() + array.size, 0, write_size - array.size);
+  auto storage = aurora::gfx::detail::resources().storageBuffer;
+
+  aurora::gfx::render_worker::enqueue_work(
+      [storage = std::move(storage), offset, snapshot, write_size]() mutable {
+        aurora::webgpu::g_queue.WriteBuffer(storage, offset, snapshot.get(), write_size);
+      });
+
+  slot.offset = offset;
+  slot.capacity = padded;
+  slot.identity = array.data;
+  slot.last_frame = frame;
+  slot.snapshot = std::move(snapshot);
+  slot.snapshot_size = array.size;
+  g_array_upload_policy[attr].Uploaded(frame);
+  array.cachedRange = {offset, array.size};
+  ++g_persistent_array_uploads;
+  g_persistent_array_upload_bytes += array.size;
+
+  if (g_persistent_array_uploads <= 32u) {
+    std::fprintf(stderr,
+                 "GEKKOAOT_AURORA_ARRAY_CACHE_V178=1 action=upload attr=%u frame=%u offset=%u bytes=%u cap=%u reused=%u\n",
+                 attr, frame, offset, array.size, padded, reusable ? 1u : 0u);
+  }
+  return true;
+}
+
+void PrimePersistentIndexedArraysV161H(std::uint32_t compact_mask,
+                                     const GekkoAOT::GX::NativeAttributePlan& bindings) {
+  using namespace aurora::gx;
+  if (!g_persistent_array_cache) return;
+  const auto frame = aurora::gfx::current_frame();
+  // Recycle before ANY draw in the new frame uses an old persistent range.
+  // A delayed reset after a cached draw would let an upload overwrite it.
+  BeginPersistentArrayFrameV161H(frame);
+  bindings.ForEach(g_native_attribute_plan,[&](unsigned i) {
+    if((compact_mask & (1u << i))!=0u) return;
+    const auto desc = g_gxState.vtxDesc[i];
+    if (desc != GX_INDEX8 && desc != GX_INDEX16) return;
+    auto& array = g_gxState.arrays[i];
+    if (array.cachedRange.size != 0u) {
+      auto& slot = g_persistent_array_slots[i];
+      // A surviving snapshot can be used in a later frame without an upload.
+      // Record that use: a subsequent mutation in this SAME frame must receive
+      // another GPU range, or it would change geometry of the earlier draw.
+      if (array.cachedRange.offset >= aurora::gfx::StorageBufferSize &&
+          array.cachedRange.offset == slot.offset)
+        slot.last_frame = frame;
+      return;
+    }
+    if (array.size == 0u || array.data == nullptr) return;
+    (void)UploadPersistentArrayV161H(static_cast<std::uint32_t>(i), frame);
+  });
+}
+
+std::uint32_t SelectCompactArrayMask(const CompactArrayPlan& plan,
+                                   const GekkoAOT::GX::NativeAttributePlan& bindings) {
+  using namespace aurora::gx;
+  std::uint32_t mask=0;
+  bindings.ForEach(g_native_attribute_plan,[&](unsigned attr) {
+    if(plan[attr] && g_gxState.arrays[attr].cachedRange.size==0u)
+      mask|=1u<<attr;
+  });
+  return mask;
+}
+
+// Reserve before uploading any compact array. The shader receives a wrapping
+// u32 bias, never a host pointer/offset or a WebGPU binding range. Clear these
+// one-draw ranges immediately after submission; frame rotation and storage
+// rollover must never interpret the bias as a persistent storage allocation.
+struct CompactArrayDraw {
+  std::uint32_t mask=0;
+  void Clear() {
+    if(!mask) return;
+    for(unsigned attr=GX_VA_POS;attr<=GX_VA_TEX7;++attr)
+      if((mask&(1u<<attr))!=0u) aurora::gx::g_gxState.arrays[attr].cachedRange={};
+    aurora::gx::g_gxState.dirty|=aurora::gx::DirtyImmediates;
+    mask=0;
+  }
+  ~CompactArrayDraw() { Clear(); }
+
+  void Prepare(const CompactArrayPlan& plan,const GekkoAOT::GX::NativeAttributePlan& bindings) {
+    using namespace aurora::gx;
+    auto selected=SelectCompactArrayMask(plan,bindings);
+    PrimePersistentIndexedArraysV161H(selected,bindings);
+    if(!selected && !g_native_array_snapshots) return;
+    const auto projected=[&](std::uint32_t candidate) {
+      std::uint64_t end=aurora::gfx::storage_size();
+      const auto alignment=aurora::gfx::storage_alignment();
+      const auto append=[&](std::uint64_t bytes) {
+        if(!bytes) return;
+        // Conservative for every upload order, including compact arrays first.
+        end+=(alignment ? alignment-1u : 0u)+bytes;
+      };
+      bindings.ForEach(g_native_attribute_plan,[&](unsigned attr) {
+        const auto& array=g_gxState.arrays[attr];
+        const auto desc=g_gxState.vtxDesc[attr];
+        if((desc!=GX_INDEX8 && desc!=GX_INDEX16) || array.cachedRange.size) return;
+        append((candidate&(1u<<attr))!=0u ? plan[attr].bytes : array.size);
+      });
+      // Aurora may build/change its fog LUT while choosing the shader/pipeline.
+      // Its exact maximum payload is one f32 per render-target pixel column.
+      append(std::uint64_t(aurora::gfx::get_render_target_size().x)*sizeof(float));
+      return end;
+    };
+    auto required=projected(selected);
+    if(required>aurora::gfx::storage_capacity()) {
+      if(!aurora::gfx::rollover_storage_pass(static_cast<std::size_t>(required))) {
+        ++g_compact_array_fallbacks;
+        PrimePersistentIndexedArraysV161H(0,bindings);
+        return;
+      }
+      ++g_compact_array_rollovers;
+      selected=SelectCompactArrayMask(plan,bindings);
+      PrimePersistentIndexedArraysV161H(selected,bindings);
+      required=projected(selected);
+      if(required>aurora::gfx::storage_capacity()) {
+        ++g_compact_array_fallbacks;
+        PrimePersistentIndexedArraysV161H(0,bindings);
+        return;
+      }
+    }
+    bool prepared=false;
+    bool failed=false;
+    bindings.ForEach(g_native_attribute_plan,[&](unsigned attr) {
+      if(failed) return;
+      const bool compact=(selected&(1u<<attr))!=0u;
+      auto& array=g_gxState.arrays[attr];
+      const auto desc=g_gxState.vtxDesc[attr];
+      // v303: short full arrays (including INDEX8 and low INDEX16 indices)
+      // need the same immutable resource identity as compact suffixes. Stage
+      // them before draw selection so native batching sees validated bases.
+      if(!compact && (!g_native_array_snapshots || array.cachedRange.size || !array.data ||
+          !array.size || array.size>8u*1024u || (desc!=GX_INDEX8 && desc!=GX_INDEX16))) return;
+      const auto window=compact ? plan[attr] : GekkoAOT::GX::CompactArrayWindow{0,array.size};
+      const auto range=aurora::gfx::push_storage_snapshot(
+          static_cast<const std::uint8_t*>(array.data)+window.prefix,window.bytes,!compact);
+      if(range.size!=window.bytes) {
+        ++g_compact_array_fallbacks;
+        Clear();
+        PrimePersistentIndexedArraysV161H(0,bindings);
+        failed=true;
+        return;
+      }
+      array.cachedRange={GekkoAOT::GX::CompactArrayShaderBase(range.offset,window.prefix),
+                         window.bytes};
+      prepared=true;
+      if(compact) {
+        mask|=1u<<attr;
+        ++g_compact_array_uploads;
+        g_compact_array_bytes+=window.bytes;
+        g_compact_array_prefix_bytes+=array.size;
+      } else {
+        ++g_native_array_snapshot_stages;
+      }
+    });
+    if(prepared) g_gxState.dirty|=DirtyImmediates;
+  }
+};
+
+// v318: one native resource allocation/copy for all indexed attributes of a
+// short draw, without min/max window uploads or per-attribute snapshot lookup.
+// Rewritten indices live exclusively in host memory. CP state, guest arrays
+// and display-list bytes keep their original representation.
+struct GatheredArrayDraw {
+  const std::uint8_t* vertices=nullptr;
+  std::uint32_t mask=0;
+  ~GatheredArrayDraw() {
+    if(!mask) return;
+    for(unsigned attr=GX_VA_POS;attr<=GX_VA_TEX7;++attr)
+      if(mask&(1u<<attr)) aurora::gx::g_gxState.arrays[attr].cachedRange={};
+    aurora::gx::g_gxState.dirty|=aurora::gx::DirtyImmediates;
+  }
+  bool Prepare(const std::uint8_t* p,std::size_t len,GXVtxFmt fmt,unsigned count) {
+    using namespace aurora::gx;
+    if(!g_native_vertex_gather ||
+       count>GekkoAOT::GX::NativeVertexGather::MaxVertices) return false;
+    const auto* layout=GetIndexScanLayout(fmt);
+    if(!layout || !layout->gather.count) return false;
+    std::array<GekkoAOT::GX::NativeVertexGather::Source,4> sources;
+    for(unsigned f=0;f<layout->field_count;++f) {
+      const auto attr=layout->fields[f].attr;
+      const auto& array=g_gxState.arrays[attr];
+      sources[f]={static_cast<const std::uint8_t*>(array.data),g_array_available[attr],array.stride};
+    }
+    GekkoAOT::GX::NativeVertexGather::Result gathered;
+    if(!layout->gather.Execute({p+3,len-3},count,{sources.data(),layout->field_count},
+                              g_native_gather_workspace,gathered)) return false;
+    const auto alignment=aurora::gfx::storage_alignment();
+    const auto padding=alignment ? alignment-1u : 0u;
+    const auto required=aurora::gfx::storage_size()+padding+
+        gathered.bytes+padding+
+        std::size_t(aurora::gfx::get_render_target_size().x)*sizeof(float);
+    if(required>aurora::gfx::storage_capacity() &&
+       !aurora::gfx::rollover_storage_pass(required)) return false;
+    const auto uploaded=aurora::gfx::push_storage(g_native_gather_workspace.storage.data(),gathered.bytes);
+    if(uploaded.size!=gathered.bytes) return false;
+    for(unsigned f=0;f<layout->field_count;++f) {
+      const auto attr=layout->fields[f].attr;
+      auto& array=g_gxState.arrays[attr];
+      const auto& range=gathered.ranges[f];
+      array.size=std::max(array.size,range.maximum*array.stride+layout->fields[f].element_size);
+      array.cachedRange={uploaded.offset+range.offset,range.bytes};
+      mask|=1u<<attr;
+    }
+    vertices=g_native_gather_workspace.vertices.data();
+    g_gxState.dirty|=DirtyImmediates;
+    ++g_native_gather_draws;
+    g_native_gather_bytes+=gathered.bytes;
+    g_native_gather_windows+=gathered.source_window_bytes;
+    return true;
+  }
+};
+
+void NotifyGuestMemoryWriteRange(std::uint32_t address, std::uint32_t size) {
+  using namespace aurora::gx;
+  if(size==0u) return;
+  ForgetTextureSourceRange(address,size);
+
+  unsigned invalidated_arrays=0u;
   for(int i=GX_VA_POS;i<GX_VA_MAX_ATTR;++i) {
     auto& array=g_gxState.arrays[i];
     if(array.cachedRange.size==0u || array.size==0u || array.data==nullptr) continue;
-    if(!GuestCacheLineOverlaps(address,g_array_guest_base[i],array.size)) continue;
+    if(!GuestRangeOverlaps(address,size,g_array_guest_base[i],array.size)) continue;
     array.cachedRange={};
-    ++invalidated;
+    ++invalidated_arrays;
     ++g_array_cache_invalidations;
   }
-  if(invalidated!=0u) {
-    // Prevent Aurora from merging the next retail draw with a command that
-    // referenced the pre-flush storage snapshot.
+  if(invalidated_arrays!=0u)
     g_gxState.dirty |= DirtyImmediates;
-    if(g_array_cache_control_logs++<64u) {
-      std::fprintf(stderr,
-                   "GEKKOAOT_NATIVE_GX_DYNAMIC_VERTEX_V141 event=invalidate op=%u ea=%08x line=%08x arrays=%u\\n",
-                   unsigned(operation),address,NormalizeGuestCacheAddress(address)&~31u,invalidated);
-    }
+
+  unsigned invalidated_textures=0u;
+  for(unsigned map=0;map<MaxTextures;++map) {
+    const auto bit=static_cast<std::uint8_t>(1u<<map);
+    if((g_texture_image3_valid&bit)==0u) continue;
+    auto& slot=g_gxState.loadedTextures[map];
+    if(slot.data==nullptr) continue;
+    const std::uint32_t guest=(g_texture_image3_word[map]&0x00ffffffu)<<5u;
+    const auto span=texture::texture_source_size(slot.format(),slot.width(),slot.height(),slot.mip_count());
+    if(span==0u || !GuestRangeOverlaps(address,size,guest,span)) continue;
+    slot.texDataVersion=static_cast<std::uint32_t>(++g_texture_generation);
+    ++invalidated_textures;
+    ++g_texture_memory_invalidations;
   }
+  if(invalidated_textures!=0u) {
+    texture::invalidate_bindings();
+    g_gxState.dirty |= DirtyTextures;
+  }
+
+  if((invalidated_arrays!=0u || invalidated_textures!=0u) &&
+     g_array_cache_control_logs++<64u) {
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_GX_MEMORY_COHERENCY_V159=1 ea=%08x bytes=%u arrays=%u textures=%u\n",
+                 address,size,invalidated_arrays,invalidated_textures);
+  }
+}
+
+void NotifyGuestVertexCacheControl(std::uint8_t operation, std::uint32_t address) {
+  // 0/1/2 are dcbst/dcbf/dcbi in HostRuntime. GekkoAOT's RAM is host-coherent,
+  // but these guest cache-management instructions are the publication signal
+  // for CPU-authored GX arrays and textures. Invalidate only the touched line.
+  if(operation>2u) return;
+  ++g_array_cache_control_events;
+  NotifyGuestMemoryWriteRange(address&~31u,32u);
 }
 
 void RefreshIndexedArraySnapshots() {
@@ -1063,6 +1995,8 @@ void TrackRawCopyRegister(std::uint8_t reg, std::uint32_t word) {
   }
 }
 
+GekkoAOT::GX::TextureViewportRoles g_texture_viewport_roles;
+
 bool PrepareRawTextureCopy(std::uint32_t word) {
   using namespace aurora::gx;
   GXTexFmt format{};
@@ -1103,8 +2037,14 @@ bool PrepareRawTextureCopy(std::uint32_t word) {
   g_gxState.texCopyDstWidth=std::max(1u,static_cast<unsigned>(g_gxState.texCopySrc.width)>>shift);
   g_gxState.texCopyDstHeight=std::max(1u,static_cast<unsigned>(g_gxState.texCopySrc.height)>>shift);
   g_gxState.texCopyFmt=format;
+  const auto display=aurora::vi::configured_fb_size();
+  const auto& view=g_gxState.logicalViewport;
+  g_texture_viewport_roles.Observe(view.left,view.top,view.width,view.height,
+      g_gxState.texCopySrc.x,g_gxState.texCopySrc.y,g_gxState.texCopySrc.width,
+      g_gxState.texCopySrc.height,float(display.x),float(display.y),
+      g_camera_copy_epoch.load(std::memory_order_relaxed));
   static unsigned copy_logs=0;
-  if(EnvBool("GEKKOAOT_TRACE_GX_COPY",false) && copy_logs++<128u)
+  if(g_trace_gx_copy && copy_logs++<128u)
     std::fprintf(stderr,"GEKKOAOT_TRACE_GX_COPY event=texture-copy width=%u height=%u half=%u format=%u\n",
                  g_gxState.texCopyDstWidth,g_gxState.texCopyDstHeight,shift,unsigned(format));
   static unsigned logs=0;
@@ -1196,10 +2136,224 @@ const aurora::webgpu::TextureWithSampler* XfbPresentSource(const XfbZeroCopySlot
 }
 
 
+struct PostFxResources {
+  wgpu::BindGroupLayout layout;
+  wgpu::RenderPipeline pipeline;
+  wgpu::Buffer params;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+};
+
+PostFxResources& UniversalPostFxResources() {
+  static PostFxResources resources;
+  return resources;
+}
+
+bool EnsureUniversalPostFxPipeline() {
+  using namespace aurora::webgpu;
+  auto& resources = UniversalPostFxResources();
+  const auto format = g_graphicsConfig.surfaceConfiguration.format;
+  if (resources.pipeline && resources.layout && resources.params && resources.format == format)
+    return true;
+
+  resources = {};
+  resources.format = format;
+  wgpu::ShaderSourceWGSL source{};
+  source.code = R"WGSL(
+struct Params { primary: vec4<f32>, secondary: vec4<f32>, };
+struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var tex_sampler: sampler;
+@group(0) @binding(2) var source_tex: texture_2d<f32>;
+var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
+  vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
+var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
+  vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+@vertex fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+  var out: VertexOutput;
+  out.position = vec4<f32>(pos[idx], 0.0, 1.0);
+  out.uv = uvs[idx];
+  return out;
+}
+fn aces(x: vec3<f32>) -> vec3<f32> {
+  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+  return clamp((x * (a * x + vec3<f32>(b))) /
+               (x * (c * x + vec3<f32>(d)) + vec3<f32>(e)),
+               vec3<f32>(0.0), vec3<f32>(1.0));
+}
+fn hash12(p: vec2<f32>) -> f32 {
+  let h = dot(p, vec2<f32>(127.1, 311.7));
+  return fract(sin(h) * 43758.5453);
+}
+@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+  let dims = vec2<f32>(textureDimensions(source_tex));
+  let px = vec2<f32>(1.0) / max(dims, vec2<f32>(1.0));
+  let uv = clamp(in.uv, vec2<f32>(0.0), vec2<f32>(1.0));
+  let center = textureSample(source_tex, tex_sampler, uv).rgb;
+  let n = textureSample(source_tex, tex_sampler, uv + vec2<f32>(0.0, -px.y)).rgb;
+  let s = textureSample(source_tex, tex_sampler, uv + vec2<f32>(0.0, px.y)).rgb;
+  let e = textureSample(source_tex, tex_sampler, uv + vec2<f32>(px.x, 0.0)).rgb;
+  let w = textureSample(source_tex, tex_sampler, uv + vec2<f32>(-px.x, 0.0)).rgb;
+  let local_blur = (center * 4.0 + n + s + e + w) / 8.0;
+
+  var color = center + (center - local_blur) * params.primary.x;
+  color += (center - local_blur) * params.secondary.y;
+
+  let radius = px * 4.0;
+  let b0 = textureSample(source_tex, tex_sampler, uv + vec2<f32>( radius.x, 0.0)).rgb;
+  let b1 = textureSample(source_tex, tex_sampler, uv + vec2<f32>(-radius.x, 0.0)).rgb;
+  let b2 = textureSample(source_tex, tex_sampler, uv + vec2<f32>(0.0,  radius.y)).rgb;
+  let b3 = textureSample(source_tex, tex_sampler, uv + vec2<f32>(0.0, -radius.y)).rgb;
+  let bloom_source = max((b0 + b1 + b2 + b3) * 0.25 - vec3<f32>(0.58), vec3<f32>(0.0));
+  color += bloom_source * params.primary.y * 0.75;
+
+  let filmic = aces(max(color, vec3<f32>(0.0)));
+  color = mix(color, filmic, params.secondary.x);
+
+  if (params.secondary.z > 0.0001) {
+    let radial = clamp(length((uv - vec2<f32>(0.5)) * vec2<f32>(1.0, 0.82)) * 1.6, 0.0, 1.0);
+    let soft = (local_blur + center) * 0.5;
+    color = mix(color, soft, params.secondary.z * smoothstep(0.35, 1.0, radial) * 0.45);
+  }
+
+  let d = length((uv - vec2<f32>(0.5)) * vec2<f32>(1.0, 0.82));
+  let vignette = 1.0 - params.primary.z * smoothstep(0.30, 0.72, d);
+  color *= vignette;
+
+  let noise = hash12(uv * dims + vec2<f32>(params.secondary.w, params.secondary.w * 0.618)) - 0.5;
+  color += vec3<f32>(noise * params.primary.w);
+  return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+)WGSL";
+  const wgpu::ShaderModuleDescriptor module_desc{.nextInChain = &source,
+      .label = "GekkoAOT v196 universal post-processing shader"};
+  const auto module = g_device.CreateShaderModule(&module_desc);
+  const std::array entries{
+      wgpu::BindGroupLayoutEntry{.binding = 0, .visibility = wgpu::ShaderStage::Fragment,
+          .buffer = wgpu::BufferBindingLayout{.type = wgpu::BufferBindingType::Uniform}},
+      wgpu::BindGroupLayoutEntry{.binding = 1, .visibility = wgpu::ShaderStage::Fragment,
+          .sampler = wgpu::SamplerBindingLayout{.type = wgpu::SamplerBindingType::Filtering}},
+      wgpu::BindGroupLayoutEntry{.binding = 2, .visibility = wgpu::ShaderStage::Fragment,
+          .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float,
+                                                .viewDimension = wgpu::TextureViewDimension::e2D}},
+  };
+  const wgpu::BindGroupLayoutDescriptor bgl_desc{.entryCount = entries.size(), .entries = entries.data()};
+  resources.layout = g_device.CreateBindGroupLayout(&bgl_desc);
+  const wgpu::PipelineLayoutDescriptor layout_desc{.bindGroupLayoutCount = 1,
+                                                    .bindGroupLayouts = &resources.layout};
+  const auto pipeline_layout = g_device.CreatePipelineLayout(&layout_desc);
+  const std::array targets{wgpu::ColorTargetState{.format = format,
+                                                   .writeMask = wgpu::ColorWriteMask::All}};
+  const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main",
+                                     .targetCount = targets.size(), .targets = targets.data()};
+  const wgpu::RenderPipelineDescriptor pipeline_desc{
+      .label = "GekkoAOT v196 universal post-processing pipeline", .layout = pipeline_layout,
+      .vertex = wgpu::VertexState{.module = module, .entryPoint = "vs_main"},
+      .primitive = wgpu::PrimitiveState{.topology = wgpu::PrimitiveTopology::TriangleList},
+      .multisample = wgpu::MultisampleState{.count = 1, .mask = UINT32_MAX}, .fragment = &fragment};
+  resources.pipeline = g_device.CreateRenderPipeline(&pipeline_desc);
+  const wgpu::BufferDescriptor params_desc{.label = "GekkoAOT v196 post-processing params",
+      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform, .size = 32};
+  resources.params = g_device.CreateBuffer(&params_desc);
+  return resources.pipeline && resources.layout && resources.params;
+}
+
+bool PresentUniversalPostFx(const aurora::webgpu::TextureWithSampler& source) {
+  using namespace aurora;
+  using namespace aurora::webgpu;
+  if (!g_post_processing_enabled || !source.texture || !source.view ||
+      source.size.width == 0 || source.size.height == 0)
+    return false;
+  if (!gfx::render_worker::is_worker_thread()) {
+    auto retained = source;
+    bool result = false;
+    gfx::render_worker::enqueue_work([retained = std::move(retained), &result]() mutable {
+      result = PresentUniversalPostFx(retained);
+    });
+    gfx::render_worker::synchronize();
+    return result;
+  }
+  if (!EnsureUniversalPostFxPipeline() || !window::is_presentable()) return false;
+  if (!g_surface && !refresh_surface(true)) return false;
+  if (!g_surface) return false;
+
+  wgpu::SurfaceTexture surface_texture;
+  {
+    window::SurfaceLock surface_lock;
+    if (!window::is_presentable() || !g_surface) return false;
+    g_surface.GetCurrentTexture(&surface_texture);
+  }
+  if (surface_texture.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
+      !surface_texture.texture) {
+    release_surface();
+    return false;
+  }
+  auto swap_texture = std::move(surface_texture.texture);
+  auto swap_view = swap_texture.CreateView();
+  if (!swap_view) return false;
+
+  auto& resources = UniversalPostFxResources();
+  const std::array<float, 8> params{
+      g_post_sharpen, g_post_bloom, g_post_vignette, g_post_grain,
+      g_post_tone, g_post_local_contrast, g_post_cinematic,
+      static_cast<float>((g_post_frame++) & 0xffffu)};
+  g_queue.WriteBuffer(resources.params, 0, params.data(), sizeof(params));
+  const std::array bind_entries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = resources.params, .size = 32},
+      wgpu::BindGroupEntry{.binding = 1, .sampler = source.sampler},
+      wgpu::BindGroupEntry{.binding = 2, .textureView = source.view},
+  };
+  const wgpu::BindGroupDescriptor bind_desc{.layout = resources.layout,
+      .entryCount = bind_entries.size(), .entries = bind_entries.data()};
+  const auto bind_group = g_device.CreateBindGroup(&bind_desc);
+  constexpr wgpu::CommandEncoderDescriptor encoder_desc{.label = "GekkoAOT v196 post-processing encoder"};
+  auto encoder = g_device.CreateCommandEncoder(&encoder_desc);
+  const auto viewport = PresentViewportForAspect(g_graphicsConfig.surfaceConfiguration.width,
+      g_graphicsConfig.surfaceConfiguration.height, source.size.width, source.size.height);
+  const std::array attachments{wgpu::RenderPassColorAttachment{.view = swap_view,
+      .loadOp = wgpu::LoadOp::Clear, .storeOp = wgpu::StoreOp::Store}};
+  const wgpu::RenderPassDescriptor pass_desc{.label = "GekkoAOT v196 post-processing pass",
+      .colorAttachmentCount = attachments.size(), .colorAttachments = attachments.data()};
+  const auto pass = encoder.BeginRenderPass(&pass_desc);
+  pass.SetPipeline(resources.pipeline);
+  pass.SetBindGroup(0, bind_group, 0, nullptr);
+  pass.SetViewport(viewport.left, viewport.top, viewport.width, viewport.height,
+                   viewport.znear, viewport.zfar);
+  pass.Draw(3);
+  pass.End();
+  const auto command = encoder.Finish();
+  g_queue.Submit(1, &command);
+
+  bool present_ok = false;
+  {
+    window::SurfaceLock surface_lock;
+    if (window::is_presentable() && g_surface)
+      present_ok = static_cast<bool>(g_surface.Present());
+  }
+  if (present_ok) {
+    gfx::after_present();
+    return true;
+  }
+  release_surface();
+  return false;
+}
+
+void PresentFinalTexture(const aurora::webgpu::TextureWithSampler& source) {
+  if (g_post_processing_enabled && PresentUniversalPostFx(source)) return;
+  aurora_present_texture(&source);
+}
+
 struct InterpolationBlendResources {
   wgpu::BindGroupLayout layout;
   wgpu::RenderPipeline pipeline;
   wgpu::Buffer params;
+  wgpu::BindGroupLayout motion_layout;
+  wgpu::ComputePipeline motion_pipeline;
+  wgpu::Texture flow;
+  wgpu::TextureView flow_view;
+  std::uint32_t flow_width = 0, flow_height = 0;
+  std::uint64_t flow_generation = 0;
+  wgpu::Texture history_identity;
+  unsigned mode = 1;
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
 };
 
@@ -1217,6 +2371,12 @@ bool EnsureInterpolationBlendPipeline() {
 
   resources = {};
   resources.format = format;
+  if (const char* mode = std::getenv("GEKKOAOT_INTERPOLATION_MODE")) {
+    if (EqualNoCase(mode, "blend")) resources.mode = 0;
+    else if (EqualNoCase(mode, "repeat")) resources.mode = 2;
+    else if (!EqualNoCase(mode, "motion"))
+      std::fprintf(stderr, "GEKKOAOT_INTERPOLATION_MODE invalid=%s using=motion\n", mode);
+  }
   wgpu::ShaderSourceWGSL source{};
   source.code = R"WGSL(
 struct Params { value: vec4<f32>, };
@@ -1225,6 +2385,7 @@ struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: v
 @group(0) @binding(1) var tex_sampler: sampler;
 @group(0) @binding(2) var previous_tex: texture_2d<f32>;
 @group(0) @binding(3) var current_tex: texture_2d<f32>;
+@group(0) @binding(4) var motion_tex: texture_2d<f32>;
 var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
   vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
 var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
@@ -1238,7 +2399,24 @@ var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   let a = textureSample(previous_tex, tex_sampler, in.uv);
   let b = textureSample(current_tex, tex_sampler, in.uv);
-  return vec4<f32>(mix(a.rgb, b.rgb, clamp(params.value.x, 0.0, 1.0)), 1.0);
+  let alpha = clamp(params.value.x, 0.0, 1.0);
+  if (params.value.y < 0.5) { return vec4<f32>(mix(a.rgb, b.rgb, alpha), 1.0); }
+  if (params.value.y > 1.5) { return vec4<f32>(b.rgb, 1.0); }
+  let flow = textureSample(motion_tex, tex_sampler, in.uv);
+  let delta = flow.xy / vec2<f32>(textureDimensions(current_tex));
+  let old_uv = in.uv + delta * alpha;
+  let new_uv = in.uv - delta * (1.0 - alpha);
+  let old = textureSample(previous_tex, tex_sampler, old_uv).rgb;
+  let newer = textureSample(current_tex, tex_sampler, new_uv).rgb;
+  let disagreement = dot(abs(old - newer), vec3<f32>(0.299, 0.587, 0.114));
+  // Cuts, occlusions and failed matches use the current real frame. Blending
+  // those areas would produce doubled silhouettes, text and HUD elements.
+  let outside = any(old_uv < vec2<f32>(0.0)) || any(old_uv > vec2<f32>(1.0)) ||
+                any(new_uv < vec2<f32>(0.0)) || any(new_uv > vec2<f32>(1.0));
+  if (flow.z > 0.07 || disagreement > 0.12 || outside) {
+    return vec4<f32>(b.rgb, 1.0);
+  }
+  return vec4<f32>(mix(old, newer, alpha), 1.0);
 }
 )WGSL";
   const wgpu::ShaderModuleDescriptor module_desc{.nextInChain = &source, .label = "GekkoAOT v49 interpolation shader"};
@@ -1252,6 +2430,9 @@ var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
                                  .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float,
                                                                       .viewDimension = wgpu::TextureViewDimension::e2D}},
       wgpu::BindGroupLayoutEntry{.binding = 3, .visibility = wgpu::ShaderStage::Fragment,
+                                 .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float,
+                                                                      .viewDimension = wgpu::TextureViewDimension::e2D}},
+      wgpu::BindGroupLayoutEntry{.binding = 4, .visibility = wgpu::ShaderStage::Fragment,
                                  .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float,
                                                                       .viewDimension = wgpu::TextureViewDimension::e2D}},
   };
@@ -1273,6 +2454,79 @@ var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
                                             .size = 16};
   resources.params = g_device.CreateBuffer(&params_desc);
   return resources.pipeline && resources.layout && resources.params;
+}
+
+bool PrepareMotionField(const aurora::webgpu::TextureWithSampler& previous,
+                        const aurora::webgpu::TextureWithSampler& current) {
+  using namespace aurora::webgpu;
+  auto& r = BlendResources();
+  if (previous.size.width != current.size.width ||
+      previous.size.height != current.size.height) return false;
+  const auto width = (current.size.width + 7u) / 8u;
+  const auto height = (current.size.height + 7u) / 8u;
+  if (!r.flow || r.flow_width != width || r.flow_height != height) {
+    const wgpu::TextureDescriptor desc{
+        .label = "GekkoAOT motion field",
+        .usage = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::TextureBinding,
+        .size = {width, height, 1}, .format = wgpu::TextureFormat::RGBA16Float};
+    r.flow = g_device.CreateTexture(&desc);
+    if (!r.flow) return false;
+    r.flow_view = r.flow.CreateView();
+    r.flow_width = width; r.flow_height = height;
+    r.flow_generation = 0; r.history_identity = {};
+  }
+  if (r.mode != 1) return bool(r.flow_view);
+  if (r.flow_generation == g_interp_snapshot_count && r.history_identity.Get() == current.texture.Get())
+    return true;
+  if (!r.motion_pipeline) {
+    wgpu::ShaderSourceWGSL source{};
+    source.code = GekkoAOT::GX::MotionShader;
+    const wgpu::ShaderModuleDescriptor module_desc{
+        .nextInChain = &source, .label = "GekkoAOT block motion shader"};
+    const auto module = g_device.CreateShaderModule(&module_desc);
+    const std::array entries{
+        wgpu::BindGroupLayoutEntry{.binding = 0, .visibility = wgpu::ShaderStage::Compute,
+            .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float}},
+        wgpu::BindGroupLayoutEntry{.binding = 1, .visibility = wgpu::ShaderStage::Compute,
+            .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float}},
+        wgpu::BindGroupLayoutEntry{.binding = 2, .visibility = wgpu::ShaderStage::Compute,
+            .storageTexture = wgpu::StorageTextureBindingLayout{
+                .access = wgpu::StorageTextureAccess::WriteOnly,
+                .format = wgpu::TextureFormat::RGBA16Float,
+                .viewDimension = wgpu::TextureViewDimension::e2D}},
+    };
+    const wgpu::BindGroupLayoutDescriptor layout_desc{
+        .entryCount = entries.size(), .entries = entries.data()};
+    r.motion_layout = g_device.CreateBindGroupLayout(&layout_desc);
+    const wgpu::PipelineLayoutDescriptor pipeline_layout_desc{
+        .bindGroupLayoutCount = 1, .bindGroupLayouts = &r.motion_layout};
+    const auto layout = g_device.CreatePipelineLayout(&pipeline_layout_desc);
+    const wgpu::ComputePipelineDescriptor pipeline_desc{
+        .label = "GekkoAOT bounded block motion", .layout = layout,
+        .compute = {.module = module, .entryPoint = "motion"}};
+    r.motion_pipeline = g_device.CreateComputePipeline(&pipeline_desc);
+    std::fprintf(stderr,
+        "GEKKOAOT_INTERPOLATION_MOTION=1 grid=8 search=16+3 cache=per-produced-frame unreliable=current-frame\n");
+  }
+  if (!r.motion_pipeline || !r.motion_layout || !r.flow_view) return false;
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .textureView = previous.view},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = current.view},
+      wgpu::BindGroupEntry{.binding = 2, .textureView = r.flow_view},
+  };
+  const wgpu::BindGroupDescriptor group_desc{
+      .layout = r.motion_layout, .entryCount = entries.size(), .entries = entries.data()};
+  const auto group = g_device.CreateBindGroup(&group_desc);
+  auto encoder = g_device.CreateCommandEncoder();
+  auto pass = encoder.BeginComputePass();
+  pass.SetPipeline(r.motion_pipeline); pass.SetBindGroup(0, group);
+  pass.DispatchWorkgroups((width + 7u) / 8u, (height + 7u) / 8u);
+  pass.End();
+  const auto command = encoder.Finish();
+  g_queue.Submit(1, &command);
+  r.flow_generation = g_interp_snapshot_count;
+  r.history_identity = current.texture;
+  return true;
 }
 
 bool PresentInterpolationBlend(const aurora::webgpu::TextureWithSampler& previous,
@@ -1300,6 +2554,7 @@ bool PresentInterpolationBlend(const aurora::webgpu::TextureWithSampler& previou
   }
 
   if (!EnsureInterpolationBlendPipeline() || !window::is_presentable()) return false;
+  if (!PrepareMotionField(previous, current)) return false;
   if (!g_surface && !refresh_surface(true)) return false;
   if (!g_surface) return false;
 
@@ -1318,13 +2573,14 @@ bool PresentInterpolationBlend(const aurora::webgpu::TextureWithSampler& previou
   if (!swap_view) return false;
 
   auto& resources = BlendResources();
-  const std::array<float, 4> params{alpha, 0.0f, 0.0f, 0.0f};
+  const std::array<float, 4> params{alpha, float(resources.mode), 0.0f, 0.0f};
   g_queue.WriteBuffer(resources.params, 0, params.data(), sizeof(params));
   const std::array bind_entries{
       wgpu::BindGroupEntry{.binding = 0, .buffer = resources.params, .size = 16},
       wgpu::BindGroupEntry{.binding = 1, .sampler = current.sampler},
       wgpu::BindGroupEntry{.binding = 2, .textureView = previous.view},
       wgpu::BindGroupEntry{.binding = 3, .textureView = current.view},
+      wgpu::BindGroupEntry{.binding = 4, .textureView = resources.flow_view},
   };
   const wgpu::BindGroupDescriptor bind_desc{.layout = resources.layout, .entryCount = bind_entries.size(),
                                              .entries = bind_entries.data()};
@@ -1462,13 +2718,107 @@ bool SnapshotInterpolationFrame(const aurora::webgpu::TextureWithSampler& source
   return g_interp_previous_valid;
 }
 
+void ObservePerspectiveCamera() {
+  using namespace aurora::gx;
+  if (g_gxState.projType != GX_PERSPECTIVE || aurora::gfx::is_offscreen()) return;
+  const auto& proj = g_gxState.proj;
+  const auto& view = g_gxState.logicalViewport;
+  if (!(view.width > 0.f) || !(view.height > 0.f)) return;
+  if (g_camera_area_epoch != g_display_copy_count) {
+    g_camera_area_epoch = g_display_copy_count;
+    g_camera_best_area = 0.f;
+  }
+  const float area = view.width * view.height;
+  if (!std::isfinite(area) || area < g_camera_best_area) return;
+  const std::array coefficients{proj.m0[0], proj.m1[1], view.width, view.height};
+  if (coefficients != g_camera_coefficients || g_camera_cached_signature == 0u) {
+    const float vertical = std::fabs(proj.m1[1]);
+    if (!std::isfinite(vertical) || vertical < 0.00001f) return;
+    const float fov = 2.f * std::atan(1.f / vertical) * 57.29577951308232f;
+    const float aspect = GekkoAOT::GX::ProjectionAspect(
+        proj.m0[0], proj.m1[1], view.width, view.height);
+    if (!std::isfinite(fov) || fov < 20.f || fov > 150.f ||
+        !std::isfinite(aspect) || aspect < .5f || aspect > 5.f) return;
+    std::uint32_t fov_bits=0, aspect_bits=0;
+    std::memcpy(&fov_bits,&fov,sizeof(fov));
+    std::memcpy(&aspect_bits,&aspect,sizeof(aspect));
+    g_camera_cached_signature = (std::uint64_t(fov_bits)<<32u)|aspect_bits;
+    g_camera_coefficients = coefficients;
+  }
+  if (g_camera_published_signature != g_camera_cached_signature ||
+      g_camera_published_copy != g_display_copy_count) {
+    g_camera_signature.store(g_camera_cached_signature,std::memory_order_relaxed);
+    g_camera_observed_copy.store(g_display_copy_count,std::memory_order_release);
+    g_camera_published_signature = g_camera_cached_signature;
+    g_camera_published_copy = g_display_copy_count;
+  }
+  g_camera_best_area = area;
+}
+
+// v300 GEKKOAOT_RUNTIME_PROFILE: averaged Aurora work per display copy, read
+// from the stats of the last frame the render worker submitted.
+void ReportAuroraFrameStats() {
+  static const bool enabled = EnvBool("GEKKOAOT_RUNTIME_PROFILE", false);
+  if (!enabled) return;
+  static std::uint64_t frames = 0u, draws = 0u, merged = 0u, verts = 0u, uniforms = 0u,
+                       indices = 0u, storage = 0u, uploads = 0u;
+  const AuroraStats* stats = aurora_get_stats();
+  if (!stats) return;
+  ++frames;
+  draws += stats->drawCallCount;
+  merged += stats->mergedDrawCallCount;
+  verts += stats->lastVertSize;
+  uniforms += stats->lastUniformSize;
+  indices += stats->lastIndexSize;
+  storage += stats->lastStorageSize;
+  uploads += stats->lastTextureUploadSize;
+  if (frames < 120u) return;
+  ReportDrawCensus();
+  std::fprintf(stderr, "GEKKOAOT_XFB_DEAD_COPIES_V320=1 copies=%llu unpresented_overwrites=%llu\n",
+               static_cast<unsigned long long>(frames),
+               static_cast<unsigned long long>(std::exchange(g_xfb_unpresented_overwrites, 0u)));
+  if(g_native_vertex_program)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_VERTEX_V315_STATS draws=%llu vertices=%llu\n",
+      static_cast<unsigned long long>(g_native_vertex_draws),
+      static_cast<unsigned long long>(g_native_vertex_vertices));
+  if(g_typed_arrays)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_TYPED_COMMANDS_V313_STATS arrays=%llu fallback=%llu declined=%llu\n",
+      static_cast<unsigned long long>(g_native_commands.NativeCalls()-g_native_commands.MatrixCalls()),
+      static_cast<unsigned long long>(g_native_commands.FallbackCalls()),
+      static_cast<unsigned long long>(g_native_commands.DeclinedHints()));
+  if(g_direct_matrices)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_DIRECT_MATRICES_V317_STATS matrices=%llu fallback=%llu\n",
+      static_cast<unsigned long long>(g_native_commands.MatrixCalls()),
+      static_cast<unsigned long long>(g_native_commands.FallbackCalls()));
+  std::fprintf(stderr,
+               "GEKKOAOT_AURORA_FRAME_V300=1 copies=%llu draws=%llu merged=%llu vert_kb=%.1f "
+               "uniform_kb=%.1f index_kb=%.1f storage_kb=%.1f texture_kb=%.1f (per copy)\n",
+               static_cast<unsigned long long>(frames),
+               static_cast<unsigned long long>(draws / frames),
+               static_cast<unsigned long long>(merged / frames), verts / 1024.0 / frames,
+               uniforms / 1024.0 / frames, indices / 1024.0 / frames,
+               storage / 1024.0 / frames, uploads / 1024.0 / frames);
+  frames = draws = merged = verts = uniforms = indices = storage = uploads = 0u;
+}
+
 bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
   using namespace aurora;
   using namespace aurora::gx;
   using namespace aurora::webgpu;
 
+  // phys=0 is a valid MEM1-backed GXCopyDisp destination. Keep the Aurora
+  // snapshot: VI may later select BOTTOM=0x500, i.e. row 1 of this zero-based
+  // XFB. Do not early-return here.
+  if (g_copy_dest_valid && g_gxState.texCopyDest &&
+      g_copy_dest_physical == 0u && g_frame_open) {
+    static unsigned zero_base_logs = 0u;
+    if (zero_base_logs++ < 16u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_NATIVE_XFB_ZERO_BASE_V202=1 action=cache-and-present-via-vi-offset\n");
+  }
+
   if (!g_copy_src_valid || !g_copy_dest_valid || !g_gxState.texCopyDest ||
-      g_copy_dest_physical == 0u || !g_frame_open) {
+      !g_frame_open) {
     std::fprintf(stderr,
                  "GEKKOAOT_NATIVE_XFB_CACHE_V12=0 src=%u dest=%u phys=%08x frame=%u action=fail-closed\n",
                  g_copy_src_valid ? 1u : 0u, g_copy_dest_valid ? 1u : 0u,
@@ -1525,6 +2875,7 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
       .sampler = g_frameBuffer.sampler,
   };
   slot->resolved = {};
+  if (slot->valid && slot->presented_generation != slot->generation) ++g_xfb_unpresented_overwrites;
   slot->address = g_copy_dest_physical;
   slot->stride_bytes = g_copy_stride_bytes != 0u ? g_copy_stride_bytes : copy_width * 2u;
   slot->native_width = copy_width;
@@ -1533,11 +2884,73 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
   slot->generation = ++g_xfb_generation;
   slot->valid = true;
 
-  // v110: GXCopyDisp is the producer boundary.  Submit the EFB->XFB resolve
-  // here, exactly once, rather than cutting Aurora's live EFB recorder from a
-  // later VI/host scanout.  VI may scan the same XFB more than once (fields,
-  // retraces, host scheduler collapse); those scanouts must be read-only.
+  // A GXCopyDisp(clear=1) can clear only selected PE attachments/channels.
+  // Preserve only what the guest explicitly left untouched.  In particular:
+  //   - MOH Frontline depth-only clear: LOAD color, CLEAR depth.
+  //   - T3 masked clear: LOAD whichever attachment must survive the boundary.
+  //   - full clear: no LOAD is needed.
+  //
+  // This keeps GXCopyDisp as a hard host-frame boundary, preventing the v176
+  // runaway-frame/index-cap failure seen on HPCOS.
+  const bool efb_has_alpha = g_gxState.pixelFmt == GX_PF_RGBA6_Z24;
+  const bool guest_clears_color = clear && g_gxState.colorUpdate;
+  const bool guest_clears_alpha = clear && g_gxState.alphaUpdate && efb_has_alpha;
+  const bool guest_clears_depth = clear && g_gxState.depthUpdate;
+
+  const bool preserve_color =
+      clear && (!guest_clears_color || (efb_has_alpha && !guest_clears_alpha));
+  const bool preserve_depth = clear && !guest_clears_depth;
+  const bool masked_clear = clear && (preserve_color || preserve_depth);
+
+  // Keep the old v176 behavior only as an explicit A/B switch. It is no longer
+  // safe as the default because it can let a logical Aurora frame grow without
+  // bound when a title emits many partial GXCopyDisp clears.
+  const bool keep_recording_open =
+      g_partial_clear_copy_continuation && masked_clear;
+
+  if (g_display_copy_state_logs++ < 128u) {
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_XFB_COPY_STATE_SELECTIVE_V1 copy=%llu xfb=%08x src=%d,%d %dx%d lines=%u stride=%u clear=%u color_update=%u alpha_update=%u depth_update=%u masked=%u preserve_color=%u preserve_depth=%u keep_open=%u global_load=%u\n",
+                 static_cast<unsigned long long>(g_display_copy_count),
+                 g_copy_dest_physical, g_gxState.texCopySrc.x, g_gxState.texCopySrc.y,
+                 g_gxState.texCopySrc.width, g_gxState.texCopySrc.height, copy_height,
+                 g_copy_stride_bytes, clear ? 1u : 0u,
+                 g_gxState.colorUpdate ? 1u : 0u,
+                 g_gxState.alphaUpdate ? 1u : 0u,
+                 g_gxState.depthUpdate ? 1u : 0u,
+                 masked_clear ? 1u : 0u,
+                 preserve_color ? 1u : 0u,
+                 preserve_depth ? 1u : 0u,
+                 keep_recording_open ? 1u : 0u,
+                 g_efb_boundary_continuity ? 1u : 0u);
+  }
+
+  if (keep_recording_open) {
+    if (g_partial_clear_copy_logs++ < 64u) {
+      std::fprintf(stderr,
+                   "GEKKOAOT_NATIVE_XFB_PARTIAL_CLEAR_V176_LEGACY event=masked-clear copy=%llu xfb=%08x action=keep-aurora-frame-open\n",
+                   static_cast<unsigned long long>(g_display_copy_count),
+                   g_copy_dest_physical);
+    }
+    return true;
+  }
+
+  // A copy without clear keeps both EFB attachments alive, even across our
+  // bounded host-frame boundary. Retail splash/loading renderers draw once
+  // and issue more display copies or overlay draws afterwards.
+  if (g_masked_clear_efb_continuity && (masked_clear || !clear)) {
+    aurora::gfx::gekkoaot_preserve_efb_on_next_begin(!clear || preserve_color, !clear || preserve_depth);
+  } else if (g_efb_boundary_continuity) {
+    // Diagnostic compatibility mode matching the old v177 all-attachment LOAD.
+    aurora::gfx::gekkoaot_preserve_efb_on_next_begin(true, true);
+  }
+
+  // v110 + selective EFB continuity: every GXCopyDisp remains a bounded
+  // producer boundary. The next recording only LOADs attachments which must
+  // survive a masked guest clear.
+  // VI/host scanout remains read-only.
   aurora_end_frame_no_present();
+  ReportAuroraFrameStats();
   CaptureFrameBoundary();
   g_frame_open = false;
   if (g_array_frame_refresh) RefreshIndexedArraySnapshots();
@@ -1561,8 +2974,7 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
   }
   if (!g_quit && aurora_begin_frame()) g_frame_open = true;
 
-  g_frame_ready_xfb = g_copy_dest_physical;
-  g_frame_ready_pending = true;
+  g_frame_ready_xfb.store(g_copy_dest_physical, std::memory_order_release);
 
   const unsigned frame_to_field = static_cast<unsigned>((trigger_word >> 12u) & 3u);
   static unsigned logs = 0;
@@ -1820,7 +3232,7 @@ bool PresentRamXfb(std::uint32_t top, std::uint32_t bottom,
   // The following presentation is enqueued after this queue write.
   aurora::webgpu::g_queue.WriteTexture(&destination, g_ram_xfb_rgba.data(),
                                         rgba_bytes, &layout, &upload_size);
-  aurora_present_texture(&g_ram_xfb_present);
+  PresentFinalTexture(g_ram_xfb_present);
 
   ++g_ram_xfb_generation;
   static unsigned logs = 0u;
@@ -1841,24 +3253,37 @@ bool PresentRamXfb(std::uint32_t top, std::uint32_t bottom,
 
 void PresentViXfb(std::uint32_t top, std::uint32_t bottom, bool address_keyed,
                   std::uint32_t width = 0u, std::uint32_t stride_bytes = 0u,
-                  std::uint32_t field_height = 0u) {
+                  std::uint32_t field_height = 0u, bool poll_events = true) {
   if (!g_ready) return;
+  FlushEfbPokes();
   DrainFifo();
-  PollEvents();
+  // v300: the GX worker runs ordered scanouts; SDL events stay on the host
+  // thread that owns the window (gekkoaot_native_gx_should_quit).
+  if (poll_events) PollEvents();
+
+  // Interlaced VI can expose TOP=0/BOTTOM=0x500 for an XFB whose base is
+  // physical zero. Use whichever field origin is non-zero for the cache lookup.
+  const std::uint32_t scanout_address = top != 0u ? top : bottom;
 
   std::uint32_t byte_offset = 0u;
   XfbZeroCopySlot* slot =
-      address_keyed && top != 0u ? FindXfbSlotForScanout(top, &byte_offset) : nullptr;
+      address_keyed && scanout_address != 0u
+          ? FindXfbSlotForScanout(scanout_address, &byte_offset)
+          : nullptr;
   const auto* source = slot ? XfbPresentSource(*slot) : nullptr;
 
-  if (address_keyed && top != 0u) {
+  if (address_keyed && scanout_address != 0u) {
     if (source == nullptr) {
-      if (PresentRamXfb(top, bottom, width, stride_bytes, field_height)) return;
+      aurora::gfx::render_worker::enqueue_work([] { g_cached_scanout.Reset(); });
+      if (PresentRamXfb(scanout_address,
+                        bottom != 0u ? bottom : scanout_address,
+                        width, stride_bytes, field_height))
+        return;
       static unsigned misses = 0;
       if (misses++ < 32u)
         std::fprintf(stderr,
-                     "GEKKOAOT_NATIVE_XFB_SCANOUT_V12=0 top=%08x bottom=%08x reason=xfb-not-cached action=hold-last-scanout ram_fallback=failed\n",
-                     top, bottom);
+                     "GEKKOAOT_NATIVE_XFB_SCANOUT_V202=0 request=%08x top=%08x bottom=%08x reason=xfb-not-cached action=hold-last-scanout ram_fallback=failed\n",
+                     scanout_address, top, bottom);
       return;
     }
 
@@ -1866,21 +3291,44 @@ void PresentViXfb(std::uint32_t top, std::uint32_t bottom, bool address_keyed,
     // this immutable XFB was already submitted at GXCopyDisp.  Never end or
     // restart the live EFB here: VI can legally scan the same generation on
     // multiple field/retrace boundaries.
-    aurora_present_texture(source);
+    // VI keeps observing RAM scanout and field changes independently of GX
+    // production. Avoid GPU work only for the same immutable GX snapshot and
+    // the same host view. Resize/aspect/resume must redraw even a static image.
+    if (!aurora::window::is_presentable()) {
+      aurora::gfx::render_worker::enqueue_work([] { g_cached_scanout.Reset(); });
+      return;
+    }
+    const auto window_size = aurora::window::get_window_size();
+    const GekkoAOT::GX::CachedScanoutKey scanout{
+        reinterpret_cast<std::uintptr_t>(source->texture.Get()), slot->generation,
+        top, bottom, window_size.native_fb_width, window_size.native_fb_height,
+        g_aspect_mode.load(std::memory_order_acquire)};
+    // Cache state belongs exclusively to the render worker. A failed surface
+    // acquisition/present is retried at the next VI field; only success allows
+    // deduplication. This preserves pipelining without a new CPU/GPU wait.
+    slot->presented_generation = slot->generation;
+    aurora::gfx::render_worker::enqueue_work([retained = *source, scanout] {
+      if (g_cached_scanout.Duplicate(scanout)) return;
+      const auto before = aurora::gfx::presentation_count();
+      PresentFinalTexture(retained);
+      if (aurora::gfx::presentation_count() != before)
+        g_cached_scanout.Queued(scanout);
+    });
 
     const std::uint32_t row_offset =
         slot->stride_bytes != 0u ? byte_offset / slot->stride_bytes : 0u;
     static unsigned logs = 0;
     if (logs++ < 64u)
       std::fprintf(stderr,
-                   "GEKKOAOT_NATIVE_XFB_SCANOUT_V12=1 request=%08x top=%08x bottom=%08x base=%08x offset=%u row=%u native=%ux%u stride=%u generation=%llu source=vi-selected-aurora-xfb-cache\n",
-                   top, top, bottom, slot->address, byte_offset, row_offset,
+                   "GEKKOAOT_NATIVE_XFB_SCANOUT_V202=1 request=%08x top=%08x bottom=%08x base=%08x offset=%u row=%u native=%ux%u stride=%u generation=%llu source=vi-selected-aurora-xfb-cache\n",
+                   scanout_address, top, bottom, slot->address, byte_offset, row_offset,
                    slot->native_width, slot->native_height, slot->stride_bytes,
                    static_cast<unsigned long long>(slot->generation));
     return;
   }
 
   // Legacy/boot path only, before VI has supplied a non-zero XFB address.
+  aurora::gfx::render_worker::enqueue_work([] { g_cached_scanout.Reset(); });
   if (g_frame_open) {
     aurora_end_frame();
     g_frame_open = false;
@@ -1924,6 +3372,8 @@ void MapTextureImage3(std::uint8_t reg, std::uint32_t word) {
     // classic "bad VRAM/overclock" corruption pattern across otherwise valid
     // draws. Fail closed and force a fresh bind when a later address resolves.
     g_texture_image3_valid=static_cast<std::uint8_t>(g_texture_image3_valid & ~bit);
+    g_texture_ui_source_hash_valid =
+        static_cast<std::uint8_t>(g_texture_ui_source_hash_valid & ~bit);
     slot.data=nullptr;
     slot.texDataVersion=static_cast<std::uint32_t>(++g_texture_generation);
     g_gxState.dirty |= DirtyTextures;
@@ -1937,7 +3387,7 @@ void MapTextureImage3(std::uint8_t reg, std::uint32_t word) {
   }
 
   static unsigned video_logs=0;
-  if(EnvBool("GEKKOAOT_TRACE_VIDEO",false) && video_logs++<256u) {
+  if(g_trace_video && video_logs++<256u) {
     const auto* bytes=static_cast<const std::uint8_t*>(ptr);
     std::uint64_t hash=1469598103934665603ull;
     for(unsigned i=0;i<required;++i) hash=(hash^bytes[i])*1099511628211ull;
@@ -1952,7 +3402,47 @@ void MapTextureImage3(std::uint8_t reg, std::uint32_t word) {
   const bool stable_bind=(g_texture_image3_valid&bit)!=0u &&
                          g_texture_mapped_image0[map]==slot.image0 &&
                          g_texture_mapped_mips[map]==slot.mip_count() && slot.data==ptr;
-  if(stable_bind && g_texture_bind_cache) return;
+  // v174: small intensity/alpha and CI textures are the formats commonly used
+  // by retail bitmap-font atlases. Terminator 3 rewrites some of those atlases
+  // in place while retaining IMAGE3, so a pointer-only stable-bind cache misses
+  // the mutation. v170 fixed that by versioning *every* such rebind, which also
+  // turns Monkey Ball's bitmap-heavy UI into constant texture churn. Hash these
+  // source bytes only on the low-bit stable-bind path and invalidate when their
+  // contents actually changed. Normal material formats keep the zero-hash fast
+  // path, while T3 still observes real in-place font updates.
+  const auto source_format=slot.format();
+  const bool font_ui_format=
+      source_format==GX_TF_I4 || source_format==GX_TF_I8 ||
+      source_format==GX_TF_IA4 || source_format==GX_TF_IA8 ||
+      source_format==GX_TF_C4 || source_format==GX_TF_C8 ||
+      source_format==GX_TF_C14X2;
+  bool font_ui_changed=false;
+  // v34: only hash low-bit/font/video textures when IMAGE3 is actually a
+  // stable rebind.  The old v174 code hashed every I4/I8/IA/CI IMAGE3 write,
+  // including ordinary texture switches and the three I8 Y/U/V planes used by
+  // retail video paths.  That made MapTextureImage3 itself a double-digit CPU
+  // hotspot.  A non-stable bind already bumps texDataVersion and uploads the
+  // new source, so hashing it cannot improve coherency.  On the first stable
+  // rebind we establish a baseline; later stable rebinds still detect genuine
+  // in-place bitmap/font mutations exactly as v174 intended.
+  const bool paranoid_texture_hash=g_paranoid_texture_hash;
+  if(font_ui_format && (stable_bind || paranoid_texture_hash)) {
+    const auto* bytes=static_cast<const std::uint8_t*>(ptr);
+    std::uint64_t hash=1469598103934665603ull;
+    for(std::uint32_t i=0;i<required;++i) hash=(hash^bytes[i])*1099511628211ull;
+    const bool had_hash=(g_texture_ui_source_hash_valid&bit)!=0u;
+    font_ui_changed=had_hash && g_texture_ui_source_hash[map]!=hash;
+    g_texture_ui_source_hash[map]=hash;
+    g_texture_ui_source_hash_valid=
+        static_cast<std::uint8_t>(g_texture_ui_source_hash_valid|bit);
+  } else if(font_ui_format) {
+    // The pointer/descriptor changed, so the previous map hash belongs to a
+    // different texture identity.  Avoid comparing it against the first stable
+    // rebind of the new source.
+    g_texture_ui_source_hash_valid=
+        static_cast<std::uint8_t>(g_texture_ui_source_hash_valid&~bit);
+  }
+  if(stable_bind && g_texture_bind_cache && (!font_ui_format || !font_ui_changed)) return;
 
   g_texture_mapped_image0[map] = slot.image0;
   g_texture_mapped_mips[map] = slot.mip_count();
@@ -1964,7 +3454,12 @@ void MapTextureImage3(std::uint8_t reg, std::uint32_t word) {
   // several GiB in minutes. texDataVersion is the mutation/version signal; the
   // object ID is identity, not a generation counter.
   slot.texObjId=static_cast<std::uint32_t>(map+1u);
-  slot.texDataVersion=static_cast<std::uint32_t>(++g_texture_generation);
+  const auto generation=static_cast<std::uint32_t>(++g_texture_generation);
+  // Font/CI sources keep a fresh version per rebind (v174 in-place updates).
+  slot.texDataVersion=font_ui_format ? generation :
+      BindTextureSourceVersion(guest,slot.image0,static_cast<std::uint8_t>(slot.mip_count()),
+                               required,generation);
+  if(g_draw_census) { ++g_tex_census_binds; g_tex_census_bind_bytes+=required; }
   slot.flags &= ~0x80u;
   g_gxState.dirty |= DirtyTextures;
 }
@@ -2001,11 +3496,12 @@ void MapTlut() {
   const bool copied=valid && g_tlut_memory.Load(trigger,
       {static_cast<const std::uint8_t*>(ptr),valid ? required : 0u});
   static unsigned logs=0;
-  if(EnvBool("GEKKOAOT_TRACE_FONT",false) && logs++<128u)
+  if(g_trace_font && logs++<128u)
     std::fprintf(stderr,"GEKKOAOT_TRACE_FONT event=tlut-load guest=%08x tmem=%05x bytes=%u success=%u revision=%llu\n",
                  guest,GekkoAOT::GX::TlutMemory::Offset(trigger),required,copied?1u:0u,
                  static_cast<unsigned long long>(g_tlut_memory.Revision()));
   if(!copied) { g_fifo_fault=true; g_quit=true; }
+  else g_tlut_binding_scan_dirty=true;
 }
 
 void BindRawTluts() {
@@ -2038,25 +3534,29 @@ void BindRawTluts() {
 
 void InvalidateTextureCacheV87() {
   using namespace aurora::gx;
-  // BP 0x66 is the retail GX texture-cache invalidate command. Pinned Aurora
-  // currently treats it as an unhandled BP register, which lets converted host
-  // textures survive after the guest explicitly invalidated TMEM. Preserve
-  // object identity but advance every bound source generation and invalidate
-  // bind groups so the next draw re-reads guest memory.
-  unsigned bound=0;
+  // v237: direct/uncached guest stores can mutate MEM1 without a dcbst/dcbf
+  // publication callback. Invalidating TMEM must therefore make the next
+  // sampled static texture check its source again. Otherwise Bink movies
+  // retain their initial black frame. Coalesce the SDK's paired BP66 pulses
+  // until the next draw; Aurora reuses its content cache if bytes are equal.
+  // GPU-owned EFB copy textures retain their separate copy-texture identity.
+  unsigned bound=0u;
   for(unsigned map=0;map<MaxTextures;++map) {
-    auto& slot=g_gxState.loadedTextures[map];
-    if(slot.data) ++bound;
-    slot.texDataVersion=static_cast<std::uint32_t>(++g_texture_generation);
+    auto& texture=g_gxState.loadedTextures[map];
+    if(!texture.data) continue;
+    ++bound;
   }
-  g_texture_image3_valid=0;
-  aurora::gx::texture::invalidate_bindings();
+  if(g_invalidate_texture_sources) g_texture_source_invalidation_pending=true;
+  ++g_texture_cache_only_invalidations;
+  if(g_draw_census) ++g_tex_census_bp66;
+  ForgetTextureSourceVersions();
+  texture::invalidate_bindings();
   g_gxState.dirty |= DirtyTextures;
   static unsigned logs=0;
   if(logs++<64u)
     std::fprintf(stderr,
-                 "GEKKOAOT_NATIVE_GX_TEX_INVALIDATE_V87=1 reg=66 bound=%u generation=%llu policy=guest-command\n",
-                 bound,static_cast<unsigned long long>(g_texture_generation));
+                 "GEKKOAOT_NATIVE_GX_TEX_INVALIDATE_V237=1 reg=66 bound=%u source_recheck=%u policy=coalesce-until-draw\n",
+                 bound,g_invalidate_texture_sources?1u:0u);
 }
 
 enum class DecodeResult : std::uint8_t { Complete, Incomplete, Invalid };
@@ -2091,9 +3591,163 @@ DecodeResult CommandLength(const std::uint8_t* p, std::size_t n,
 }
 
 bool ProcessSpan(const std::uint8_t* data, std::size_t bytes, unsigned depth);
+bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth);
+
+// v320: draw-run coalescing. Retail engines (HPCOS: ~1.5M draws/s, 78% with
+// <=4 vertices, 95% directly following the previous draw) emit long runs of
+// tiny identical-format draws with no command in between. GX state cannot
+// change inside such a run, so one draw over the concatenated vertices is
+// equivalent: list primitives are concatenated, strips/fans become triangle
+// lists using exactly Aurora's own vertex order (same winding/culling and
+// rasterization order). The merged draw then needs one array window, one
+// upload and one recorded/encoded draw instead of one per GXBegin.
+// v323: members only need the same vertex format. A run of one list primitive
+// (quads or triangles) stays that primitive and is a plain concatenation; any
+// strip/fan member or a mix of primitives becomes one triangle list, using
+// Aurora's prepare_idx_buffer order for every source primitive (quads as
+// (0,1,2)(2,3,0)), so winding, culling and rasterization order are unchanged.
+// Strips/fans are expanded vertex by vertex, which only pays for small ones;
+// list members are copied as one block and may be larger.
+constexpr std::uint32_t kDrawRunExpandMax = 64u;
+constexpr std::uint32_t kDrawRunListMax = 256u;
+constexpr std::uint32_t kDrawRunMaxVertices = 16384u;
+bool g_draw_runs = true;
+std::vector<std::uint8_t> g_draw_run_buffer;
+
+std::uint32_t DrawRunTriangleVertices(std::uint8_t op, std::uint32_t count) {
+  switch (op) {
+  case GX_QUADS: return count / 4u * 6u;
+  case GX_TRIANGLESTRIP:
+  case GX_TRIANGLEFAN: return 3u * (count - 2u);
+  default: return count;
+  }
+}
+bool DrawRunMember(std::uint8_t op, std::uint32_t count) {
+  if (count == 0u) return false;
+  switch (op) {
+  case GX_QUADS: return count <= kDrawRunListMax && count % 4u == 0u;
+  case GX_TRIANGLES: return count <= kDrawRunListMax && count % 3u == 0u;
+  case GX_TRIANGLESTRIP:
+  case GX_TRIANGLEFAN: return count >= 3u && count <= kDrawRunExpandMax;
+  default: return false;  // lines/points keep Aurora's dedicated paths
+  }
+}
+bool DrawRunStateAllows() {
+  using namespace aurora::gx;
+  const auto& state = g_gxState;
+  // A lone 4/6-vertex orthographic draw may be a screen fill whose
+  // classification feeds uniforms; never fold one into a larger draw.
+  return !(state.projType == GX_ORTHOGRAPHIC && state.numTexGens == 1u &&
+           state.numTevStages <= 2u && state.blendMode == GX_BM_NONE);
+}
+// Copy one vertex of a run member. Strides are small and vary per VAT, so a
+// libc memcpy call per expanded vertex dominated the run assembly; two
+// overlapping fixed-size moves cover every stride from 4 to 64 bytes.
+inline void CopyRunVertex(std::uint8_t* dst, const std::uint8_t* src, std::uint32_t stride) {
+  const auto pair = [&]<std::size_t N>() {
+    std::uint8_t head[N], tail[N];
+    std::memcpy(head, src, N);
+    std::memcpy(tail, src + stride - N, N);
+    std::memcpy(dst, head, N);
+    std::memcpy(dst + stride - N, tail, N);
+  };
+  if (stride >= 32u && stride <= 64u) pair.template operator()<32>();
+  else if (stride >= 16u && stride < 32u) pair.template operator()<16>();
+  else if (stride >= 8u && stride < 16u) pair.template operator()<8>();
+  else if (stride >= 4u && stride < 8u) pair.template operator()<4>();
+  else std::memcpy(dst, src, stride);
+}
+bool IsDrawCommand(std::uint8_t cmd) {
+  const std::uint8_t op = cmd & GX_OPCODE_MASK;
+  return op >= 0x80u && op <= 0xB8u;
+}
+
+// Process the framed command at data[0..len); if it starts a run of small
+// draws in the same vertex format, consume the whole run (bounded by
+// `available`). Same failure contract as ProcessOne.
+bool ProcessCommandOrRun(const std::uint8_t* data, std::size_t available, std::size_t len,
+                         unsigned depth, std::size_t* consumed) {
+  *consumed = len;
+  const std::uint8_t cmd = data[0], op = cmd & GX_OPCODE_MASK;
+  if (!g_draw_runs || !IsDrawCommand(cmd) || len < 3u || len + 3u > available ||
+      !IsDrawCommand(data[len]))
+    return ProcessOne(data, len, depth);
+  const std::uint8_t vat = cmd & GX_VAT_MASK;
+  const std::uint32_t first = Be16(data + 1);
+  const auto miss = [&](unsigned reason) {
+    if (g_draw_census) ++g_draw_run_misses[reason];
+    return ProcessOne(data, len, depth);
+  };
+  if ((data[len] & GX_VAT_MASK) != vat) return miss(0u);
+  if (op == GX_LINES || op == GX_LINESTRIP || op == GX_POINTS) return miss(3u);
+  if (!DrawRunMember(op, first)) return miss(1u);
+  if (!DrawRunStateAllows()) return miss(2u);
+  const auto fmt = static_cast<GXVtxFmt>(vat);
+  const std::uint32_t stride = VertexSize(fmt);
+  if (stride == 0u || len != 3u + std::size_t(first) * stride) return ProcessOne(data, len, depth);
+  std::size_t end = len;
+  std::uint32_t members = 1u, triangles = DrawRunTriangleVertices(op, first), list = first;
+  bool mixed = false;
+  while (end + 3u <= available && IsDrawCommand(data[end]) &&
+         (data[end] & GX_VAT_MASK) == vat) {
+    const std::uint8_t member_op = data[end] & GX_OPCODE_MASK;
+    const std::uint32_t count = Be16(data + end + 1);
+    const std::size_t bytes = 3u + std::size_t(count) * stride;
+    if (!DrawRunMember(member_op, count) || end + bytes > available) break;
+    const std::uint32_t expanded = DrawRunTriangleVertices(member_op, count);
+    if (triangles + expanded > kDrawRunMaxVertices) break;
+    mixed |= member_op != op;
+    triangles += expanded;
+    list += count;
+    end += bytes;
+    ++members;
+  }
+  if (members == 1u) return miss(1u);
+
+  const bool keep_list = !mixed && (op == GX_QUADS || op == GX_TRIANGLES);
+  const std::uint32_t total = keep_list ? list : triangles;
+  auto& out = g_draw_run_buffer;
+  out.resize(3u + std::size_t(total) * stride);
+  out[0] = keep_list ? cmd : static_cast<std::uint8_t>(GX_TRIANGLES | vat);
+  out[1] = static_cast<std::uint8_t>(total >> 8u);
+  out[2] = static_cast<std::uint8_t>(total);
+  std::uint8_t* dst = out.data() + 3u;
+  for (std::size_t at = 0u; at < end;) {
+    const std::uint8_t member_op = data[at] & GX_OPCODE_MASK;
+    const std::uint32_t count = Be16(data + at + 1);
+    const std::uint8_t* v = data + at + 3u;
+    const auto put = [&](std::uint32_t index) {
+      CopyRunVertex(dst, v + std::size_t(index) * stride, stride);
+      dst += stride;
+    };
+    if (keep_list || member_op == GX_TRIANGLES) {
+      std::memcpy(dst, v, std::size_t(count) * stride);
+      dst += std::size_t(count) * stride;
+    } else if (member_op == GX_QUADS) {
+      // Identical to aurora::gx::prepare_idx_buffer's quad expansion.
+      for (std::uint32_t q = 0u; q < count; q += 4u) {
+        put(q); put(q + 1u); put(q + 2u);
+        put(q + 2u); put(q + 3u); put(q);
+      }
+    } else {
+      for (std::uint32_t i = 2u; i < count; ++i) {
+        // Identical to aurora::gx::prepare_idx_buffer's strip/fan expansion.
+        if (member_op == GX_TRIANGLEFAN) { put(0u); put(i - 1u); put(i); }
+        else if (i == 2u || (i & 1u) == 0u) { put(i - 2u); put(i - 1u); put(i); }
+        else { put(i - 1u); put(i - 2u); put(i); }
+      }
+    }
+    at += 3u + std::size_t(count) * stride;
+  }
+  *consumed = end;
+  ++g_draw_run_runs;
+  g_draw_run_members += members;
+  return ProcessOne(out.data(), out.size(), depth);
+}
 
 void RememberFifoWrite(std::uint64_t value, std::uint8_t size, std::uint64_t stream_offset,
                        std::uint32_t guest_pc) {
+  if(!g_fifo_forensic_trace) return;
   g_fifo_write_trace[g_fifo_write_trace_head] = {value, stream_offset, guest_pc, size};
   static_assert((g_fifo_write_trace.size() & (g_fifo_write_trace.size() - 1u)) == 0u);
   g_fifo_write_trace_head =
@@ -2103,10 +3757,6 @@ void RememberFifoWrite(std::uint64_t value, std::uint8_t size, std::uint64_t str
 
 void RememberDecodedCommand(const std::uint8_t* p, std::size_t len, std::uint64_t stream_offset) {
   if (!p || len == 0u) return;
-  FifoCommandTrace trace{};
-  trace.stream_offset = stream_offset;
-  trace.len = len;
-  trace.cmd = p[0];
   g_fifo_last_cmd = p[0];
   g_fifo_last_cmd_len = len;
   const std::uint8_t op = p[0] & GX_OPCODE_MASK;
@@ -2116,10 +3766,15 @@ void RememberDecodedCommand(const std::uint8_t* p, std::size_t len, std::uint64_
     g_fifo_last_draw_stride = g_fifo_last_draw_count == 0u
                                 ? 0u
                                 : static_cast<std::uint32_t>((len - 3u) / g_fifo_last_draw_count);
-    trace.fmt = g_fifo_last_draw_fmt;
-    trace.count = g_fifo_last_draw_count;
-    trace.stride = g_fifo_last_draw_stride;
   }
+  if(!g_fifo_forensic_trace) return;
+  FifoCommandTrace trace{};
+  trace.stream_offset = stream_offset;
+  trace.len = len;
+  trace.cmd = p[0];
+  trace.fmt = g_fifo_last_draw_fmt;
+  trace.count = g_fifo_last_draw_count;
+  trace.stride = g_fifo_last_draw_stride;
   g_fifo_command_trace[g_fifo_command_trace_head] = trace;
   static_assert((g_fifo_command_trace.size() & (g_fifo_command_trace.size() - 1u)) == 0u);
   g_fifo_command_trace_head =
@@ -2204,6 +3859,11 @@ void DumpFifoFault(std::size_t fault_offset) {
 
 bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
   const std::uint8_t cmd=p[0], op=cmd & GX_OPCODE_MASK;
+  // v288: GekkoAOT has already framed and validated this complete command.
+  // Enter Aurora's native state handlers directly instead of asking its FIFO
+  // interpreter to decode the same opcode/header a second time. Keep BP copy,
+  // mask, token, texture provenance and CP array handling below authoritative.
+  static const bool direct_state=EnvBool("GEKKOAOT_NATIVE_GX_DIRECT_STATE",true);
   static const bool trace_xf=EnvBool("GEKKOAOT_TRACE_GX_STATE",false);
   if(trace_xf && op==GX_LOAD_XF_REG) {
     const auto header=Be32(p+1);
@@ -2214,6 +3874,19 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
                    address,count,Be32(p+5));
   }
   if(g_array_base_trace && op==GX_CMD_INVL_VC) ++g_array_base_trace_invalidate;
+  if(g_draw_census) {
+    if(op==GX_CMD_CALL_DL) NoteDrawGap(256u);
+    else if(op==GX_LOAD_CP_REG) NoteDrawGap(p[1]>=0xA0u ? 8u : 16u);
+    else if(op==GX_LOAD_XF_REG) NoteDrawGap((Be32(p+1)&0xffffu)<0x1000u ? 32u : 64u);
+    else if(op==GX_LOAD_INDX_A||op==GX_LOAD_INDX_B||op==GX_LOAD_INDX_C||op==GX_LOAD_INDX_D) NoteDrawGap(128u);
+    else if(op==kLoadBpOpcode) {
+      const std::uint8_t reg=p[1];
+      if(reg==0x52u) NoteDrawGap(512u);
+      else if((reg>=0x80u&&reg<=0xBBu)||reg==0x64u||reg==0x65u) NoteDrawGap(1u);
+      else if((reg>=0xC0u&&reg<=0xFDu)||(reg>=0x28u&&reg<=0x2Fu)||(reg>=0x40u&&reg<=0x42u)) NoteDrawGap(2u);
+      else if(reg!=0x45u&&reg!=0x47u&&reg!=0x48u) NoteDrawGap(4u);
+    }
+  }
   if(op==GX_CMD_CALL_DL) {
     // The retail CP has one display-list call level. A stream may call one DL,
     // but a DL cannot recursively call another DL. The old host recursion cap
@@ -2258,6 +3931,32 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
     const std::uint32_t effective_word=reg==0xFEu ? word :
         (std::uint32_t(reg)<<24u)|
         ((bp_cache[reg]&~bp_mask)|(word&bp_mask))&0x00ffffffu;
+    // XF aliases can invalidate decoded BP state without changing its word.
+    const bool bp_changed = reg==0xFEu || !aurora::gx::g_gxState.bpRegValid.test(reg) || bp_cache[reg]!=effective_word;
+    // v159: SDKs and retail render loops aggressively re-emit GX state. Aurora
+    // quite reasonably treats a BP write as a state mutation, but feeding an
+    // identical value through handle_bp() dirties pipelines/textures anyway.
+    // Suppress only registers whose write has no command-like side effect.
+    // Token/draw-done/copy/TLUT/cache/preload and BP-mask writes always pass.
+    const bool bp_side_effect = reg==0x45u || reg==0x47u || reg==0x48u ||
+                                reg==0x52u || (reg>=0x55u && reg<=0x57u) ||
+                                reg==0x65u || reg==0x66u || reg==0xFEu ||
+                                (reg>=0x60u && reg<=0x67u);
+    if(!bp_changed && !bp_side_effect) {
+      // Every non-mask BP command consumes the current write mask. The value is
+      // already present in Aurora's cache, so no other state needs touching.
+      bp_cache[0xFEu]=0x00ffffffu;
+      return true;
+    }
+
+    // IMAGE0 and MODE1 can change dimensions/mip span without a new IMAGE3
+    // address write. Track those register groups only on an actual mutation,
+    // then skip the eight-slot scans on ordinary draws.
+    if(bp_changed && ((reg>=0x84u&&reg<=0x8bu)||(reg>=0xa4u&&reg<=0xabu)))
+      g_texture_mapping_scan_dirty=true;
+    if(bp_changed && ((reg>=0x88u&&reg<=0x8bu)||(reg>=0xa8u&&reg<=0xabu)||
+                      (reg>=0x98u&&reg<=0x9bu)||(reg>=0xb8u&&reg<=0xbbu)))
+      g_tlut_binding_scan_dirty=true;
     if(g_z16r_copy_trace && reg==0x43u &&
        (bp_cache[reg]&7u)!=(effective_word&7u) && g_z16r_bp_logs++<96u)
       std::fprintf(stderr,
@@ -2278,6 +3977,10 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
       aurora::gx::g_gxState.bpRegValid.set(reg);
       bp_cache[0xFEu]=0x00ffffffu;
     };
+    if (reg == 0x55u || reg == 0x56u) {
+      consume_intercepted_bp();
+      return GekkoAOT::GX::WriteNativeBoundingBox(reg, effective_word & 0x00ffffffu);
+    }
     if(reg==0x65u) {
       consume_intercepted_bp();
       MapTlut();
@@ -2286,6 +3989,7 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
     if(reg>=0x49u && reg<=0x4Eu) TrackRawCopyRegister(reg,effective_word);
     if(reg==0x52u && ((effective_word>>14)&1u)!=0u) {
       ++g_display_copy_count;
+      g_camera_copy_epoch.store(g_display_copy_count,std::memory_order_release);
       consume_intercepted_bp();
       const bool clear=((effective_word>>11)&1u)!=0u;
       const bool latched=LatchDisplayCopyCached(effective_word,clear);
@@ -2301,6 +4005,7 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
       return latched;
     }
     const bool texture_copy = reg==0x52u;
+    if(texture_copy) ForgetTextureSourceVersions();  // v324: EFB copies rewrite guest RAM
     if(texture_copy && !PrepareRawTextureCopy(effective_word)) {
       // Bad raw copy state is preferable to poisoning Aurora's copy-texture
       // cache with a null/stale destination. Continue guest execution and let
@@ -2308,13 +4013,16 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
       consume_intercepted_bp();
       return true;
     }
+    // v300: Aurora records a GXCopyTex as a sealed pass whose FrameOp captures
+    // its pass/upload pointers and staging high-water marks; passes, ops and
+    // uploads live in std::deque, and encode_op touches only worker-owned
+    // state. Later draws bind the copy through copyTextures, ordered on the
+    // same frame encoder. Waiting for the render worker on both sides of every
+    // copy (v78) only serialized the GX and render threads; keep it as an
+    // opt-in diagnostic.
+    static const bool copy_fence = EnvBool("GEKKOAOT_GX_COPY_FENCE", false);
     if(texture_copy) {
-      // Aurora resolves EFB->texture copies through its render worker. Retail
-      // games may issue a burst of dependent copies and immediately bind the
-      // results as textures. Keep that copy boundary ordered with respect to
-      // prior and following native GX work instead of allowing several copy
-      // passes to overlap while the raw FIFO continues mutating GX state.
-      if(!aurora::gfx::render_worker::is_worker_thread())
+      if(copy_fence && !aurora::gfx::render_worker::is_worker_thread())
         aurora::gfx::render_worker::synchronize();
       static unsigned trace_before=0;
       if(trace_before++<64u)
@@ -2322,10 +4030,11 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
                      "GEKKOAOT_NATIVE_GX_EFB_COPY_FENCE_V78=1 phase=before dest_phys=%08x fmt=%u\n",
                      g_copy_dest_physical,unsigned(aurora::gx::g_gxState.texCopyFmt));
     }
-    (void)aurora::gx::fifo::process(p,static_cast<std::uint32_t>(len));
+    if(direct_state && len==5u) aurora::gx::fifo::handle_bp(word);
+    else (void)aurora::gx::fifo::process(p,static_cast<std::uint32_t>(len));
     if(reg==0x66u) InvalidateTextureCacheV87();
     if(texture_copy) {
-      if(!aurora::gfx::render_worker::is_worker_thread())
+      if(copy_fence && !aurora::gfx::render_worker::is_worker_thread())
         aurora::gfx::render_worker::synchronize();
       static unsigned trace_after=0;
       if(trace_after++<64u)
@@ -2342,11 +4051,55 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
 
   if(op>=0x80u&&op<=0xB8u) {
     if(len < 3u) return false;
+    NoteDraw(Be16(p+1));
     const auto fmt=static_cast<GXVtxFmt>(cmd&GX_VAT_MASK);
     const auto prim=static_cast<GXPrimitive>(cmd&GX_OPCODE_MASK);
     const std::uint16_t count=Be16(p+1);
-    RefreshTextureMappings();
-    BindRawTluts();
+    if(g_texture_mapping_scan_dirty) {
+      RefreshTextureMappings();
+      g_texture_mapping_scan_dirty=false;
+    }
+    if(g_tlut_binding_scan_dirty) {
+      BindRawTluts();
+      g_tlut_binding_scan_dirty=false;
+    }
+    using aurora::gx::g_gxState;
+    if(g_texture_source_invalidation_pending && count!=0u) {
+      for(unsigned map=0;map<aurora::gx::MaxTextures;++map) {
+        auto& texture=g_gxState.loadedTextures[map];
+        if(!texture.data) continue;
+        texture.texDataVersion=static_cast<std::uint32_t>(++g_texture_generation);
+        const auto span=aurora::gx::texture::texture_source_size(
+            texture.format(),texture.width(),texture.height(),texture.mip_count());
+        if((g_texture_image3_valid&(1u<<map))!=0u && span<=0xffffffffu)
+          RememberTextureSourceVersion((g_texture_image3_word[map]&0x00ffffffu)<<5u,texture.image0,
+                                       static_cast<std::uint8_t>(texture.mip_count()),
+                                       static_cast<std::uint32_t>(span),texture.texDataVersion);
+        if(g_draw_census) { ++g_tex_census_forced; g_tex_census_forced_bytes+=span; }
+      }
+      g_texture_source_invalidation_pending=false;
+    }
+    if(g_trace_font) {
+      static std::array<std::uint64_t,128> font_draw_keys{};
+      static unsigned font_draw_samples=0;
+      const auto& tex=g_gxState.loadedTextures[0];
+      const std::uint64_t key=(std::uint64_t(g_gxState.bpRegCache[0x94])<<32u)|
+          (std::uint64_t(tex.image0)<<8u)|g_gxState.numTexGens;
+      bool seen=false;
+      for(unsigned i=0;i<font_draw_samples;++i) seen|=font_draw_keys[i]==key;
+      if(!seen && font_draw_samples<font_draw_keys.size()) {
+        font_draw_keys[font_draw_samples++]=key;
+        std::fprintf(stderr,
+          "GEKKOAOT_T3_FONT_DIAG prim=%u vertices=%u format=%u size=%ux%u image0=%06x image3=%06x tlut0=%06x tlut_src=%06x tlut_load=%06x tev_color=%06x tev_alpha=%06x alpha_compare=%06x blend=%06x texgens=%u\n",
+          unsigned(prim),unsigned(count),unsigned(tex.format()),tex.width(),tex.height(),
+          g_gxState.bpRegCache[0x88]&0xffffffu,
+          g_gxState.bpRegCache[0x94]&0xffffffu,g_gxState.bpRegCache[0x98]&0xffffffu,
+          g_gxState.bpRegCache[0x64]&0xffffffu,g_gxState.bpRegCache[0x65]&0xffffffu,
+          g_gxState.bpRegCache[0xc0]&0xffffffu,g_gxState.bpRegCache[0xc1]&0xffffffu,
+          g_gxState.bpRegCache[0xf3]&0xffffffu,g_gxState.bpRegCache[0x41]&0xffffffu,
+          unsigned(g_gxState.numTexGens));
+      }
+    }
     if(trace_xf) {
       using namespace aurora::gx;
       static unsigned draw_logs=0;
@@ -2386,12 +4139,33 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
       return true;
     }
 
-    if(!PrepareIndexedArrayWindows(p,len)) {
+    // GX_CULL_ALL is a legal state (used by Luigi's Mansion). WebGPU has no
+    // equivalent and Aurora rejects it when constructing a triangle pipeline.
+    // Consume the framed vertices without submitting culled polygons.
+    if(g_gxState.cullMode == GX_CULL_ALL && prim != GX_POINTS &&
+       prim != GX_LINES && prim != GX_LINESTRIP) return true;
+
+    GatheredArrayDraw gathered_draw;
+    const bool gathered=gathered_draw.Prepare(p,len,fmt,count);
+    CompactArrayPlan compact_plan{};
+    const GekkoAOT::GX::NativeAttributePlan* bindings=nullptr;
+    if(!gathered && !PrepareIndexedArrayWindows(p,len,g_compact_array_windows ? &compact_plan : nullptr,&bindings)) {
       std::fprintf(stderr,
                    "GEKKOAOT_NATIVE_GX_FIFO_ERROR opcode=0x%02x action=reject-array-window\n",
                    unsigned(cmd));
       return false;
     }
+    CompactArrayDraw compact_draw;
+    if(!gathered) {
+      if(g_compact_array_windows || g_native_array_snapshots) compact_draw.Prepare(compact_plan,*bindings);
+      else PrimePersistentIndexedArraysV161H(0,*bindings);
+    }
+    const bool screen_fill=ClassifyScreenFill(p,len,prim,fmt,count);
+    if (screen_fill!=g_screen_fill_draw) {
+      g_screen_fill_draw=screen_fill;
+      g_gxState.dirty|=aurora::gx::DirtyUniform;
+    }
+
     if(g_z16r_copy_trace && g_z16r_bound_maps!=0u && g_z16r_draw_logs<96u) {
       std::uint8_t sampled_maps=0;
       const auto& state=aurora::gx::g_gxState;
@@ -2430,9 +4204,20 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
                      static_cast<unsigned long long>(g_array_base_trace_window_bytes),
                      static_cast<unsigned long long>(g_array_base_trace_eager_growth));
     }
-    if(aurora::gx::fifo::submit_raw_draw(prim,fmt,count,p+3,
+    ObservePerspectiveCamera();
+    if(aurora::gx::fifo::submit_raw_draw(prim,fmt,count,gathered ? gathered_draw.vertices : p+3,
                                          static_cast<std::uint32_t>(len-3u)))
       return true;
+
+    // Accepted layouts have the exact same byte count as the raw draw. Keep
+    // the original semantic path if the renderer rejects a gathered payload.
+    if(gathered) {
+      for(unsigned f=0;f<GetIndexScanLayout(fmt)->field_count;++f)
+        g_gxState.arrays[GetIndexScanLayout(fmt)->fields[f].attr].cachedRange={};
+      const GekkoAOT::GX::NativeAttributePlan* original_bindings=nullptr;
+      if(!PrepareIndexedArrayWindows(p,len,&compact_plan,&original_bindings)) return false;
+      compact_draw.Prepare(compact_plan,*original_bindings);
+    }
 
     // The direct path is an optimisation, never a compatibility requirement.
     // If its stricter framing contract rejects a non-empty draw, preserve the
@@ -2454,7 +4239,15 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
     return false;
   }
 
-  (void)aurora::gx::fifo::process(p,static_cast<std::uint32_t>(len));
+  if(direct_state && op==GX_LOAD_CP_REG && len==6u) {
+    aurora::gx::fifo::handle_cp(p[1],Be32(p+2));
+  } else if(direct_state && op==GX_LOAD_XF_REG && len>=9u &&
+            len==5u+std::size_t((Be32(p+1)>>16u)+1u)*4u) {
+    aurora::gx::fifo::handle_xf(static_cast<std::uint16_t>(Be32(p+1)),
+                              std::span<const std::uint8_t>(p+5,len-5u));
+  } else {
+    (void)aurora::gx::fifo::process(p,static_cast<std::uint32_t>(len));
+  }
   if(op==GX_LOAD_CP_REG) InvalidateVertexSize(p[1]);
   return true;
 }
@@ -2471,8 +4264,9 @@ bool ProcessSpan(const std::uint8_t* data, std::size_t bytes, unsigned depth) {
                    status==DecodeResult::Incomplete?"incomplete":"invalid",need);
       return false;
     }
-    if(!ProcessOne(data+off,len,depth)) return false;
-    off+=len;
+    std::size_t consumed=len;
+    if(!ProcessCommandOrRun(data+off,bytes-off,len,depth,&consumed)) return false;
+    off+=consumed;
   }
   return true;
 }
@@ -2503,6 +4297,43 @@ void CompactFifo() {
   g_fifo_read=0u;
 }
 
+bool CanRecoverSingleByteFifoDesync(const std::uint8_t* p, std::size_t available,
+                                    std::size_t* validated_bytes) {
+  if(!p || available<2u || !validated_bytes) return false;
+
+  // 0x18..0x1f are the reserved hole between LOAD_XF (0x10 family) and the
+  // indexed-load commands (0x20 family). Do not turn arbitrary unknown GX
+  // opcodes into NOPs. Rising Sun can occasionally expose one stray byte from
+  // this reserved family while the following byte is already a complete BP/CP
+  // control command. Recover only that one-byte loss of framing and only when
+  // the complete currently-buffered suffix validates from the next byte.
+  if((p[0]&GX_OPCODE_MASK)!=0x18u) return false;
+  const std::uint8_t next_op=p[1]&GX_OPCODE_MASK;
+  const bool strong_anchor = next_op==kLoadBpOpcode || next_op==GX_LOAD_CP_REG ||
+      next_op==GX_LOAD_XF_REG || next_op==GX_LOAD_INDX_A ||
+      next_op==GX_LOAD_INDX_B || next_op==GX_LOAD_INDX_C ||
+      next_op==GX_LOAD_INDX_D || next_op==GX_CMD_CALL_DL;
+  if(!strong_anchor) return false;
+
+  std::size_t off=1u;
+  std::size_t commands=0u;
+  while(off<available) {
+    std::size_t len=0u,need=1u;
+    const auto status=CommandLength(p+off,available-off,&len,&need);
+    if(status==DecodeResult::Invalid) return false;
+    if(status==DecodeResult::Incomplete) {
+      // A command split by the host burst boundary is still a valid suffix;
+      // DrainFifo() will wait for its remaining bytes normally.
+      *validated_bytes=off;
+      return commands!=0u;
+    }
+    off+=len;
+    ++commands;
+  }
+  *validated_bytes=off;
+  return commands!=0u;
+}
+
 void DrainFifo() {
   while(g_fifo_read<g_fifo.size()) {
     const std::size_t available=g_fifo.size()-g_fifo_read;
@@ -2514,6 +4345,23 @@ void DrainFifo() {
       break;
     }
     if(status==DecodeResult::Invalid) {
+      std::size_t validated=0u;
+      if(CanRecoverSingleByteFifoDesync(g_fifo.data()+g_fifo_read,available,&validated)) {
+        const std::uint8_t bad=g_fifo[g_fifo_read];
+        const std::uint8_t anchor=g_fifo[g_fifo_read+1u];
+        static std::uint64_t recoveries=0u;
+        ++recoveries;
+        std::fprintf(stderr,
+                     "GEKKOAOT_NATIVE_GX_FIFO_RESYNC_V201=1 offset=%zu absolute=%llu "
+                     "dropped=0x%02x anchor=0x%02x validated=%zu count=%llu action=skip-one-reserved-byte\n",
+                     g_fifo_read,
+                     static_cast<unsigned long long>(g_fifo_stream_base+g_fifo_read),
+                     unsigned(bad),unsigned(anchor),validated,
+                     static_cast<unsigned long long>(recoveries));
+        ++g_fifo_read;
+        g_fifo_need=1u;
+        continue;
+      }
       DumpFifoFault(g_fifo_read);
       std::fprintf(stderr,
                    "GEKKOAOT_NATIVE_GX_FIFO_ERROR offset=%zu opcode=0x%02x action=fail-closed\n",
@@ -2523,7 +4371,8 @@ void DrainFifo() {
       break;
     }
     RememberDecodedCommand(g_fifo.data()+g_fifo_read,len,g_fifo_stream_base+g_fifo_read);
-    if(!ProcessOne(g_fifo.data()+g_fifo_read,len,0u)) {
+    std::size_t consumed=len;
+    if(!ProcessCommandOrRun(g_fifo.data()+g_fifo_read,g_fifo.size()-g_fifo_read,len,0u,&consumed)) {
       DumpFifoFault(g_fifo_read);
       std::fprintf(stderr,
                    "GEKKOAOT_NATIVE_GX_FIFO_ERROR offset=%zu opcode=0x%02x action=fail-closed-process\n",
@@ -2532,7 +4381,7 @@ void DrainFifo() {
       g_quit=true;
       break;
     }
-    g_fifo_read+=len;
+    g_fifo_read+=consumed;
     g_fifo_need=1u;
   }
   CompactFifo();
@@ -2582,8 +4431,16 @@ void PollFullscreenShortcut() {
 
 void PollEvents() {
   const AuroraEvent* ev=aurora_update();
-  while(ev && ev->type!=AURORA_NONE) { if(ev->type==AURORA_EXIT) g_quit=true; ++ev; }
+  while(ev && ev->type!=AURORA_NONE) {
+    if(ev->type==AURORA_EXIT) g_quit=true;
+    if (ev->type == AURORA_WINDOW_RESIZED || ev->type == AURORA_UNPAUSED ||
+        ev->type == AURORA_DISPLAY_SCALE_CHANGED ||
+        (ev->type == AURORA_SDL_EVENT && ev->sdl.type == SDL_EVENT_WINDOW_EXPOSED))
+      aurora::gfx::render_worker::enqueue_work([] { g_cached_scanout.Reset(); });
+    ++ev;
+  }
   PollFullscreenShortcut();
+  if (g_info.window) RefreshHostWindowAspect();
 }
 
 #ifdef GEKKOAOT_HAVE_X11
@@ -2672,30 +4529,122 @@ bool PrepareX11Embed() {
 
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* user) {
   if(g_ready) return true;
+  // A previous renderer set quit at shutdown. A new device owns a fresh
+  // producer lifetime; retaining that latch silently discards every command.
+  g_quit=false;
+  g_frame_open=false;
+  g_alt_enter_latched=false;
   g_resolve=resolve; g_resolve_user=user; g_fifo.reserve(1u<<20);
   g_fifo_read=0; g_fifo_need=1; g_fifo_fault=false; g_fifo_fault_reported=false;
+  g_fifo_forensic_trace=EnvBool("GEKKOAOT_NATIVE_GX_FIFO_FORENSIC",false);
+  g_native_commands.Reset();
+  g_native_commands.SetDirectSpansEnabled(EnvBool("GEKKOAOT_NATIVE_GX_DIRECT_COMMAND_SPANS",true));
+  g_typed_arrays=EnvBool("GEKKOAOT_NATIVE_GX_TYPED_ARRAYS",false) && !g_fifo_forensic_trace &&
+      !std::getenv("GEKKOAOT_GX_DIAG_FIFO_CAPTURE");
+  g_direct_matrices=EnvBool("GEKKOAOT_NATIVE_GX_DIRECT_MATRICES",true) && !g_fifo_forensic_trace &&
+      !std::getenv("GEKKOAOT_GX_DIAG_FIFO_CAPTURE");
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_DIRECT_MATRICES_V317=1 enabled=%u renderer=matrix-state\n",g_direct_matrices?1u:0u);
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_TYPED_COMMANDS_V313=1 enabled=%u arrays=host-parameters fallback=exact-stream\n",g_typed_arrays?1u:0u);
+  g_fifo_streaming=EnvBool("GEKKOAOT_NATIVE_GX_STREAM_FIFO",true);
+  g_fifo_stream_stats=EnvBool("GEKKOAOT_NATIVE_GX_STREAM_FIFO_STATS",false);
+  g_fifo_submitted_bytes=0; g_fifo_copied_bytes=0; g_fifo_direct_bytes=0;
   g_fifo_write_trace.fill({}); g_fifo_write_trace_head=0; g_fifo_write_trace_count=0;
   g_fifo_last_cmd=0; g_fifo_last_cmd_len=0; g_fifo_last_draw_fmt=0xffu;
   g_fifo_last_draw_count=0; g_fifo_last_draw_stride=0;
   g_vertex_size_cache.fill(0); g_vertex_size_valid=0;
   g_index_scan_layout.fill({}); g_index_scan_valid=0;
   g_texture_image3_word.fill(0); g_texture_image3_valid=0; g_texture_image3_written=0;
+  g_texture_ui_source_hash.fill(0); g_texture_ui_source_hash_valid=0;
   g_tlut_memory.Reset(); g_tlut_revisions.fill(0); g_tlut_bindings.fill(0);
   g_array_available.fill(0);
   g_array_guest_base.fill(0);
+  g_cached_scanout.Reset();
+  for(auto& slot : g_persistent_array_slots) slot = {};
+  for(auto& policy : g_array_upload_policy) policy = {};
+  g_adaptive_array_upload=EnvBool("GEKKOAOT_NATIVE_GX_ADAPTIVE_ARRAY_UPLOAD",true);
+  g_content_array_cache=EnvBool("GEKKOAOT_NATIVE_GX_CONTENT_ARRAY_CACHE",true);
+  g_content_array_hits=0;
+  g_persistent_array_cursor=static_cast<std::uint32_t>(aurora::gfx::StorageBufferSize);
+  g_persistent_array_frame=UINT32_MAX;
+  g_persistent_array_reset_pending=false;
+  g_persistent_array_cache=EnvBool("GEKKOAOT_NATIVE_GX_PERSISTENT_ARRAY_CACHE",true);
+  g_persistent_array_min_bytes=EnvUnsigned("GEKKOAOT_NATIVE_GX_PERSISTENT_ARRAY_MIN_BYTES",8u*1024u);
+  g_persistent_array_uploads=0;
+  g_persistent_array_upload_bytes=0;
+  g_persistent_array_hits=0;
+  g_persistent_array_fallbacks=0;
+  g_adaptive_array_fallbacks=0;
+  g_compact_array_windows=EnvBool("GEKKOAOT_NATIVE_GX_COMPACT_ARRAY_WINDOWS",true);
+  g_native_index_range_cache=EnvBool("GEKKOAOT_NATIVE_GX_INDEX_RANGE_CACHE",false);
+  g_native_index_ranges.Clear();
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_INDEX_RANGES_V307=%u payload_limit=512 exact=layout+draw fallback=rescan\n",
+               g_native_index_range_cache?1u:0u);
+  g_native_array_tiles=EnvBool("GEKKOAOT_NATIVE_GX_ARRAY_TILES",true) &&
+                       aurora::gfx::native_snapshot_atlas_enabled();
+  g_native_array_snapshots=EnvBool("GEKKOAOT_NATIVE_GX_ARRAY_SNAPSHOTS",true) &&
+                           aurora::gfx::native_snapshot_atlas_enabled();
+  g_native_attribute_plan=EnvBool("GEKKOAOT_NATIVE_GX_ATTRIBUTE_PLAN",true);
+  g_native_vertex_program=EnvBool("GEKKOAOT_NATIVE_GX_VERTEX_PROGRAM",true);
+  g_native_vertex_gather=EnvBool("GEKKOAOT_NATIVE_GX_VERTEX_GATHER",false);
+  g_native_gather_draws=g_native_gather_bytes=g_native_gather_windows=0;
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_VERTEX_GATHER_V318=%u indexed=16 fields=1..4 vertices=1..64 resources=host-packed fallback=original\n",g_native_vertex_gather?1u:0u);
+  g_native_vertex_profile=EnvBool("GEKKOAOT_RUNTIME_PROFILE",false);
+  g_native_vertex_draws=0;g_native_vertex_vertices=0;
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_VERTEX_V315=%u layout=compiled-index16 fields=2..4 equality=exact fallback=original env=GEKKOAOT_NATIVE_GX_VERTEX_PROGRAM\n",g_native_vertex_program?1u:0u);
+  const auto* snapshot_recycling=std::getenv("GEKKOAOT_NATIVE_GX_SNAPSHOT_RECYCLING");
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_SNAPSHOT_RECYCLING_V312=%u scope=cpu-shadow gpu-ranges=immutable env=GEKKOAOT_NATIVE_GX_SNAPSHOT_RECYCLING\n",
+               snapshot_recycling && snapshot_recycling[0]=='1' ? 1u : 0u);
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_ATTRIBUTE_PLAN_V310=%u source=validated-vcd-vat cache=layout-only resources=live env=GEKKOAOT_NATIVE_GX_ATTRIBUTE_PLAN\n",
+               g_native_attribute_plan?1u:0u);
+  g_native_array_snapshot_stages=0;
+  g_compact_array_uploads=0;
+  g_compact_array_bytes=0;
+  g_compact_array_prefix_bytes=0;
+  g_compact_array_rollovers=0;
+  g_compact_array_fallbacks=0;
   g_array_cache_control_events=0;
   g_array_cache_invalidations=0;
   g_array_cache_control_logs=0;
   g_copy_dest_physical=0; g_copy_stride_bytes=0; g_copy_yscale_raw=0x100u; g_copy_src_valid=false; g_copy_dest_valid=false;
-  g_frame_ready_pending=false; g_frame_ready_xfb=0;
+  g_frame_ready_xfb.store(0, std::memory_order_relaxed);
+  g_texture_viewport_roles.Reset();
+  g_screen_fill_draw=false;
+  g_pending_efb_pokes={};
+  g_efb_poke_batch=EnvBool("GEKKOAOT_NATIVE_GX_EFB_POKE_BATCH",true);
+  g_efb_poke_stats=EnvBool("GEKKOAOT_NATIVE_GX_EFB_POKE_STATS",false);
+  g_efb_poke_first_flush_logged=false;
+  g_efb_poke_writes=0;
+  g_efb_poke_draws=0;
   g_alt_enter_latched=false;
-  g_frame_interpolation_enabled=EnvBool("GEKKOAOT_FRAME_INTERPOLATION",true);
+  g_frame_interpolation_enabled=false;
   g_interp_previous={}; g_interp_current={};
   g_interp_previous_valid=false; g_interp_current_valid=false; g_interp_snapshot_count=0;
   g_texture_bind_cache=EnvBool("GEKKOAOT_NATIVE_GX_FIFO_TEXTURE_CACHE",true);
+  g_texture_version_reuse=EnvBool("GEKKOAOT_NATIVE_GX_TEXTURE_VERSION_REUSE",true);
+  ForgetTextureSourceVersions();
   g_array_base_trace=EnvBool("GEKKOAOT_NATIVE_GX_ARRAY_BASE_TRACE",false);
   g_z16r_copy_trace=EnvBool("GEKKOAOT_NATIVE_GX_Z16R_TRACE",false);
   g_ztexture_trace=EnvBool("GEKKOAOT_NATIVE_GX_ZTEXTURE_TRACE",false);
+  g_partial_clear_copy_continuation=
+      EnvBool("GEKKOAOT_NATIVE_GX_PARTIAL_CLEAR_CONTINUATION",false);
+  g_masked_clear_efb_continuity=
+      EnvBool("GEKKOAOT_NATIVE_GX_MASKED_CLEAR_CONTINUITY",true);
+  g_efb_boundary_continuity=
+      EnvBool("GEKKOAOT_NATIVE_GX_EFB_CONTINUITY",false);
+  g_draw_census=EnvBool("GEKKOAOT_RUNTIME_PROFILE",false);
+  g_draw_runs=EnvBool("GEKKOAOT_NATIVE_GX_DRAW_RUNS",true);
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_DRAW_RUNS_V323=%u list_member_vertices=%u expand_member_vertices=%u "
+               "max_run_vertices=%u key=vat mixed=triangles order=aurora-exact\n",
+               g_draw_runs?1u:0u,unsigned(kDrawRunListMax),unsigned(kDrawRunExpandMax),
+               unsigned(kDrawRunMaxVertices));
+  g_display_copy_state_logs=0;
+  g_partial_clear_copy_logs=0;
+  g_trace_gx_copy=EnvBool("GEKKOAOT_TRACE_GX_COPY",false);
+  g_trace_video=EnvBool("GEKKOAOT_TRACE_VIDEO",false);
+  g_invalidate_texture_sources=EnvBool("GEKKOAOT_GX_INVALIDATE_TEXTURE_SOURCES",true);
+  g_texture_source_invalidation_pending=false;
+  g_trace_font=EnvBool("GEKKOAOT_TRACE_FONT",false);
+  g_paranoid_texture_hash=EnvBool("GEKKOAOT_GX_PARANOID_TEXTURE_HASH",false);
   g_ztexture_logs=0;
   g_z16r_copy_dest=0; g_z16r_copy_span=0; g_z16r_bound_maps=0;
   g_z16r_bp_logs=0; g_z16r_copy_logs=0; g_z16r_bind_logs=0; g_z16r_draw_logs=0;
@@ -2717,6 +4666,17 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   // Aurora Z-texture (BP F4/F5 + Z8/Z16/Z24X8 sampling + fragment depth).
   g_array_frame_refresh=EnvBool("GEKKOAOT_NATIVE_GX_ARRAY_FRAME_REFRESH",false);
   g_indexed_draw_coherency=EnvBool("GEKKOAOT_NATIVE_GX_INDEXED_DRAW_COHERENCY",false);
+  g_post_processing_enabled=EnvBool("GEKKOAOT_POST_PROCESSING",true);
+  g_post_preset=std::getenv("GEKKOAOT_POSTFX_PRESET") ? std::getenv("GEKKOAOT_POSTFX_PRESET") : "balanced";
+  if(EqualNoCase(g_post_preset.c_str(),"cinematic")) g_post_cinematic=0.20f;
+  else g_post_cinematic=0.0f;
+  g_post_sharpen=EnvFloat("GEKKOAOT_POSTFX_SHARPEN",0.28f,0.0f,1.0f);
+  g_post_bloom=EnvFloat("GEKKOAOT_POSTFX_BLOOM",0.10f,0.0f,1.0f);
+  g_post_vignette=EnvFloat("GEKKOAOT_POSTFX_VIGNETTE",0.06f,0.0f,1.0f);
+  g_post_grain=EnvFloat("GEKKOAOT_POSTFX_GRAIN",0.0f,0.0f,0.25f);
+  g_post_tone=EnvFloat("GEKKOAOT_POSTFX_TONE",0.15f,0.0f,1.0f);
+  g_post_local_contrast=EnvFloat("GEKKOAOT_POSTFX_LOCAL_CONTRAST",0.08f,0.0f,1.0f);
+  g_post_frame=0;
   AuroraConfig config{};
   config.appName="GekkoAOT " GEKKOAOT_VERSION;
   config.desiredBackend=BackendFromEnv();
@@ -2729,6 +4689,21 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   config.windowHeight=EnvUnsigned("GEKKOAOT_NATIVE_GX_HEIGHT",540);
   config.pauseOnFocusLost=false;
   config.allowJoystickBackgroundEvents=true;
+  config.allowCpuAdapter=EnvBool("GEKKOAOT_NATIVE_GX_ALLOW_CPU",false);
+  const unsigned msaa=EnvUnsigned("GEKKOAOT_NATIVE_GX_MSAA",1);
+  const unsigned anisotropy=EnvUnsigned("GEKKOAOT_NATIVE_GX_ANISOTROPY",16);
+  config.msaa=(msaa==4)?4:1;
+  config.maxTextureAnisotropy=(anisotropy==1 || anisotropy==2 || anisotropy==4 ||
+                               anisotropy==8 || anisotropy==16)?anisotropy:16;
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_QUALITY msaa=%u anisotropy=%u interpolation=%u\n",
+               config.msaa, config.maxTextureAnisotropy,
+               g_frame_interpolation_enabled ? 1u : 0u);
+  std::fprintf(stderr,"GEKKOAOT_POST_PROCESSING_V196=%u preset=%s sharpen=%.3f bloom=%.3f vignette=%.3f grain=%.3f tone=%.3f local=%.3f cinematic=%.3f stage=final-xfb\n",
+               g_post_processing_enabled?1u:0u,g_post_preset.c_str(),g_post_sharpen,g_post_bloom,
+               g_post_vignette,g_post_grain,g_post_tone,g_post_local_contrast,g_post_cinematic);
+  std::fprintf(stderr,"GEKKOAOT_AURORA_HOT_ENV_CACHE_V36=1 trace_copy=%u trace_video=%u trace_font=%u paranoid_hash=%u\n",
+               g_trace_gx_copy?1u:0u,g_trace_video?1u:0u,g_trace_font?1u:0u,
+               g_paranoid_texture_hash?1u:0u);
   config.mem1Size=0; config.mem2Size=0;
 #ifdef GEKKOAOT_HAVE_X11
   if (!PrepareX11Embed()) {
@@ -2764,13 +4739,41 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   std::fprintf(stderr,"GEKKOAOT_NATIVE_RAM_XFB_V57=1 mode=vi-geometry-yuvy-fallback fastpath=aurora-zero-copy\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_RAM_XFB_V82=1 detector=per-xfb-history slots=16 arm=3-observations+2-changes fallback=cache-miss-only\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_XFB_PRESENT_BOUNDARY_V110=1 producer=gx-copy submit=gx-copy scanout=present-only ram-upload=direct-queue live-efb-cut=forbidden\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_XFB_PARTIAL_CLEAR_V176_LEGACY=%u default=off policy=keep-recording-open env=GEKKOAOT_NATIVE_GX_PARTIAL_CLEAR_CONTINUATION\n",
+               g_partial_clear_copy_continuation?1u:0u);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_XFB_MASKED_CLEAR_CONTINUITY_V1=%u default=on policy=gxcopydisp-boundary+selective-color-depth-load env=GEKKOAOT_NATIVE_GX_MASKED_CLEAR_CONTINUITY\n",
+               g_masked_clear_efb_continuity?1u:0u);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_XFB_EFB_CONTINUITY_V177_SAFE=%u default=off policy=diagnostic-all-attachment-load env=GEKKOAOT_NATIVE_GX_EFB_CONTINUITY regression=hpcos-ghse69\n",
+               g_efb_boundary_continuity?1u:0u);
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_PERF_RECOVERY_V115=1 array-frame-refresh-default=off indexed-draw-coherency-default=off ztexture=aurora-v1 xfb-boundary=v110\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_AURORA_ARRAY_CACHE_V35=%u region_mib=64 base_mib=%llu min_bytes=%u small=frame-staging coherency=guest-write+dcache-publication fallback=transient-storage\n",
+               g_persistent_array_cache?1u:0u,
+               static_cast<unsigned long long>(aurora::gfx::StorageBufferSize/(1024ull*1024ull)),
+               g_persistent_array_min_bytes);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_ADAPTIVE_ARRAY_UPLOAD_V190=%u recent_frames=4 retry_frames=64 dynamic=mapped-frame-staging stable=persistent env=GEKKOAOT_NATIVE_GX_ADAPTIVE_ARRAY_UPLOAD\n",
+               g_adaptive_array_upload?1u:0u);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_CONTENT_ARRAY_CACHE_V191=%u equality=exact-bytes snapshot=immutable same-frame-ranges=distinct env=GEKKOAOT_NATIVE_GX_CONTENT_ARRAY_CACHE\n",
+               g_content_array_cache?1u:0u);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_COMPACT_ARRAY_WINDOWS_V293=%u indices=raw-u16 source=used-suffix shader-bias=u32 one-draw=1 preflight=arrays+fog env=GEKKOAOT_NATIVE_GX_COMPACT_ARRAY_WINDOWS\n",
+               g_compact_array_windows?1u:0u);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_RESOURCES_V303 atlas=%u tiles=%u small_arrays=%u equality=cacheable-cpu-shadow raw_indices=preserved fallback=original\n",
+               aurora::gfx::native_snapshot_atlas_enabled()?1u:0u,
+               g_native_array_tiles?1u:0u,g_native_array_snapshots?1u:0u);
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_INDEXED_ARRAY_COHERENCY_V114=1 policy=exact-used-windows+no-cross-draw-merge default=off env=GEKKOAOT_NATIVE_GX_INDEXED_DRAW_COHERENCY\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_ZTEXTURE_V115=1 backend=aurora-bp-f4-f5 trace=%u env=GEKKOAOT_NATIVE_GX_ZTEXTURE_TRACE\n",g_ztexture_trace?1u:0u);
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_INDEX_SCAN_V2=1 layout=cached-fields nbt3=xyz-element\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_XF_ARRAY_WINDOW_V86=1 arrays=pos+normal+texture+light sizing=per-indexed-load bounds=guest-mapping\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_COHERENCY_V87=1 texture-invalidate=bp66 stale-array=fail-closed stale-texture=fail-closed dl-depth=1\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_TEXTURE_ID_V10=1 identity=stable-per-slot version=per-load\n");
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_FONT_COHERENCY_V174=1 formats=i4+i8+ia4+ia8+c4+c8+c14x2 policy=content-hash-on-stable-rebind\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_ARRAY_FRAME_REFRESH_V3=%u policy=%s\n",
                g_array_frame_refresh?1u:0u,
                g_array_frame_refresh?"gx-copy+host-frame-boundary":"gx-invalidate-driven");
@@ -2779,11 +4782,14 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
                g_indexed_draw_coherency?"refresh-used-arrays+forbid-cross-draw-merge":"legacy-cache-reuse");
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_GX_DYNAMIC_VERTEX_V141=1 source=dcbst+dcbf+dcbi line=32 target=indexed-arrays policy=invalidate-overlap-no-per-draw-hash\n");
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_TEXTURE_COHERENCY_V159=1 mutation=cache-control+host-dma bp66=tmem-only draw-scans=dirty-driven\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_EFB_COPY_V2=1 mode=retail-bp-state\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_EFB_COPY_FENCE_V78=1 ordering=render-worker-before+after trace=64\n");
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_FIFO_CAP_V11=1 bytes=%u policy=fail-closed\n",
                16u*1024u*1024u);
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_FIFO_BURST_V13=1 abi=optional max=4096\n");
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_FIFO_FASTPATH_V159=1 forensic=%u env=GEKKOAOT_NATIVE_GX_FIFO_FORENSIC texture-scans=dirty-only\n",g_fifo_forensic_trace?1u:0u);
   std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_PRESENT_V137=1 interpolation-aspect=live-window fullscreen=alt-enter-standalone\n");
   std::fprintf(stderr,
                "GEKKOAOT_NATIVE_GX_WIDESCREEN_V156C=1 producer=gc-fit scanout=window-wide "
@@ -2804,6 +4810,7 @@ namespace {
 bool AppendNativeFifoBytes(const std::uint8_t* bytes, std::size_t size,
                            std::uint32_t guest_pc) {
   if(!g_ready || g_fifo_fault || g_quit || !bytes || size==0u) return false;
+  FlushEfbPokes();
   // WGPIPE is a stream, not an unbounded command archive. If framing stops
   // making progress, fail closed before std::vector can grow into GiB of host
   // memory. This limit is deliberately far above any sensible in-flight FIFO.
@@ -2818,15 +4825,123 @@ bool AppendNativeFifoBytes(const std::uint8_t* bytes, std::size_t size,
     return false;
   }
   const std::size_t old=g_fifo.size();
-  g_fifo.insert(g_fifo.end(), bytes, bytes+size);
+  // Preserve the exact submitted stream for diagnosing command framing;
+  // unlike draw captures this also retains CP state and split gather lines.
+  static std::FILE* capture = [] {
+    const char* path = std::getenv("GEKKOAOT_GX_DIAG_FIFO_CAPTURE");
+    return path && *path ? std::fopen(path, "wb") : nullptr;
+  }();
+  if (capture) {
+    (void)std::fwrite(bytes, 1u, size, capture);
+    (void)std::fflush(capture);
+  }
   // One forensic record per host burst is enough to retain the producer PC
   // while keeping the fast path independent from guest-store granularity.
   RememberFifoWrite(0u, static_cast<std::uint8_t>(std::min<std::size_t>(size,255u)),
                     g_fifo_stream_base+old, guest_pc);
-  if(g_fifo.size()-g_fifo_read>=g_fifo_need) DrainFifo();
+  if(g_fifo_stream_stats) g_fifo_submitted_bytes += size;
+  // v239: ProcessOne consumes control words immediately and copies vertex
+  // payloads into owned staging before returning. The submitted span is never
+  // retained by the renderer. Forensic mode keeps the original buffered path.
+  if(!g_fifo_streaming || g_fifo_forensic_trace) {
+    g_fifo.insert(g_fifo.end(), bytes, bytes+size);
+    if(g_fifo_stream_stats) g_fifo_copied_bytes += size;
+    if(g_fifo.size()-g_fifo_read>=g_fifo_need) DrainFifo();
+    return !g_fifo_fault;
+  }
+  std::size_t offset=0;
+  while(offset<size && !g_fifo_fault) {
+    if(g_fifo_read<g_fifo.size()) {
+      const std::size_t unread=g_fifo.size()-g_fifo_read;
+      if(unread>=g_fifo_need) {
+        DrainFifo();
+        continue;
+      }
+      // Complete only the pending header/payload. A large draw may need more
+      // than one burst; keep its complete bytes until the existing decoder can
+      // consume it, then parse the remaining incoming commands directly.
+      const std::size_t copied=std::min(size-offset,g_fifo_need-unread);
+      g_fifo.insert(g_fifo.end(),bytes+offset,bytes+offset+copied);
+      if(g_fifo_stream_stats) g_fifo_copied_bytes += copied;
+      offset+=copied;
+      if(g_fifo.size()-g_fifo_read>=g_fifo_need) DrainFifo();
+      continue;
+    }
+    std::size_t length=0,need=1;
+    const auto status=CommandLength(bytes+offset,size-offset,&length,&need);
+    if(status!=DecodeResult::Complete) {
+      // Preserve exact framing/error recovery and the old bounds for an
+      // incomplete or invalid suffix. No command bytes are discarded here.
+      g_fifo.insert(g_fifo.end(),bytes+offset,bytes+size);
+      if(g_fifo_stream_stats) g_fifo_copied_bytes += size-offset;
+      DrainFifo();
+      break;
+    }
+    RememberDecodedCommand(bytes+offset,length,g_fifo_stream_base);
+    if(!ProcessCommandOrRun(bytes+offset,size-offset,length,0u,&length)) {
+      // Retain the failing command and suffix for the normal diagnostic dump;
+      // do not replay a command that may already have changed GX state.
+      g_fifo.insert(g_fifo.end(),bytes+offset,bytes+size);
+      if(g_fifo_stream_stats) g_fifo_copied_bytes += size-offset;
+      DumpFifoFault(0u);
+      std::fprintf(stderr,
+                   "GEKKOAOT_NATIVE_GX_FIFO_ERROR offset=0 opcode=0x%02x action=fail-closed-process\n",
+                   unsigned(bytes[offset]));
+      g_fifo_fault=true; g_quit=true;
+      break;
+    }
+    g_fifo_stream_base+=length;
+    g_fifo_need=1u;
+    offset+=length;
+    if(g_fifo_stream_stats) g_fifo_direct_bytes += length;
+  }
   return !g_fifo_fault;
 }
 
+bool AppendNativeCommands(const std::uint8_t* bytes,std::size_t size,std::uint32_t pc) {
+  if(!g_typed_arrays&&!g_direct_matrices) return AppendNativeFifoBytes(bytes,size,pc);
+  return g_native_commands.Consume(bytes,size,
+    [pc](const std::uint8_t* raw,std::size_t n){return AppendNativeFifoBytes(raw,n,pc);},
+    []{return !g_fifo_fault && g_fifo_read==g_fifo.size();},
+    [](GekkoAOT::GX::NativeCommandStream::ArrayBinding binding){
+      if(!g_ready || g_fifo_fault || g_quit)return false;
+      FlushEfbPokes();
+      MapArrayBase(std::uint8_t(0xa0u+binding.index),binding.base);
+      aurora::gx::fifo::handle_cp(std::uint8_t(0xb0u+binding.index),binding.stride);
+      g_fifo_stream_base+=12u;
+      if(g_fifo_stream_stats){g_fifo_submitted_bytes+=12u;g_fifo_direct_bytes+=12u;}
+      return true;
+    },
+    [](std::uint32_t address,std::uint32_t words,const std::uint8_t* data){
+      if(!g_ready || g_fifo_fault || g_quit || !GekkoAOT::GX::NativeMatrixRange(address,words))return false;
+      FlushEfbPokes();
+      // Native SDK upload: write the host renderer's matrix rows directly.
+      // No opcode/header decoding, XF register dispatch or CPUState access.
+      bool changed=false;
+      auto store=[&](float& value,unsigned i) {
+        const auto bits=Be32(data+4u*i);
+        if(std::bit_cast<std::uint32_t>(value)!=bits) {
+          value=std::bit_cast<float>(bits);changed=true;
+        }
+      };
+      auto& state=aurora::gx::g_gxState;
+      if(address<0x100u) {
+        const auto row=address/4u;
+        for(unsigned i=0;i<words;++i)store(state.xfPosRows[row+i/4u][i%4u],i);
+      } else if(address<0x500u) {
+        const auto row=(address-0x400u)/3u;
+        for(unsigned i=0;i<9u;++i)store(state.xfNrmRows[row+i/3u][i%3u],i);
+      } else {
+        auto* matrix=reinterpret_cast<float*>(&state.ptTexMtxs[(address-0x500u)/12u]);
+        for(unsigned i=0;i<12u;++i)store(matrix[i],i);
+      }
+      if(changed)state.dirty|=aurora::gx::DirtyUniform;
+      const auto bytes=5u+4u*words;
+      g_fifo_stream_base+=bytes;
+      if(g_fifo_stream_stats){g_fifo_submitted_bytes+=bytes;g_fifo_direct_bytes+=bytes;}
+      return true;
+    });
+}
 } // namespace
 
 // Aurora shader/presentation overlays query these live values. Keeping aspect
@@ -2838,29 +4953,149 @@ GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_widescreen_x_scale() noexcept {
 GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_widescreen_target_aspect() noexcept {
   return TargetAspectForMode(g_aspect_mode.load(std::memory_order_acquire));
 }
+
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_camera_signature(
+    float* fov_y_degrees, float* guest_aspect) noexcept {
+  if (!fov_y_degrees || !guest_aspect) return false;
+  const auto observed = g_camera_observed_copy.load(std::memory_order_acquire);
+  const auto current = g_camera_copy_epoch.load(std::memory_order_acquire);
+  const auto signature = g_camera_signature.load(std::memory_order_acquire);
+  if (!signature || current < observed || current - observed > 2u) return false;
+  const auto fov_bits = static_cast<std::uint32_t>(signature >> 32u);
+  const auto aspect_bits = static_cast<std::uint32_t>(signature);
+  std::memcpy(fov_y_degrees,&fov_bits,sizeof(float));
+  std::memcpy(guest_aspect,&aspect_bits,sizeof(float));
+  return true;
+}
+
+GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_widescreen_projection_scale(
+    float horizontal, float vertical, float width, float height) noexcept {
+  if (g_aspect_mode.load(std::memory_order_relaxed) != 1u) return 1.f;
+  return GekkoAOT::GX::PerspectiveXScale(horizontal, vertical, width,
+                                         height, HostWindowAspect());
+}
+
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_texture_viewport(
+    float left,float top,float width,float height) noexcept {
+  return g_texture_viewport_roles.IsProducer(left,top,width,height,
+      g_camera_copy_epoch.load(std::memory_order_relaxed));
+}
+
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_screen_fill() noexcept {
+  return g_screen_fill_draw;
+}
+
+GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_ui_clip_x(
+    float x, float left, float width, float scale) noexcept {
+  return GekkoAOT::GX::UiClipX(x,left,width,scale);
+}
+
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_screen_copy(
+    int width, int height, float view_width, float view_height) noexcept {
+  return GekkoAOT::GX::IsScreenCopy(width, height, view_width, view_height);
+}
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_widescreen_diag(
+    int projection_type, float view_left, float view_top,
+    float view_width, float view_height, int scissor_x, int scissor_y,
+    int scissor_width, int scissor_height, bool offscreen,
+    bool samples_screen_copy, float correction) noexcept {
+  // Called for every uniform build: resolve the diagnostic switch once.
+  static const bool enabled = EnvBool("GEKKOAOT_DIAG_WIDESCREEN", false);
+  if (!enabled) return;
+  char state[256]{};
+  std::snprintf(state, sizeof(state),
+                "projection=%d guest=1.333333 host=%.6f viewport=%.1f,%.1f,%.1f,%.1f scissor=%d,%d,%d,%d offscreen=%u efb-sample=%u correction=%.6f",
+                projection_type, HostWindowAspect(), view_left, view_top,
+                view_width, view_height, scissor_x, scissor_y,
+                scissor_width, scissor_height, offscreen ? 1u : 0u,
+                samples_screen_copy ? 1u : 0u, correction);
+  static std::string previous;
+  if (previous != state) {
+    previous = state;
+    std::fprintf(stderr, "GEKKOAOT_DIAG_WIDESCREEN %s\n", state);
+  }
+}
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_set_aspect_mode(std::uint32_t mode) {
   ApplyAspectMode(mode, true);
 }
 
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_set_pe_callback(HostPeEventFn fn, void* user) { g_pe=fn; g_pe_user=user; }
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_sdk_array(std::uint32_t index,std::uint32_t base,
+                                                   std::uint32_t stride,std::uint32_t before) {
+  if(g_ready && !g_quit && !g_fifo_fault && g_typed_arrays)
+    (void)g_native_commands.Stage({index,base,stride},before);
+}
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_write_commands(const std::uint8_t* bytes,
+    std::uint32_t size,std::uint32_t pc,const void* metadata,std::uint32_t count) {
+  if(!bytes || !size || size>4096u || count>64u || (!metadata&&count))return;
+  if(!g_typed_arrays){(void)AppendNativeCommands(bytes,size,pc);return;}
+  const auto* commands=static_cast<const GekkoAOT::GX::NativeArrayCommand*>(metadata);
+  // Validate metadata before applying any operation. Older/invalid producers
+  // still submit the complete transport through the compatibility decoder.
+  for(unsigned i=0;i<count;++i) {
+    if(commands[i].offset>=size || commands[i].index>=16 ||
+       (i && commands[i].offset<commands[i-1].offset+12u)) {
+      (void)AppendNativeCommands(bytes,size,pc);return;
+    }
+  }
+  unsigned offset=0;
+  for(unsigned i=0;i<count;++i) {
+    const auto& c=commands[i];
+    if(c.offset>offset && !AppendNativeCommands(bytes+offset,c.offset-offset,pc))return;
+    (void)g_native_commands.Stage({c.index,c.base,c.stride},0);
+    offset=c.offset;
+  }
+  if(offset<size)(void)AppendNativeCommands(bytes+offset,size-offset,pc);
+}
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_write_sdk_commands_v317(const std::uint8_t* bytes,
+    std::uint32_t size,std::uint32_t pc,const void* metadata,std::uint32_t count) {
+  using namespace GekkoAOT::GX;
+  if(!bytes || !size || size>4096u || count>64u || (!metadata&&count))return;
+  const auto* commands=static_cast<const NativeSdkCommand*>(metadata);
+  for(unsigned i=0;i<count;++i) {
+    const auto& c=commands[i];
+    const bool valid=c.kind==NativeSdkKind::Array ? c.a<16u :
+      c.kind==NativeSdkKind::Matrix && c.c==0u && NativeMatrixRange(c.a,c.b);
+    if(!valid || c.offset>=size ||
+       (i && c.offset<commands[i-1].offset+NativeSdkWireBytes(commands[i-1]))) {
+      (void)AppendNativeCommands(bytes,size,pc);return;
+    }
+  }
+  unsigned offset=0;
+  for(unsigned i=0;i<count;++i) {
+    const auto& c=commands[i];
+    if(c.offset>offset && !AppendNativeCommands(bytes+offset,c.offset-offset,pc))return;
+    if(c.kind==NativeSdkKind::Array && g_typed_arrays)
+      (void)g_native_commands.Stage({c.a,c.b,c.c},0);
+    else if(c.kind==NativeSdkKind::Matrix && g_direct_matrices)
+      (void)g_native_commands.StageMatrix(c.a,c.b,0);
+    offset=c.offset;
+  }
+  if(offset<size)(void)AppendNativeCommands(bytes+offset,size-offset,pc);
+}
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_write(std::uint64_t value, std::uint8_t size,
                                                   std::uint32_t guest_pc) {
   if(size!=1&&size!=2&&size!=4&&size!=8) return;
   std::uint8_t bytes[8]{};
   for(std::uint8_t i=0;i<size;++i)
     bytes[i]=static_cast<std::uint8_t>(value>>((size-1u-i)*8u));
-  (void)AppendNativeFifoBytes(bytes,size,guest_pc);
+  (void)AppendNativeCommands(bytes,size,guest_pc);
 }
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_write_burst(const std::uint8_t* bytes,
                                                         std::uint32_t size,
                                                         std::uint32_t guest_pc) {
   if(size==0u || size>4096u) return;
-  (void)AppendNativeFifoBytes(bytes,size,guest_pc);
+  (void)AppendNativeCommands(bytes,size,guest_pc);
 }
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_cache_control(std::uint8_t operation,
                                                          std::uint32_t address) {
   if(!g_ready || g_fifo_fault || g_quit) return;
   NotifyGuestVertexCacheControl(operation,address);
+}
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_memory_write(std::uint32_t address,
+                                                        std::uint32_t size) {
+  if(!g_ready || g_fifo_fault || g_quit || size==0u) return;
+  NotifyGuestMemoryWriteRange(address,size);
 }
 // v162: CPU-visible EFB Z aperture for retail GXPeekZ loads. Aurora's own
 // GXCpu2Efb implementation is intentionally asynchronous: use the newest
@@ -2870,6 +5105,7 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_cache_control(std::uint8_t operation,
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_peek_z(std::uint16_t x, std::uint16_t y,
                                                    std::uint32_t* z) {
   if(!g_ready || g_fifo_fault || g_quit || z==nullptr) return false;
+  FlushEfbPokes();
   std::uint32_t value=0u;
   const bool valid=aurora::gfx::depth_peek::read_latest(x,y,value);
   aurora::gfx::depth_peek::request_snapshot();
@@ -2882,6 +5118,7 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_peek_z(std::uint16_t x, std::uint16_t
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_peek_argb(std::uint16_t x, std::uint16_t y,
                                                       std::uint32_t* argb) {
   if(!g_ready || g_fifo_fault || g_quit || argb==nullptr) return false;
+  FlushEfbPokes();
   std::uint32_t value=0u;
   const bool valid=aurora::gfx::color_peek::read_latest(x,y,value);
   aurora::gfx::color_peek::request_snapshot();
@@ -2902,6 +5139,34 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_peek_argb(std::uint16_t x, std::uint1
   *argb=color;
   return true;
 }
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_read_bbox(std::uint16_t* bounds) {
+  if (!g_ready || g_fifo_fault || g_quit || !bounds) return false;
+  const bool active = GekkoAOT::GX::NativeBoundingBoxActive();
+  if (active) {
+    FlushEfbPokes();
+    if (g_frame_open) {
+      // PE reads complete prior raster work without performing a guest EFB
+      // clear or display copy. Continue with both attachments loaded.
+      aurora::gfx::gekkoaot_preserve_efb_on_next_begin(true, true);
+      aurora_end_frame_no_present();
+      g_frame_open = false;
+    }
+    aurora::gfx::render_worker::synchronize();
+  }
+  const bool result = GekkoAOT::GX::ReadNativeBoundingBox(bounds);
+  if (active && !g_quit && aurora_begin_frame()) g_frame_open = true;
+  return result;
+}
+// CPU EFB pokes are ordered after the pending WGPIPE batch and before the next
+// guest-visible draw/copy. Reuse Aurora's partial clear draw so MSAA, resource
+// lifetime and pass continuation follow the ordinary EFB command stream.
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_poke_efb(std::uint16_t x, std::uint16_t y,
+                                                     std::uint32_t value, bool depth) {
+  if (!g_ready || !g_frame_open || g_fifo_fault || g_quit || x >= 640u || y >= 528u)
+    return false;
+  QueueEfbPoke(x,y,value,depth);
+  return true;
+}
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_present() {
   PresentViXfb(0u,0u,false);
 }
@@ -2914,11 +5179,27 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_present_xfb_ex(
     std::uint32_t stride_bytes, std::uint32_t field_height) {
   PresentViXfb(top,bottom,true,width,stride_bytes,field_height);
 }
+// v300 optional ABI: same VI scanout as present_xfb_ex, executed by the host's
+// GX worker in FIFO order. It never pumps window events.
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_present_xfb_async(
+    std::uint32_t top, std::uint32_t bottom, std::uint32_t width,
+    std::uint32_t stride_bytes, std::uint32_t field_height) {
+  if (g_fifo_fault || g_quit) return;
+  PresentViXfb(top,bottom,true,width,stride_bytes,field_height,false);
+}
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_consume_frame_ready(std::uint32_t* xfb_address) {
-  if(!g_ready || !g_frame_ready_pending) return false;
-  if(xfb_address) *xfb_address=g_frame_ready_xfb;
-  g_frame_ready_pending=false;
-  return true;
+  if(!g_ready) return false;
+  const auto xfb = g_frame_ready_xfb.exchange(0, std::memory_order_acq_rel);
+  if (xfb_address) *xfb_address = xfb;
+  return xfb != 0;
+}
+// Optional ABI: this poll only touches the atomic mailbox and is safe while
+// the parser worker is running. Renderer state still requires a host fence
+// after a non-empty result, and all MMIO/FIFO fences retain their old ordering.
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_consume_frame_ready_async(std::uint32_t* xfb_address) {
+  const auto xfb = g_frame_ready_xfb.exchange(0, std::memory_order_acq_rel);
+  if (xfb_address) *xfb_address = xfb;
+  return xfb != 0;
 }
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_frame_interpolation_ready() {
   return g_ready && g_frame_interpolation_enabled && g_interp_previous_valid && g_interp_current_valid;
@@ -2934,6 +5215,32 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_present_interpolated(float alpha) {
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_should_quit(){ PollEvents(); return g_quit; }
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_shutdown(){
   if(!g_ready) return;
+  if(g_native_vertex_gather)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_VERTEX_GATHER_V318_STATS draws=%llu packed_bytes=%llu source_window_bytes=%llu\n",
+      static_cast<unsigned long long>(g_native_gather_draws),
+      static_cast<unsigned long long>(g_native_gather_bytes),
+      static_cast<unsigned long long>(g_native_gather_windows));
+  if(g_typed_arrays)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_TYPED_COMMANDS_V313_STATS arrays=%llu fallback=%llu declined=%llu\n",
+      static_cast<unsigned long long>(g_native_commands.NativeCalls()-g_native_commands.MatrixCalls()),
+      static_cast<unsigned long long>(g_native_commands.FallbackCalls()),
+      static_cast<unsigned long long>(g_native_commands.DeclinedHints()));
+  if(g_direct_matrices)
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_DIRECT_MATRICES_V317_STATS matrices=%llu fallback=%llu\n",
+      static_cast<unsigned long long>(g_native_commands.MatrixCalls()),
+      static_cast<unsigned long long>(g_native_commands.FallbackCalls()));
+  if(g_fifo_stream_stats)
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_GX_STREAM_FIFO_V239_STATS submitted=%llu copied=%llu direct=%llu forensic=%u\n",
+                 static_cast<unsigned long long>(g_fifo_submitted_bytes),
+                 static_cast<unsigned long long>(g_fifo_copied_bytes),
+                 static_cast<unsigned long long>(g_fifo_direct_bytes),
+                 g_fifo_forensic_trace?1u:0u);
+  FlushEfbPokes();
+  if (g_efb_poke_stats)
+    std::fprintf(stderr,"GEKKOAOT_EFB_POKE_V164_STATS writes=%llu draws=%llu\n",
+                 static_cast<unsigned long long>(g_efb_poke_writes),
+                 static_cast<unsigned long long>(g_efb_poke_draws));
   // Stop accepting host work first, then finish the producer-owned frame while
   // Aurora's render worker and WebGPU device are still alive. The host keeps
   // this DSO mapped until process exit so spontaneous Dawn cancellation
@@ -2958,6 +5265,12 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_shutdown(){
   g_ram_xfb_candidate_epoch=0u;
   g_interp_previous={}; g_interp_current={};
   g_interp_previous_valid=false; g_interp_current_valid=false;
+  aurora::gfx::render_worker::synchronize();
+  GekkoAOT::GX::ShutdownNativeBoundingBox();
+  // Release optional host presentation resources while Dawn's device and
+  // window/WSI are alive; function-static handles must not defer this to exit.
+  UniversalPostFxResources()={};
+  BlendResources()={};
   aurora_shutdown();
   g_resolve=nullptr;
   g_resolve_user=nullptr;
@@ -2973,8 +5286,28 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_shutdown(){
                static_cast<unsigned long long>(g_array_cache_control_events),
                static_cast<unsigned long long>(g_array_cache_invalidations));
   std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_ARRAY_UPLOAD_V190_STATS persistent_uploads=%llu persistent_bytes=%llu adaptive_fallbacks=%llu content_hits=%llu\n",
+               static_cast<unsigned long long>(g_persistent_array_uploads),
+               static_cast<unsigned long long>(g_persistent_array_upload_bytes),
+               static_cast<unsigned long long>(g_adaptive_array_fallbacks),
+               static_cast<unsigned long long>(g_content_array_hits));
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_COMPACT_ARRAY_WINDOWS_V293_STATS uploads=%llu bytes=%llu original_prefix_bytes=%llu rollovers=%llu fallbacks=%llu\n",
+               static_cast<unsigned long long>(g_compact_array_uploads),
+               static_cast<unsigned long long>(g_compact_array_bytes),
+               static_cast<unsigned long long>(g_compact_array_prefix_bytes),
+               static_cast<unsigned long long>(g_compact_array_rollovers),
+               static_cast<unsigned long long>(g_compact_array_fallbacks));
+  std::fprintf(stderr,
                "GEKKOAOT_NATIVE_GX_SHUTDOWN_V12=1 order=drain-endframe-events-aurora dso=pinned\n");
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_ARRAY_SNAPSHOTS_V303_STATS staged=%llu\n",
+               static_cast<unsigned long long>(g_native_array_snapshot_stages));
+  const auto index_stats=g_native_index_ranges.Statistics();
+  std::fprintf(stderr,"GEKKOAOT_NATIVE_INDEX_RANGES_V307_STATS hits=%llu misses=%llu admitted=%llu rejected=%llu\n",
+      static_cast<unsigned long long>(index_stats.hits),static_cast<unsigned long long>(index_stats.misses),
+      static_cast<unsigned long long>(index_stats.admitted),static_cast<unsigned long long>(index_stats.rejected));
   g_fifo.clear();
+  g_native_commands.Reset();
   g_fifo_read=0;
   g_fifo_need=1;
   g_fifo_fault=false;
@@ -2998,9 +5331,21 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_shutdown(){
   g_texture_image3_word.fill(0);
   g_texture_image3_valid=0;
   g_texture_image3_written=0;
+  g_texture_ui_source_hash.fill(0);
+  g_texture_ui_source_hash_valid=0;
   g_array_frame_refresh=false;
   g_array_available.fill(0);
   g_array_guest_base.fill(0);
+  for(auto& slot : g_persistent_array_slots) slot = {};
+  g_persistent_array_cursor=0;
+  g_persistent_array_frame=UINT32_MAX;
+  g_persistent_array_reset_pending=false;
+  g_persistent_array_cache=false;
+  g_persistent_array_min_bytes=8u*1024u;
+  g_persistent_array_uploads=0;
+  g_persistent_array_upload_bytes=0;
+  g_persistent_array_hits=0;
+  g_persistent_array_fallbacks=0;
   g_array_cache_control_events=0;
   g_array_cache_invalidations=0;
   g_array_cache_control_logs=0;
@@ -3015,6 +5360,13 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_shutdown(){
   for(auto& slot : g_xfb_slots) slot = {};
   g_xfb_generation=0;
   g_display_copy_count=0;
+  g_camera_signature.store(0,std::memory_order_relaxed);
+  g_camera_observed_copy.store(0,std::memory_order_relaxed);
+  g_camera_copy_epoch.store(0,std::memory_order_relaxed);
+  g_camera_area_epoch=~std::uint64_t{0};g_camera_best_area=0.f;
+  g_camera_coefficients={};g_camera_cached_signature=0;
+  g_camera_published_signature=0;
+  g_camera_published_copy=~std::uint64_t{0};
   g_interp_previous={}; g_interp_current={};
   g_interp_previous_valid=false; g_interp_current_valid=false; g_interp_snapshot_count=0;
   g_fifo_fault=false;

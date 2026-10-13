@@ -6,9 +6,165 @@ GekkoAOT is still **pre-alpha**. Compatibility entries describe the furthest
 state observed during development testing and do not imply full playability.
 
 The project follows [Semantic Versioning](https://semver.org/) while it is pre-1.0.
-Future release entries are maintained by Release Please from Conventional Commits.
+Releases are prepared explicitly and published through the manual Release workflow.
 
 ## [Unreleased]
+
+## [0.0.7](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.6...v0.0.7) (2026-10-13)
+
+This entry covers the local implementation since the public `main` baseline [`063f218`](https://github.com/ant0-blase/GekkoAOT/commit/063f21858dd147c2bcd30c096c10621dc5f3ef05), including the compiler/runtime, graphics, audio, compatibility and launcher changes accumulated after 0.0.6.
+
+### Compatibility coverage and boot progress
+
+- Expanded the documented runtime coverage to 23 titles/developer samples, with gameplay, menus, opening video and boot activity recorded separately. These are development observations, not complete-game certifications.
+- Documented **Harry Potter and the Prisoner of Azkaban** reaching the Hogwarts Express gameplay corridor, alongside the existing **Chamber of Secrets** courtyard and **Sorcerer's Stone** gameplay observations.
+- Documented **GoldenEye: Rogue Agent** Fort Knox gameplay and **Call of Duty: Finest Hour** Stalingrad gameplay; pending-interrupt and graphics-completion paths received additional fixes.
+- Included **Disney/Pixar Cars** racing gameplay, **Animaniacs: The Great Edgar Hunt** menu/card navigation, **Finding Nemo** menu execution and **Driven** card/menu execution.
+- Recorded **Disney's Hide & Sneak** earlier first-level LLVM gameplay and later restored REL discovery, plus **Disney's Magical Mirror Starring Mickey Mouse** boot/rendering activity after nested-directory extraction fixes.
+- Included user-observed gameplay for **Luigi's Mansion**, **Tales of Symphonia**, **Ghost Recon 2**, **Star Fox Adventures**, **Terminator 3** and **Resident Evil**. Their remaining rendering, audio, movie or transition issues are listed with the observed state.
+- Retained **Mario Kart: Double Dash!!**, **Super Mario Sunshine**, **MOH Frontline** and the developer demo observations, and added the limited **MOH Rising Sun** level-selection and **Tony Hawk's Underground** opening-video/card-navigation results.
+- Kept additional corpus/compiled targets separate from verified runtime starts. See [Compatibility](docs/COMPATIBILITY.md) for the complete table and remaining work.
+
+### PowerPC AOT and native call boundaries
+
+- Expanded static direct-call/tailcall lowering and compile-time native-intercept filtering; known host services avoid repeated generic dispatch/admission work.
+- Added optional owner-specific hardware, address-window, flat-VM and locked-cache bindings while retaining compatibility with older modules.
+- Improved direct secondary-image routing using module-owned caches, immutable page indices and dense instruction-owner tables, with fallback for gaps, aliases and sparse/oversized images.
+- Hoisted stable secondary-chain policy checks out of repeated dispatch iterations and kept cold legacy routing separate from native superchains.
+- Added pending-IRQ epoch barriers when enabling MSR[EE] and when returning through RFI, so primary/secondary chains yield at interrupt-visible boundaries.
+- Preserved poll-park exits and saturated-event-counter handling rather than redispatching a parked loop or treating saturation as a safe chain.
+- Added static host-call and cold FP-unavailable exits, SPR re-entry boundaries and additional alternate-entry support.
+- Added LLVM state alias metadata and pure owner-service annotations to reduce redundant loads/calls without applying blanket fast-math.
+- Preserved both LLVM and Portable C AOT, including direct/inlined Portable C memory helpers and exact compatibility paths.
+
+### Memory, VM, cache publication and exceptions
+
+- Added a guarded 4 GiB host guest-address window, with checked `base + EA` lowering for admitted RAM accesses and shared cached/uncached backing.
+- Added direct flat-VM access with per-access admission so changes to paging controls can revoke a previously valid view.
+- Added resident paged-VM lowering through an owner-specific translation mirror, with MSR/segment, permission, reference/change-bit and page-boundary checks.
+- Added direct locked-cache scalar/paired accesses to the same storage used by SDK DMA, retaining exact extents and fallback at invalid boundaries.
+- Improved DSI restart/fault propagation, including quantized helpers and unrecoverable-vector state handling, rather than losing a memory exception across a native helper.
+- Added guest-write/cache-publication tracking for renderer resources and executable routing; texture/array reuse is invalidated by relevant writes and EFB copies.
+- Added native memory/string operations over validated contiguous spans and page-aware guest reads, with conservative decline when paged operands are not resident.
+- Added Linux transparent huge-page backing for suitable AOT text while retaining fixed function addresses, executable protections and an unchanged mapping on failure.
+
+### Scalar, paired-single and quantized floating point
+
+- Specialized dynamic-GQR float cases instead of expanding every quantization type into each generated body; other types retain helper paths.
+- Resolved paired memory spans once before conversion where a direct host span can safely cover both elements.
+- Added exact/native f32 expansion for quantized float loads, including dedicated handling of denormals and NaNs.
+- Added direct paired/quantized WGPIPE submission and dynamic-address gather attempts before publishing unnecessary CPU state.
+- Expanded admitted native scalar arithmetic and division, respecting FPSCR controls, non-IEEE behavior and exceptional-result fallback.
+- Added scalar/paired FMA and paired arithmetic specializations with explicit rounding, denormal and non-IEEE handling.
+- Coalesced proven paired-FP regions without crossing alternate entries or observable boundaries, preserving the first FP-unavailable exception PC.
+- Retained independent controls for regression comparisons; state-SSA/full register-residency experiments are not represented as universal defaults.
+
+### Native SDK, OS and timing services
+
+- Enabled NativeHW and all nine host-service components by default in the standalone runtime as well as fresh launcher configurations. Explicit umbrella/device opt-outs remain available, and launcher diagnostics now report the NativeHW selection.
+- Added a structural SDK service corpus and generators; recognition metadata is separated from complete-body semantic admission.
+- Expanded native `PADRead`, `DVDFastOpen`, memory/string/cache helpers, SDK clock leaves, `GXSetArray` and normal/position/texture matrix services.
+- Added complete-body checks for GX SDK variants and explicit context-capture requirements for scheduler/context services. Unsupported or modified bodies retain compiled PPC execution.
+- Improved NativeOS lazy FPU ownership and context save/load/current-context boundaries, preserving architectural FP state for the guest SDK handler.
+- Added deadline-driven idle handling across device, decrementer and OS events, with bounded RAM/counter poll proofs and clock-spin parking.
+- Kept interrupt-disabled finite waits and pending IRQ latches distinct from actual guest interrupt delivery.
+- Reduced hot-path environment scans and repeated priority/queue/service bookkeeping where the effective policy is immutable for a session.
+- Kept arbitrary guest-rate limiting opt-in; a lower CPU percentage obtained by slowing simulation is not treated as an optimization.
+
+### WGPIPE, FIFO, CP and PE ordering
+
+- Added native write-gather append paths for admitted store widths and typed SDK packet submission, retaining partial gathers and guest FIFO mirrors.
+- Batched CP burst consumption and pointer advancement; complete safe stream ranges can be submitted without repeated per-command copies.
+- Added direct producer batch slots and ordered host-command metadata without separate per-SDK-call allocation or publication.
+- Added direct BP/CP/XF state ingress after validated framing, avoiding a second renderer opcode/header decode for supported commands.
+- Queued ordered PE token/finish notifications until acknowledgment instead of overwriting an enabled unacknowledged event.
+- Deferred breakpoint-release progress to the proper hardware boundary so stop/rearm sequences are not consumed prematurely inside a register write.
+- Published queued work promptly at guest idle and completion-related BP boundaries, reducing `GXDrawDone` waits.
+- Retained custom display lists, forensic/raw recording, backlogs, breakpoints and unsupported paths as compatibility fallbacks.
+
+### NativeGX batching and GPU resource costs
+
+- Added compatible adjacent-draw coalescing, including bounded primitive expansion with preserved order and winding.
+- Added ordered typed array/matrix commands so proven SDK operations update native Aurora state without CP/XF packet parsing.
+- Added cached attribute plans, native vertex programs and packed gathering for supported short indexed draws.
+- Added compact INDEX16 upload windows with exact shader index bias, preserving sparse indices, NBT3 and guest mutations.
+- Added snapshot atlases, array tiles, persistent GPU snapshots and native resource tables with immutable pending-draw ranges.
+- Added encoder-scoped bind-group caching with invalidation at pass/custom-encoder boundaries and exact dynamic offsets.
+- Added texture-source/version reuse with BP invalidation, EFB-copy and guest-publication checks, reducing repeated decode/hash work.
+- Added persistent staging/storage pools and lazy staging; optional upload-arena/snapshot-recycling experiments remain independently selectable.
+- Enabled stronger closed-plugin code generation and IPO/LTO where supported, while keeping portable release CPU policies.
+- Reset GPU caches, Dawn handles and pending state correctly across renderer teardown/restart.
+
+### EFB, textures, shadows and widescreen
+
+- Added GPU fragment bounding-box accumulation/readback and BP integration, with guest coordinates, scissor and fragment visibility handling for paths used by the Mickey titles.
+- Improved color/depth EFB peeks/pokes, copy-format conversion and batched poke handling.
+- Preserved the appropriate EFB attachments across bounded display-copy recordings, including no-clear and color-preserving depth-clear cases, without unbounded host frames.
+- Improved texture-source invalidation, repeated BP decoding after XF aliases, missing texture-coordinate defaults and manual SU sampling scale used by movie Y/U/V passes.
+- Added BP scissor-offset decoding and consistent viewport/scissor adjustment while preserving EFB copy coordinates.
+- Distinguished perspective scenes, orthographic UI, screen fills and observed texture/shadow producer passes for widescreen projection/scissor handling.
+- Corrected clipping of aspect-corrected UI, including Luigi's Game Boy Horror; the Tales of Symphonia map/save result was also checked with the user.
+- Retained 3D camera/frustum candidates across subsequent HUD projections and limited redundant per-frame camera work. Universal CPU-side culling and every shadow pass are still unfinished.
+- Added configurable host post-processing after final XFB scanout: sharpen, bloom, vignette, grain, tone and local contrast, without changing guest EFB/RAM data.
+
+### DVD, VFS and streamed disc audio
+
+- Preserved nested FST directories and migrated old extraction-policy caches so embedded REL/executable discovery can find their files.
+- Added native FST leaf lookup and host-backed DVDFileInfo population for admitted SDK bodies.
+- Added persistent file/nod handle reuse for immutable disc reads while retaining live overlay reopening.
+- Improved asynchronous DI completion, cancellation, drive-cover/stop behavior and shutdown quiescence of pending host I/O.
+- Added streamed DVD/DTK ADPCM decoding and mixing into host audio, with current/next track handling, stream status/position, volume and sample-rate conversion.
+- Kept drive bookkeeping and IRQ/register behavior in DI rather than requiring every disc provider to duplicate it.
+
+### DSP, AX and JAudio
+
+- Expanded JAudio standard/light protocol recognition, synchronization masks, deferred acknowledgments and frame/subframe voice processing.
+- Added main-RAM PCM16 voice sources and direct resident VPB access, preserving the PPC-owned tail during writeback.
+- Corrected AFC sample caching, predictor history and non-aligned loop handling.
+- Matched signed 16-bit mixer wrap, gain/ramp scaling and front stereo DAC output; avoided adding rear/wet effects twice.
+- Improved DSP reset/bootstrap/task-mail transitions and separated protocol deadlines from interrupt acknowledgment.
+- Added deferred ARAM DMA busy-clear/completion IRQ timing and relevant idle wake deadlines.
+- Improved host audio buffering and frame mixing, retaining standalone DSP fallback for unknown microcode families.
+- Improved optional VP6/VP6F conversion through libswscale when available. Full movie frontends and H4M/HVQM4 decoding are not claimed complete.
+
+### Input, memory cards and launcher
+
+- Added native EXI host-card storage, initialization/checksums, command/DMA handling and coalesced dirty-range persistence.
+- Improved SI automatic polling, explicit transfers and idle input deadlines so keyboard/gamepad state remains responsive.
+- Corrected legacy shoulder/trigger mappings and keyboard/controller stick composition; reduced unnecessary device-health polling while keeping input sample cadence.
+- Enabled NativeOS for new launcher settings and retained existing user preferences, launcher cards and explicit native environment overrides.
+- Made selected host-FPS, MSAA, anisotropy and post-processing settings authoritative rather than silently forcing different native-profile values.
+- Exposed and defaulted additional proven native lowering/rendering paths while keeping independent fallback controls.
+
+### Compilation, caching and regression coverage
+
+- Added compiler worker batching and adaptive REL scheduling under a shared CPU-slot budget.
+- Made ThinLTO bitcode emission on-demand, reduced unnecessary fallback audits and bounded expensive coalescing/vectorizer searches.
+- Preserved source timestamps across deterministic dependency patch composition so unchanged sources do not trigger needless compiler/renderer rebuilds.
+- Separated translated-object and final module/glue identities, included effective native options/capabilities, and added source/toolchain fingerprints for secondary caches.
+- Added pipeline serialization and compiler snapshots to avoid conflicting builds and stale dependency/configuration reuse.
+- Improved per-object build progress, cached-object reporting and failure retry behavior.
+- Registered the runner-dependent FP policy integration test only for native-host builds, with an explicit helper dependency; tools-only builds remain independently testable.
+- Expanded native hardware, SDK admission, VM/fault, FP, vertex/resource, PE/FIFO ordering, restart and build/cache tests. Linux release preparation passed 79 CTest cases plus five publication-boundary tests.
+
+### Release maintenance
+
+- Launch the Windows REL-to-DOL pre-scan directly through CreateProcessW, preserve quoted shell fallback commands, and test real helper execution with spaces, brackets, argument quotes and exit-code propagation.
+- Publish rebuilt release assets through a draft, refreshing the version tag and release notes only after successful platform builds.
+- Run CTest in both CI and release jobs; keep large PE test fixtures off the Windows stack and accept CMake tool-cache type variations when validating reusable builds.
+- Fixed MSVC test portability (Windows file timestamps and empty argument packs) and Clang narrowing in the generated Aurora texture cache key.
+- Added retained gameplay screenshots for Luigi’s Mansion, Chamber of Secrets, GoldenEye and Call of Duty to the README gallery.
+- Updated the full README, preserving its screenshots, technical explanations and long-term architecture sections, and expanded the compatibility documentation.
+- Consolidated old versioned development/audit notes into maintained topic documents; raw audit CSVs and profiling captures stay local.
+- Removed inactive Release Please metadata and code backups; version 0.0.7 remains an explicit manual-release preparation.
+- Added source/archive/package exclusion rules and publication-content checks to CI and the manual release workflow.
+
+### Remaining limits
+
+- Full-game compatibility, later transitions, sound/movie families and visual correctness remain title- and scene-dependent.
+- Complete SDK replacement, CPUState/dispatcher removal, custom FIFO/MMIO elimination, universal frustum/widescreen correction and full H4M/movie support remain unfinished.
+- Known Luigi flashlight/rectangle, Sunshine water, Ghost Recon movie/widescreen and effect-dependent performance issues remain follow-up targets.
+- No universal CPU-use target or two-to-three-minute cold compilation ceiling has been established.
 
 ## [0.0.6](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.5...v0.0.6) (2026-09-27)
 

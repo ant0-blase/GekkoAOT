@@ -16,6 +16,9 @@ struct BuildRequest
     QString toolchain;
     QString llvmDir;
     QString nativeAbi;
+    bool nativeOs = true;
+    bool nativeHw = true;
+    QString runtimeWorkers = "parallel";
     QString runArgs;
     QString userDir;
     QString windowSystem;
@@ -23,7 +26,18 @@ struct BuildRequest
     QString aspectMode;
     QString resolution;
     bool fullscreen = false;
+    bool frameInterpolation = false;
     int fpsLimit = 120;
+    int msaaSamples = 1;
+    int textureAnisotropy = 16;
+    bool postProcessing = true;
+    QString postPreset = "balanced";
+    double postSharpen = 0.28;
+    double postBloom = 0.10;
+    double postVignette = 0.06;
+    double postGrain = 0.0;
+    double postTone = 0.15;
+    double postLocalContrast = 0.08;
     QString uiScale;
     QString inputConfig;
     QMap<QString, QString> gameEnvironment;

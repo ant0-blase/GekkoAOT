@@ -14,6 +14,9 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
+#if defined(GEKKOAOT_HAVE_FFMPEG_SWSCALE)
+#include <libswscale/swscale.h>
+#endif
 }
 #endif
 
@@ -32,7 +35,11 @@ std::string AvError(int error) {
 }
 
 bool ConvertFrameToRgba(const AVFrame* source, NativeVP6Frame* output,
-                        std::string* error) {
+                        std::string* error
+#if defined(GEKKOAOT_HAVE_FFMPEG_SWSCALE)
+                        , SwsContext** cached_sws
+#endif
+                        ) {
   if (!source || !output || source->width <= 0 || source->height <= 0) {
     if (error) *error = "invalid decoded VP6 frame";
     return false;
@@ -56,6 +63,27 @@ bool ConvertFrameToRgba(const AVFrame* source, NativeVP6Frame* output,
   output->width = width;
   output->height = height;
   output->rgba.resize(static_cast<std::size_t>(width) * height * 4u);
+
+#if defined(GEKKOAOT_HAVE_FFMPEG_SWSCALE)
+  if (cached_sws) {
+    *cached_sws = sws_getCachedContext(
+        *cached_sws, source->width, source->height,
+        static_cast<AVPixelFormat>(source->format), source->width, source->height,
+        AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    if (*cached_sws) {
+      const int colorspace = source->colorspace == AVCOL_SPC_BT709 ? SWS_CS_ITU709 : SWS_CS_ITU601;
+      const int* coeff = sws_getCoefficients(colorspace);
+      const int full = source->color_range == AVCOL_RANGE_JPEG ? 1 : 0;
+      (void)sws_setColorspaceDetails(*cached_sws, coeff, full, coeff, 1,
+                                    0, 1 << 16, 1 << 16);
+      std::uint8_t* dst_data[4] = {output->rgba.data(), nullptr, nullptr, nullptr};
+      int dst_linesize[4] = {static_cast<int>(width * 4u), 0, 0, 0};
+      const int rows = sws_scale(*cached_sws, source->data, source->linesize, 0,
+                                 source->height, dst_data, dst_linesize);
+      if (rows == source->height) return true;
+    }
+  }
+#endif
 
   const int hsub = desc->log2_chroma_w;
   const int vsub = desc->log2_chroma_h;
@@ -99,6 +127,9 @@ struct NativeVP6Decoder::Impl {
   AVCodecContext* context = nullptr;
   AVFrame* frame = nullptr;
   AVPacket* packet = nullptr;
+#if defined(GEKKOAOT_HAVE_FFMPEG_SWSCALE)
+  SwsContext* sws = nullptr;
+#endif
 #endif
 };
 
@@ -164,6 +195,10 @@ void NativeVP6Decoder::Flush() {
 void NativeVP6Decoder::Close() {
 #if defined(GEKKOAOT_HAVE_FFMPEG_VP6)
   if (impl_) {
+#if defined(GEKKOAOT_HAVE_FFMPEG_SWSCALE)
+    if (impl_->sws) sws_freeContext(impl_->sws);
+    impl_->sws = nullptr;
+#endif
     if (impl_->packet) av_packet_free(&impl_->packet);
     if (impl_->frame) av_frame_free(&impl_->frame);
     if (impl_->context) avcodec_free_context(&impl_->context);
@@ -214,7 +249,11 @@ bool NativeVP6Decoder::Decode(std::span<const std::uint8_t> bytes,
     last_error_ = "avcodec_receive_frame(VP6): " + AvError(rc);
     return false;
   }
-  return ConvertFrameToRgba(impl_->frame, output, &last_error_);
+  return ConvertFrameToRgba(impl_->frame, output, &last_error_
+#if defined(GEKKOAOT_HAVE_FFMPEG_SWSCALE)
+                            , &impl_->sws
+#endif
+                            );
 #else
   (void)bytes;
   last_error_ = "GekkoAOT was built without libavcodec VP6 support";

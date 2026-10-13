@@ -1,0 +1,268 @@
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -617,10 +617,9 @@
+   }
+   cache.lastDrawFmt = fmt;
+   diagnose_draw_ranges(vertRange, idxRange, vtxCount, numIndices, cache.config.shaderConfig.vtxStride);
+-  gfx::push_draw_command(DrawData{
++  DrawData draw{
+       .pipeline = cache.pipelineRef,
+       .bindGroups = cache.bindGroups,
+-      .vertRange = vertRange,
+       .idxRange = idxRange,
+       .uniformRange = cache.uniformRange,
+       .immediateData = immediates,
+@@ -628,7 +627,33 @@
+       .indexCount = numIndices,
+       .instanceCount = instanceCount,
+       .dstAlpha = state.dstAlpha,
+-  });
++  };
++  const bool logic = state.blendMode == GX_BM_LOGIC && shader_logic_op(state.blendOp) &&
++                     (state.colorUpdate || state.alphaUpdate);
++  if (!logic) {
++    gfx::push_draw_command(draw);
++    return;
++  }
++  // Snapshot per primitive: overlapping triangles must consume the previous
++  // primitive's output. Ordinary blends never enter this slower path.
++  const u32 count = lineMode ? instanceCount : (numIndices ? numIndices : vtxCount) / 3u;
++  for (u32 i = 0; i < count; ++i) {
++    auto primitive = draw;
++    primitive.logicDestination = snapshot_logic_destination();
++    if (lineMode) {
++      primitive.instanceCount = 1;
++      primitive.immediateData.vtxStart += i * (prim == GX_LINES ? 2u : 1u) *
++                                          cache.config.shaderConfig.vtxStride;
++    } else if (numIndices) {
++      primitive.idxRange.offset += i * 3u * sizeof(u16);
++      primitive.idxRange.size = 3u * sizeof(u16);
++      primitive.indexCount = 3;
++    } else {
++      primitive.immediateData.vtxStart += i * 3u * cache.config.shaderConfig.vtxStride;
++      primitive.vtxCount = 3;
++    }
++    gfx::push_draw_command(primitive);
++  }
+ }
+ 
+ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange) noexcept {
+@@ -662,7 +687,8 @@
+   const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
+                           prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
+   auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
+-  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1;
++  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1 &&
++                        !(g_gxState.blendMode == GX_BM_LOGIC && shader_logic_op(g_gxState.blendOp));
+ 
+   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
+   const auto vertexData = reader.take(totalVtxBytes);
+@@ -683,15 +709,14 @@
+       idxRange = gfx::push_indices(idxBuf.data(), idxBuf.size(), hadIndexRange ? 0 : 4);
+       idxBuf.clear();
+     }
+-    CHECK(lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset,
+-          "Non-consecutive vertex ranges ({} < {})", lastDraw->vertRange.offset + lastDraw->vertRange.size,
++    CHECK(lastDraw->immediateData.vtxStart + lastDraw->vtxCount * vtxSize == vertRange.offset,
++          "Non-consecutive vertex ranges ({} < {})", lastDraw->immediateData.vtxStart + lastDraw->vtxCount * vtxSize,
+           vertRange.offset);
+     if (hadIndexRange) {
+       CHECK(lastDraw->idxRange.offset + lastDraw->idxRange.size == idxRange.offset,
+             "Non-consecutive index ranges ({} < {})", lastDraw->idxRange.offset + lastDraw->idxRange.size,
+             idxRange.offset);
+     }
+-    lastDraw->vertRange.size += vertRange.size;
+     if (lastDraw->idxRange.size == 0) {
+       lastDraw->idxRange = idxRange;
+     } else {
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -1682,6 +1682,31 @@
+     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
+   }
+ 
++  if (shader_logic_op(static_cast<GXLogicOp>(config.logicOp))) {
++    texBindings += "\n@group(3) @binding(0) var logic_destination: texture_2d<f32>;";
++    constexpr std::array<std::string_view, 16> expressions{
++      "vec4u(0u)",
++      "s & d",
++      "s & ~d",
++      "s",
++      "~s & d",
++      "d",
++      "s ^ d",
++      "s | d",
++      "~(s | d)",
++      "~(s ^ d)",
++      "~d",
++      "s | ~d",
++      "~s",
++      "~s | d",
++      "~(s & d)",
++      "vec4u(255u)",
++    };
++    fragmentFn += "\n    let s = vec4u(round(clamp(prev, vec4f(0.0), vec4f(1.0)) * 255.0));"
++                  "\n    let d = vec4u(round(textureLoad(logic_destination, vec2i(in.pos.xy), 0) * 255.0));";
++    fragmentFn += fmt::format("\n    prev = vec4f(({}) & vec4u(255u)) / 255.0;", expressions[config.logicOp & 15u]);
++  }
++
+   if (dstAlphaMode == DstAlphaMode::Replace) {
+     // GX destination alpha is set via the blend constant
+     fragmentFn += "\n    prev.a = 1.0;";
+--- a/lib/gx/pipeline.cpp
++++ b/lib/gx/pipeline.cpp
+@@ -91,6 +91,8 @@
+   if (data.bindGroups.textureBindGroup) {
+     pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
+   }
++  pass.SetBindGroup(3, data.logicDestination ? gfx::find_bind_group(data.logicDestination)
++                                           : g_emptyLogicBindGroup);
+   pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+   if (data.dstAlpha != UINT32_MAX) {
+     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
+--- a/lib/gx/pipeline.hpp
++++ b/lib/gx/pipeline.hpp
+@@ -7,7 +7,7 @@
+ struct DrawData {
+   gfx::PipelineRef pipeline;
+   GXBindGroups bindGroups;
+-  gfx::Range vertRange;
++  gfx::BindGroupRef logicDestination;
+   gfx::Range idxRange;
+   gfx::Range uniformRange;
+   DrawImmediateData immediateData;
+@@ -17,7 +17,7 @@
+   uint32_t dstAlpha;
+ };
+ 
+-constexpr uint32_t GXPipelineConfigVersion = 14;
++constexpr uint32_t GXPipelineConfigVersion = 15;
+ struct PipelineConfig {
+   uint32_t version = GXPipelineConfigVersion;
+   uint32_t msaaSamples = 1; // deprecated
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -30,6 +30,7 @@
+ 
+ GXState g_gxState{};
+ wgpu::BindGroup g_emptyTextureBindGroup;
++wgpu::BindGroup g_emptyLogicBindGroup;
+ 
+ namespace {
+ wgpu::Sampler sEmptySampler;
+@@ -41,6 +42,8 @@
+ wgpu::BindGroupLayout sTextureBindGroupLayout;
+ wgpu::BindGroupLayout sSamplerBindGroupLayout;
+ wgpu::PipelineLayout sPipelineLayout;
++wgpu::BindGroupLayout sLogicBindGroupLayout;
++gfx::TextureHandle sLogicDestination;
+ 
+ std::atomic<int> sPendingViewportPolicy{-1};
+ 
+@@ -135,6 +138,13 @@
+     };
+     break;
+   case GX_BM_LOGIC:
++    if (shader_logic_op(op)) {
++      // The fragment shader computes the integer result before write masks.
++      colorBlendComponent = {.operation = wgpu::BlendOperation::Add,
++                             .srcFactor = wgpu::BlendFactor::One,
++                             .dstFactor = wgpu::BlendFactor::Zero};
++      break;
++    }
+     switch (op) {
+       DEFAULT_FATAL("unsupported logic op {}", underlying(op));
+     case GX_LO_CLEAR:
+@@ -384,6 +394,9 @@
+ 
+   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+   config.shaderConfig = {};
++  if (g_gxState.blendMode == GX_BM_LOGIC &&
++      (g_gxState.colorUpdate || g_gxState.alphaUpdate))
++    config.shaderConfig.logicOp = static_cast<u8>(g_gxState.blendOp);
+   config.shaderConfig.fogType = g_gxState.fog.type;
+   config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
+   u8 vtxOffset = 0;
+@@ -582,10 +595,22 @@
+     g_emptyTextureBindGroup = g_device.CreateBindGroup(&desc);
+   }
+   {
++    const wgpu::BindGroupLayoutEntry logicEntry{
++        .binding = 0, .visibility = wgpu::ShaderStage::Fragment,
++        .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float,
++                                            .viewDimension = wgpu::TextureViewDimension::e2D}};
++    const wgpu::BindGroupLayoutDescriptor logicDesc{.label = "GX Logic Destination Layout",
++        .entryCount = 1, .entries = &logicEntry};
++    sLogicBindGroupLayout = g_device.CreateBindGroupLayout(&logicDesc);
++    const wgpu::BindGroupEntry emptyLogicEntry{.binding = 0, .textureView = sEmptyTextureView};
++    const wgpu::BindGroupDescriptor emptyLogicDesc{.label = "GX Empty Logic Destination",
++        .layout = sLogicBindGroupLayout, .entryCount = 1, .entries = &emptyLogicEntry};
++    g_emptyLogicBindGroup = g_device.CreateBindGroup(&emptyLogicDesc);
+     const std::array layouts{
+         gfx::detail::resources().staticBindGroupLayout,
+         gfx::detail::resources().uniformBindGroupLayout,
+         sTextureBindGroupLayout,
++        sLogicBindGroupLayout,
+     };
+     const wgpu::PipelineLayoutDescriptor desc{
+         .label = "GX Pipeline Layout",
+@@ -597,7 +622,24 @@
+   }
+ }
+ 
++gfx::BindGroupRef snapshot_logic_destination() noexcept {
++  const auto size = gfx::get_render_target_size();
++  if (!sLogicDestination || sLogicDestination->size.width != size.x ||
++      sLogicDestination->size.height != size.y)
++    sLogicDestination = gfx::new_render_texture(size.x, size.y, GX_TF_RGBA8, "GX Logic Destination");
++  gfx::resolve_pass_into(sLogicDestination,
++      {.x = 0, .y = 0, .width = static_cast<int32_t>(size.x), .height = static_cast<int32_t>(size.y)},
++      false, false, false, {}, 0.f);
++  const WGPUBindGroupEntry entry{.binding = 0, .textureView = sLogicDestination->sampleTextureView.Get()};
++  const WGPUBindGroupDescriptor desc{.label = {"GX Logic Destination", WGPU_STRLEN},
++      .layout = sLogicBindGroupLayout.Get(), .entryCount = 1, .entries = &entry};
++  return gfx::bind_group_ref(desc);
++}
++
+ void shutdown() noexcept {
++  sLogicDestination = {};
++  sLogicBindGroupLayout = {};
++  g_emptyLogicBindGroup = {};
+   // TODO we should probably store this all in g_state.gx instead
+   sSamplerBindGroupLayout = {};
+   sTextureBindGroupLayout = {};
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -509,7 +509,7 @@
+   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
+   u8 fogRangeEnabled : 1 = false;
+   u8 pad1 : 5 = 0;
+-  u8 pad2 = 0;
++  u8 logicOp = GX_LO_COPY;
+   u32 zTexType = 0;
+   u32 zTexOp = GX_ZT_DISABLE;
+   std::array<AttrConfig, MaxVtxAttr> attrs;
+@@ -528,6 +528,13 @@
+ 
+ struct PipelineConfig;
+ struct PipelineOptions;
++
++// Preserve destination feedback at primitive boundaries for WebGPU logic ops.
++constexpr bool shader_logic_op(GXLogicOp op) noexcept {
++  return op != GX_LO_CLEAR && op != GX_LO_COPY && op != GX_LO_NOOP;
++}
++gfx::BindGroupRef snapshot_logic_destination() noexcept;
++extern wgpu::BindGroup g_emptyLogicBindGroup;
+ 
+ struct GXBindGroups {
+   gfx::BindGroupRef textureBindGroup;
+--- a/tests/gx_test_stubs.cpp
++++ b/tests/gx_test_stubs.cpp
+@@ -119,6 +119,7 @@
+   ++g_testPipelineBuildCount;
+ }
+ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
++gfx::BindGroupRef snapshot_logic_destination() noexcept { return {}; }
+ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
+ gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; }
+ void resolve_sampled_textures(const ShaderInfo& info) noexcept {}

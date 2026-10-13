@@ -1,0 +1,190 @@
+diff --git a/src/cpu/cpu.c b/src/cpu/cpu.c
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -1255,1 +1255,0 @@
+-                set_fprf(cpu, classify_f32((f32)result));
+@@ -1297,1 +1296,0 @@
+-    set_fprf(cpu, single ? classify_f32((f32)result) : classify_f64(result));
+diff --git a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -271,1 +271,2 @@
+-  llvm::Value *pending_fprf_ = nullptr;
++  llvm::Value *pending_fprf_ = nullptr;
++  llvm::Value *pending_fprf_valid_ = nullptr;
+diff --git a/src/backend/llvm/fpr_state.cpp b/src/backend/llvm/fpr_state.cpp
+--- a/src/backend/llvm/fpr_state.cpp
++++ b/src/backend/llvm/fpr_state.cpp
+@@ -198,45 +198,97 @@
+-void FunctionEmitter::updateFPRF(Value *lane0) { pending_fprf_ = lane0; }
+-
+-void FunctionEmitter::materializeFPRF() {
+-  if (!pending_fprf_)
+-    return;
+-  Value *lane0 = pending_fprf_;
+-  pending_fprf_ = nullptr;
+-  Value *bits = builder_.CreateBitCast(lane0, Type::getInt32Ty(context_));
+-  Value *sign = builder_.CreateICmpNE(
+-      builder_.CreateAnd(bits, builder_.getInt32(0x80000000u)),
+-      builder_.getInt32(0));
+-  Value *exponent = builder_.CreateAnd(bits, builder_.getInt32(0x7F800000u));
+-  Value *normalExponent = builder_.CreateICmpULE(
+-      builder_.CreateSub(exponent, builder_.getInt32(0x00800000u)),
+-      builder_.getInt32(0x7E800000u));
+-  BasicBlock *normal = BasicBlock::Create(context_, "fprf_normal", function_);
+-  BasicBlock *unusual = BasicBlock::Create(context_, "fprf_unusual", function_);
+-  BasicBlock *join = BasicBlock::Create(context_, "fprf_join", function_);
+-  builder_.CreateCondBr(normalExponent, normal, unusual,
+-                        MDBuilder(context_).createBranchWeights(64, 1));
+-
+-  builder_.SetInsertPoint(normal);
+-  Value *normalClass = builder_.CreateSelect(sign, builder_.getInt32(0x08u),
+-                                             builder_.getInt32(0x04u));
+-  builder_.CreateBr(join);
+-
+-  builder_.SetInsertPoint(unusual);
+-  Function *fixup = getFPRFUnusualFixup(module_);
+-  CallInst *unusualClass = builder_.CreateCall(fixup, {bits}, "fprf.unusual");
+-  unusualClass->setCallingConv(fixup->getCallingConv());
+-  builder_.CreateBr(join);
+-
+-  builder_.SetInsertPoint(join);
+-  PHINode *classification =
+-      builder_.CreatePHI(Type::getInt32Ty(context_), 2, "fprf.class");
+-  classification->addIncoming(normalClass, normal);
+-  classification->addIncoming(unusualClass, unusual);
+-
+-  Value *fpscr = builder_.CreateLoad(Type::getInt32Ty(context_),
+-                                     state_[DOLIR_STATE_FPSCR]);
+-  fpscr = builder_.CreateAnd(fpscr, builder_.getInt32(~(0x1Fu << 12)));
+-  builder_.CreateStore(
+-      builder_.CreateOr(fpscr, builder_.CreateShl(classification, 12)),
+-      state_[DOLIR_STATE_FPSCR]);
+-}
++void FunctionEmitter::updateFPRF(Value *lane0) {
++  pending_fprf_ = lane0;
++  pending_fprf_valid_ = ConstantInt::getTrue(context_);
++}
++
++void FunctionEmitter::materializeFPRF() {
++  if (!pending_fprf_)
++    return;
++  Value *lane0 = pending_fprf_;
++  Value *valid = pending_fprf_valid_
++                     ? pending_fprf_valid_
++                     : ConstantInt::getTrue(context_);
++  pending_fprf_ = nullptr;
++  pending_fprf_valid_ = nullptr;
++
++  auto emitClassification = [&]() {
++    Value *classification = nullptr;
++    if (lane0->getType()->isFloatTy()) {
++      Value *bits = builder_.CreateBitCast(lane0, Type::getInt32Ty(context_));
++      Value *sign = builder_.CreateICmpNE(
++          builder_.CreateAnd(bits, builder_.getInt32(0x80000000u)),
++          builder_.getInt32(0));
++      Value *exponent =
++          builder_.CreateAnd(bits, builder_.getInt32(0x7F800000u));
++      Value *fraction =
++          builder_.CreateAnd(bits, builder_.getInt32(0x007FFFFFu));
++      Value *expZero = builder_.CreateICmpEQ(exponent, builder_.getInt32(0));
++      Value *expMax = builder_.CreateICmpEQ(
++          exponent, builder_.getInt32(0x7F800000u));
++      Value *fracZero = builder_.CreateICmpEQ(fraction, builder_.getInt32(0));
++      Value *normal = builder_.CreateSelect(
++          sign, builder_.getInt32(0x08u), builder_.getInt32(0x04u));
++      Value *zero = builder_.CreateSelect(
++          sign, builder_.getInt32(0x12u), builder_.getInt32(0x02u));
++      Value *subnormal = builder_.CreateSelect(
++          sign, builder_.getInt32(0x18u), builder_.getInt32(0x14u));
++      Value *infinity = builder_.CreateSelect(
++          sign, builder_.getInt32(0x09u), builder_.getInt32(0x05u));
++      Value *zeroOrSubnormal = builder_.CreateSelect(fracZero, zero, subnormal);
++      Value *infinityOrNaN = builder_.CreateSelect(
++          fracZero, infinity, builder_.getInt32(0x11u));
++      classification = builder_.CreateSelect(
++          expZero, zeroOrSubnormal,
++          builder_.CreateSelect(expMax, infinityOrNaN, normal), "fprf.class");
++    } else {
++      Value *bits = builder_.CreateBitCast(lane0, Type::getInt64Ty(context_));
++      Value *sign = builder_.CreateICmpNE(
++          builder_.CreateAnd(bits, builder_.getInt64(0x8000000000000000ull)),
++          builder_.getInt64(0));
++      Value *exponent = builder_.CreateAnd(
++          bits, builder_.getInt64(0x7FF0000000000000ull));
++      Value *fraction = builder_.CreateAnd(
++          bits, builder_.getInt64(0x000FFFFFFFFFFFFFull));
++      Value *expZero = builder_.CreateICmpEQ(exponent, builder_.getInt64(0));
++      Value *expMax = builder_.CreateICmpEQ(
++          exponent, builder_.getInt64(0x7FF0000000000000ull));
++      Value *fracZero = builder_.CreateICmpEQ(fraction, builder_.getInt64(0));
++      Value *normal = builder_.CreateSelect(
++          sign, builder_.getInt32(0x08u), builder_.getInt32(0x04u));
++      Value *zero = builder_.CreateSelect(
++          sign, builder_.getInt32(0x12u), builder_.getInt32(0x02u));
++      Value *subnormal = builder_.CreateSelect(
++          sign, builder_.getInt32(0x18u), builder_.getInt32(0x14u));
++      Value *infinity = builder_.CreateSelect(
++          sign, builder_.getInt32(0x09u), builder_.getInt32(0x05u));
++      Value *zeroOrSubnormal = builder_.CreateSelect(fracZero, zero, subnormal);
++      Value *infinityOrNaN = builder_.CreateSelect(
++          fracZero, infinity, builder_.getInt32(0x11u));
++      classification = builder_.CreateSelect(
++          expZero, zeroOrSubnormal,
++          builder_.CreateSelect(expMax, infinityOrNaN, normal), "fprf.class64");
++    }
++
++    Value *fpscr = builder_.CreateLoad(Type::getInt32Ty(context_),
++                                       state_[DOLIR_STATE_FPSCR]);
++    fpscr = builder_.CreateAnd(fpscr, builder_.getInt32(~(0x1Fu << 12)));
++    builder_.CreateStore(
++        builder_.CreateOr(fpscr, builder_.CreateShl(classification, 12)),
++        state_[DOLIR_STATE_FPSCR]);
++  };
++
++  if (auto *constant = dyn_cast<ConstantInt>(valid)) {
++    if (constant->isZero())
++      return;
++    emitClassification();
++    return;
++  }
++
++  BasicBlock *apply = BasicBlock::Create(context_, "fprf_apply", function_);
++  BasicBlock *skip = BasicBlock::Create(context_, "fprf_skip", function_);
++  BasicBlock *join = BasicBlock::Create(context_, "fprf_valid_join", function_);
++  builder_.CreateCondBr(valid, apply, skip,
++                        MDBuilder(context_).createBranchWeights(4096, 1));
++  builder_.SetInsertPoint(apply);
++  emitClassification();
++  builder_.CreateBr(join);
++  builder_.SetInsertPoint(skip);
++  builder_.CreateBr(join);
++  builder_.SetInsertPoint(join);
++}
+diff --git a/src/backend/llvm/runtime.cpp b/src/backend/llvm/runtime.cpp
+--- a/src/backend/llvm/runtime.cpp
++++ b/src/backend/llvm/runtime.cpp
+@@ -33,2 +33,4 @@
+-  if (slot == DOLIR_STATE_FPSCR)
+-    pending_fprf_ = nullptr;
++  if (slot == DOLIR_STATE_FPSCR) {
++    pending_fprf_ = nullptr;
++    pending_fprf_valid_ = nullptr;
++  }
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -92,1 +92,2 @@
+-    pending_fprf_ = nullptr;
++    pending_fprf_ = nullptr;
++    pending_fprf_valid_ = nullptr;
+diff --git a/src/backend/llvm/floating_point.cpp b/src/backend/llvm/floating_point.cpp
+--- a/src/backend/llvm/floating_point.cpp
++++ b/src/backend/llvm/floating_point.cpp
+@@ -485,1 +485,6 @@
+-      reloadState(DOLIR_STATE_FPSCR);
++      reloadState(DOLIR_STATE_FPSCR);
++      // v187: ppc_fma leaves FPRF deferred.  If the helper returns false due
++      // to an enabled FP exception, keep the architectural FPRF unchanged.
++      pending_fprf_ = single ? builder_.CreateFPTrunc(fused, f32) : fused;
++      pending_fprf_valid_ = success;

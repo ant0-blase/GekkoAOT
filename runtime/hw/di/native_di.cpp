@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace GekkoAOT::HW::DI {
 
@@ -15,6 +17,31 @@ constexpr std::uint8_t kCmdStopMotor = 0xe3u;
 constexpr std::uint8_t kCmdAudioBufferConfig = 0xe4u;
 constexpr std::uint32_t kInvalidCommandError = 0x00052000u;
 constexpr std::uint32_t kNoMediumError = 0x00023a00u;
+bool TraceDvd() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GEKKOAOT_TRACE_DVD");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+std::int16_t DecodeDtkNibble(std::uint8_t nibble, std::uint8_t control,
+                             std::int32_t& previous, std::int32_t& older) {
+  std::int32_t prediction = 0;
+  switch (control >> 4u) {
+  case 1u: prediction = previous * 60; break;
+  case 2u: prediction = previous * 115 - older * 52; break;
+  case 3u: prediction = previous * 98 - older * 55; break;
+  default: break;
+  }
+  prediction = std::clamp((prediction + 32) >> 6, -0x200000, 0x1fffff);
+  const std::int32_t signed_nibble = nibble < 8u ? nibble : static_cast<std::int32_t>(nibble) - 16;
+  const std::int32_t current =
+      ((signed_nibble * 4096) >> (control & 15u)) * 64 + prediction;
+  older = previous;
+  previous = current;
+  return static_cast<std::int16_t>(std::clamp(current >> 6, -32768, 32767));
+}
 }
 
 void NativeDI::Reset(bool disc_present) {
@@ -39,6 +66,74 @@ void NativeDI::Reset(bool disc_present) {
   audio_position_ = 0;
   audio_next_start_ = 0;
   audio_next_length_ = 0;
+  ResetAudioDecoder();
+}
+
+void NativeDI::ResetAudioDecoder() {
+  audio_history_.fill(0);
+  audio_frame_index_ = 28u;
+  audio_sample_phase_ = 0;
+}
+
+bool NativeDI::DecodeAudioBlock() {
+  if (!audio_streaming_ || !audio_enabled_ || !disc_present_ || !hooks_.read_audio)
+    return false;
+  if (audio_position_ >= audio_current_start_ + audio_current_length_) {
+    audio_current_start_ = audio_next_start_;
+    audio_current_length_ = audio_next_length_;
+    audio_position_ = audio_current_start_;
+    if (audio_stop_at_track_end_ || audio_current_length_ == 0u) {
+      audio_stop_at_track_end_ = false;
+      audio_streaming_ = false;
+      return false;
+    }
+    audio_history_.fill(0);
+  }
+  std::array<std::uint8_t, 32> block{};
+  if (audio_current_start_ + audio_current_length_ - audio_position_ < block.size() ||
+      !hooks_.read_audio(hooks_.user, audio_position_, block.data(), block.size())) {
+    static unsigned read_errors = 0;
+    if (read_errors++ < 8u)
+      std::fprintf(stderr, "GEKKOAOT_NATIVE_DTK_READ_ERROR offset=%08llx\n",
+                   static_cast<unsigned long long>(audio_position_));
+    audio_streaming_ = false;
+    return false;
+  }
+  audio_position_ += block.size();
+  for (std::size_t i = 0; i < 28u; ++i) {
+    const auto bits = block[4u + i];
+    audio_decoded_[i * 2u] =
+        DecodeDtkNibble(bits & 15u, block[0], audio_history_[0], audio_history_[1]);
+    audio_decoded_[i * 2u + 1u] =
+        DecodeDtkNibble(bits >> 4u, block[1], audio_history_[2], audio_history_[3]);
+  }
+  audio_frame_index_ = 0u;
+  return true;
+}
+
+void NativeDI::MixAudio(std::int16_t* pcm, std::size_t frames,
+                        std::uint32_t output_hz, std::uint32_t stream_hz,
+                        std::uint32_t volume) {
+  if (!pcm || !frames || !output_hz || !stream_hz || !audio_streaming_) return;
+  const std::int32_t left_volume = volume & 0xffu;
+  const std::int32_t right_volume = (volume >> 8u) & 0xffu;
+  for (std::size_t frame = 0; frame < frames; ++frame) {
+    if (audio_frame_index_ == 28u && !DecodeAudioBlock()) return;
+    for (std::size_t channel = 0; channel < 2u; ++channel) {
+      const std::int32_t gain = channel == 0u ? left_volume : right_volume;
+      const std::int32_t disc_sample = audio_decoded_[audio_frame_index_ * 2u + channel];
+      const std::int32_t mixed = static_cast<std::int32_t>(pcm[frame * 2u + channel]) +
+                                 (disc_sample * gain) / 255;
+      pcm[frame * 2u + channel] =
+          static_cast<std::int16_t>(std::clamp(mixed, -32768, 32767));
+    }
+    audio_sample_phase_ += stream_hz;
+    while (audio_sample_phase_ >= output_hz) {
+      audio_sample_phase_ -= output_hz;
+      ++audio_frame_index_;
+      if (audio_frame_index_ == 28u && !DecodeAudioBlock()) return;
+    }
+  }
 }
 
 bool NativeDI::Handles(std::uint32_t address) const {
@@ -90,9 +185,23 @@ void NativeDI::SetDiscPresent(bool present) {
   cover_ |= kCoverInt;
 }
 
+void NativeDI::ConfigureAudioBuffer(bool enabled, std::uint8_t size) {
+  audio_enabled_ = enabled;
+  audio_buffer_size_ = size & 0x0fu;
+  if (!enabled) {
+    audio_streaming_ = false;
+    audio_stop_at_track_end_ = false;
+  }
+}
+
 void NativeDI::FinishCommand(bool success, std::uint32_t immediate,
                              std::uint32_t bytes_transferred,
                              std::uint32_t error_code) {
+  static unsigned logs = 0;
+  if (TraceDvd() && logs++ < 256u)
+    std::fprintf(stderr, "GEKKOAOT_TRACE_DVD event=device-complete seq=%llu opcode=%02x success=%u bytes=%u immediate=%08x error=%08x\n",
+                 static_cast<unsigned long long>(command_sequence_), last_opcode_,
+                 unsigned(success), bytes_transferred, immediate, success ? 0u : error_code);
   immediate_ = immediate;
   dma_control_ &= ~kControlTStart;
 
@@ -127,6 +236,11 @@ bool NativeDI::CompletePendingFor(std::uint64_t sequence, bool success,
 void NativeDI::ExecuteCommand() {
   const std::uint8_t opcode = static_cast<std::uint8_t>(command_[0] >> 24);
   last_opcode_ = opcode;
+  static unsigned logs = 0;
+  if (TraceDvd() && logs++ < 256u)
+    std::fprintf(stderr, "GEKKOAOT_TRACE_DVD event=device-command seq=%llu command=%08x,%08x,%08x dma=%08x length=%u control=%x\n",
+                 static_cast<unsigned long long>(command_sequence_), command_[0], command_[1],
+                 command_[2], dma_address_, dma_length_, dma_control_);
 
   // The disc reader is a separate provider. It may still have an image
   // mounted after the guest opens the drive cover, but that image is no longer
@@ -154,12 +268,8 @@ void NativeDI::ExecuteCommand() {
     // E4: bit 16 enables the drive's DTK audio path; low nibble selects the
     // hardware audio-buffer size. Keep this register/drive state even though
     // actual ADPCM decoding is not part of NativeDI.
-    audio_enabled_ = ((command_[0] >> 16u) & 1u) != 0u;
-    audio_buffer_size_ = static_cast<std::uint8_t>(command_[0] & 0x0fu);
-    if (!audio_enabled_) {
-      audio_streaming_ = false;
-      audio_stop_at_track_end_ = false;
-    }
+    ConfigureAudioBuffer(((command_[0] >> 16u) & 1u) != 0u,
+                         static_cast<std::uint8_t>(command_[0] & 0x0fu));
     std::fprintf(stderr,
                  "GEKKOAOT_NATIVE_DI_DTK_V56=1 cmd=E4 enabled=%u buffer=%u\n",
                  audio_enabled_ ? 1u : 0u, static_cast<unsigned>(audio_buffer_size_));
@@ -187,11 +297,13 @@ void NativeDI::ExecuteCommand() {
           audio_current_length_ = audio_next_length_;
           audio_position_ = audio_current_start_;
           audio_streaming_ = true;
+          ResetAudioDecoder();
         }
       }
     } else if (subcommand == 1u) {
       audio_stop_at_track_end_ = false;
       audio_streaming_ = false;
+      ResetAudioDecoder();
     } else {
       FinishCommand(false, immediate_, 0u, 0x00052000u);
       return;

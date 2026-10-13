@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstddef>
 
 namespace GekkoAOT::HW::DI {
 
@@ -39,6 +40,8 @@ public:
   struct DeviceHooks {
     void* user = nullptr;
     CommandResponse (*execute)(void* user, const CommandRequest& request) = nullptr;
+    bool (*read_audio)(void* user, std::uint64_t offset, void* destination,
+                       std::uint32_t size) = nullptr;
   };
 
   NativeDI() { Reset(); }
@@ -50,6 +53,9 @@ public:
 
   void SetDeviceHooks(DeviceHooks hooks) { hooks_ = hooks; }
   void SetDiscPresent(bool present);
+  // IPL configures DTK from disc-header bytes 8/9 before handing off to a DOL.
+  // Direct native boot must install that state without issuing a guest command.
+  void ConfigureAudioBuffer(bool enabled, std::uint8_t size);
   void CompletePending(bool success, std::uint32_t immediate = 0,
                        std::uint32_t bytes_transferred = 0,
                        std::uint32_t error_code = 0x00031100u);
@@ -73,6 +79,10 @@ public:
   bool AudioEnabled() const { return audio_enabled_; }
   bool AudioStreaming() const { return audio_streaming_; }
   std::uint64_t AudioPosition() const { return audio_position_; }
+  // Mix decoded disc audio into interleaved host L/R PCM at the AID output
+  // rate. The AI controls playback and volume; DI owns track/decoder state.
+  void MixAudio(std::int16_t* pcm, std::size_t frames, std::uint32_t output_hz,
+                std::uint32_t stream_hz, std::uint32_t volume);
 
 private:
   static constexpr std::uint32_t ToPhysical(std::uint32_t address) {
@@ -114,6 +124,8 @@ private:
   void ExecuteCommand();
   void FinishCommand(bool success, std::uint32_t immediate,
                      std::uint32_t bytes_transferred, std::uint32_t error_code);
+  bool DecodeAudioBlock();
+  void ResetAudioDecoder();
 
   std::uint32_t status_ = 0;
   std::uint32_t cover_ = 0;
@@ -139,6 +151,10 @@ private:
   std::uint64_t audio_position_ = 0;
   std::uint64_t audio_next_start_ = 0;
   std::uint32_t audio_next_length_ = 0;
+  std::array<std::int16_t, 56> audio_decoded_{};
+  std::array<std::int32_t, 4> audio_history_{};
+  std::uint32_t audio_frame_index_ = 28;
+  std::uint64_t audio_sample_phase_ = 0;
 
   DeviceHooks hooks_{};
 };

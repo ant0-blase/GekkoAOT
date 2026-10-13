@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "os/native_os.h"
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -77,7 +78,7 @@ struct Fixture {
   }
 
   template<class... Args> void Call(Kind kind, Args... args) {
-    const std::uint32_t parameters[] = {static_cast<std::uint32_t>(args)...};
+    const std::array<std::uint32_t, sizeof...(args)> parameters{static_cast<std::uint32_t>(args)...};
     for (unsigned i = 0; i < sizeof...(args); ++i) cpu.gpr[3 + i] = parameters[i];
     cpu.lr = 0x800a0000u + (++calls * 4u);
     CHECK(os.Dispatch(kind, &cpu));
@@ -114,6 +115,23 @@ void TestReceivers() {
   CHECK(f.Word(kOutLow) == 0u);
 }
 
+void TestZeroCapacityQueue() {
+  Fixture f;
+  // Wind Waker initializes a JKRThread queue with no message slots. The SDK
+  // writes its header without touching the unused array or rejecting count 0.
+  f.Call(Kind::InitMessageQueue, kQueue, 0xffffffffu, 0u);
+  CHECK(f.Word(kQueue + 16u) == 0xffffffffu);
+  CHECK(f.Word(kQueue + 20u) == 0u);
+  f.Word(kOutMain, 0x12345678u);
+  f.Call(Kind::SendMessage, kQueue, 0xabcdef01u, 0u);
+  CHECK(f.cpu.gpr[3] == 0u);
+  f.Call(Kind::JamMessage, kQueue, 0xabcdef01u, 0u);
+  CHECK(f.cpu.gpr[3] == 0u);
+  f.Call(Kind::ReceiveMessage, kQueue, kOutMain, 0u);
+  CHECK(f.cpu.gpr[3] == 0u);
+  CHECK(f.Word(kOutMain) == 0x12345678u);
+}
+
 
 void TestReadyPriorityMutationPreempts() {
   Fixture f;
@@ -131,6 +149,34 @@ void TestReadyPriorityMutationPreempts() {
   // immediately and trigger the same preemption as retail SelectThread(0).
   f.Call(Kind::SetThreadPriority, kLow, 15u);
   CHECK(f.Word(kCurrentThread) == kLow);
+}
+
+// v329: Call of Duty's GX FIFO high-watermark handler suspends the current
+// thread from interrupt context. __OSDispatchInterrupt runs handlers with the
+// scheduler disabled: OSSuspendThread must only mark the thread READY and leave
+// the interrupt frame intact; the switch happens at __OSReschedule.
+void TestSuspendCurrentInsideInterruptDefers() {
+  Fixture f;
+  f.Word(kMain + 0x2d0u, 10u);  // main outranks the worker: resuming it must not preempt
+  f.Word(kMain + 0x2d4u, 10u);
+  f.Call(Kind::CreateThread, kLow, 0x800b0000u, 0u, 0x80071000u, 0x1000u, 20u, 0u);
+  CHECK(f.cpu.gpr[3] == 1u);
+  f.Call(Kind::ResumeThread, kLow);
+  CHECK(f.Word(kCurrentThread) == kMain);
+  // The external interrupt vector saved the interrupted state in main's context.
+  f.Half(kMain + 0x1a2u, 2u);              // OS_CONTEXT_STATE_EXC
+  f.Word(kMain + 0x198u, 0x80001234u);     // interrupted SRR0
+  f.Call(Kind::DisableScheduler);
+  f.Call(Kind::SuspendThread, kMain);
+  const auto handler_return = f.cpu.lr;
+  CHECK(f.cpu.gpr[3] == 0u);                         // previous suspend count
+  CHECK(f.cpu.pc == handler_return);                 // the handler continues
+  CHECK(f.Word(kCurrentThread) == kMain);            // no switch while disabled
+  CHECK(f.Word(kMain + 0x198u) == 0x80001234u);      // interrupt frame untouched
+  f.Call(Kind::EnableScheduler);
+  f.Call(Kind::Reschedule);
+  CHECK(f.Word(kCurrentThread) == kLow);             // dispatcher's reschedule switches
+  CHECK(f.Word(kMain + 0x198u) == 0x80001234u);      // and still resumes the interrupted pc
 }
 
 void TestSenders() {
@@ -151,8 +197,10 @@ void TestSenders() {
 }
 
 int main() {
+  TestZeroCapacityQueue();
   TestReceivers();
   TestReadyPriorityMutationPreempts();
   TestSenders();
+  TestSuspendCurrentInsideInterruptDefers();
   std::cout << "OS message receiver/sender priority tests passed\n";
 }

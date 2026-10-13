@@ -58,11 +58,18 @@ diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
 
  #include <llvm/IR/BasicBlock.h>
  #include <llvm/IR/Function.h>
-@@ -55,5 +56,15 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+@@ -55,5 +56,22 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
                                        Value *address, Type *resultType,
                                        u32 width, bool sign) {
 +  const char *relTranslate = std::getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
-+  if (relTranslate && relTranslate[0] && relTranslate[0] != '0') {
++  // REL AOT is compiled from a synthetic linked image. Only addresses that
++  // DolIR proved to be constant MEM1 values can originate from those static
++  // relocations. Dynamic pointers (heap/stack/loaded data pointers) already
++  // contain the live OSLink address and must never be canonical-remapped just
++  // because their numeric value overlaps the synthetic REL window.
++  if (relTranslate && relTranslate[0] && relTranslate[0] != '0' &&
++      instruction.address_domain == DOLIR_ADDRESS_MEM1 &&
++      instruction.address_lower == instruction.address_upper) {
 +    Type *i32 = Type::getInt32Ty(context_);
 +    auto *translateType = FunctionType::get(
 +        i32, {ctx_->getType(), i32}, false);
@@ -74,10 +81,17 @@ diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
    Value *directOffset = nullptr;
    if (Value *pointer =
            provenMemoryPointer(instruction, address, width, &directOffset)) {
-@@ -151,4 +161,14 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+@@ -151,4 +168,21 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
                                       Value *address, Value *value, u32 width) {
 +  const char *relTranslate = std::getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
-+  if (relTranslate && relTranslate[0] && relTranslate[0] != '0') {
++  // REL AOT is compiled from a synthetic linked image. Only addresses that
++  // DolIR proved to be constant MEM1 values can originate from those static
++  // relocations. Dynamic pointers (heap/stack/loaded data pointers) already
++  // contain the live OSLink address and must never be canonical-remapped just
++  // because their numeric value overlaps the synthetic REL window.
++  if (relTranslate && relTranslate[0] && relTranslate[0] != '0' &&
++      instruction.address_domain == DOLIR_ADDRESS_MEM1 &&
++      instruction.address_lower == instruction.address_upper) {
 +    Type *i32 = Type::getInt32Ty(context_);
 +    auto *translateType = FunctionType::get(
 +        i32, {ctx_->getType(), i32}, false);
