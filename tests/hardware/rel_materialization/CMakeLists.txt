@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(GekkoAOTRelMaterialization C CXX)
+set(DOLRECOMP_ENABLE_LLVM ON CACHE BOOL "" FORCE)
+add_subdirectory("${DOLRECOMP_SOURCE}" dolrecomp EXCLUDE_FROM_ALL)
+add_executable(rel_materialization_fixture fixture.cpp)
+target_link_libraries(rel_materialization_fixture PRIVATE dr_llvm)
+foreach(mode IN ITEMS 0 1)
+  set(probes "${CMAKE_CURRENT_BINARY_DIR}/probes-${mode}.o")
+  add_custom_command(OUTPUT "${probes}"
+    COMMAND rel_materialization_fixture "${probes}" ${mode}
+    DEPENDS rel_materialization_fixture VERBATIM)
+  set_source_files_properties("${probes}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  add_executable(rel_materialization_check_${mode} check.c "${probes}")
+  target_link_libraries(rel_materialization_check_${mode} PRIVATE dr_cpu)
+endforeach()

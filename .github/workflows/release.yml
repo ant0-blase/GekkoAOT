@@ -58,6 +58,8 @@ jobs:
           fi
 
           python tools/release_notes.py --version "$VERSION" --check
+          python tools/check_release_tree.py
+          python tests/hardware/test_release_tree.py
 
           TAG="v${VERSION}"
           RELEASE_EXISTS=false
@@ -521,6 +523,9 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release --parallel 2
 
+      - name: Run release regression tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
       - name: Install Linux package tree
         if: runner.os == 'Linux'
         run: cmake --install build --prefix "$PWD/package"
@@ -730,6 +735,9 @@ jobs:
           GEKKOAOT_STATE_DIR: ${{ runner.temp }}\gekkoaot-state
         run: '& .\package\bin\gekkoaotctl.exe status'
 
+      - name: Validate packaged release contents
+        run: python tools/check_release_tree.py --package package
+
       - name: Package Linux release
         if: runner.os == 'Linux'
         shell: bash
@@ -868,6 +876,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           RELEASE_EXISTS: ${{ needs.plan.outputs.release_exists }}
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+          FORCE_PUBLISH: ${{ inputs.force_publish }}
         run: |
           set -euo pipefail
 
@@ -880,7 +889,15 @@ jobs:
               --target "$GITHUB_SHA" \
               --title "GekkoAOT $TAG" \
               --notes-file release-notes.md \
+              --draft \
               "${flags[@]}"
+          else
+            [[ "$FORCE_PUBLISH" == true ]]
+            # Keep a complete replacement hidden until every asset uploads.
+            gh release edit "$TAG" --draft
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" \
+              -f "sha=$GITHUB_SHA" -F force=true >/dev/null
           fi
 
           mapfile -t assets < <(find dist -maxdepth 1 -type f -name 'GekkoAOT-*' -print | sort)
@@ -889,3 +906,9 @@ jobs:
             exit 3
           fi
           gh release upload "$TAG" "${assets[@]}" --clobber
+          gh release edit "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "GekkoAOT $TAG" \
+            --notes-file release-notes.md \
+            --prerelease="$PRERELEASE" \
+            --draft=false

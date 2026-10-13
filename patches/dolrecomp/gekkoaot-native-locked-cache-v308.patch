@@ -1,0 +1,113 @@
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -252,6 +252,7 @@
+   llvm::Value *native_mem1_bias_ = nullptr;
+   llvm::Value *native_mem2_bias_ = nullptr;
+   llvm::Value *native_flat_vmem_view_ = nullptr; // GEKKOAOT_NATIVE_FLAT_VMEM_V304
++  llvm::Value *native_locked_cache_base_ = nullptr; // GEKKOAOT_NATIVE_LOCKED_CACHE_V308
+   llvm::Value *nativeMemoryPointer(llvm::Value*, llvm::Value*, llvm::Value*);
+   llvm::Value *ram_ = nullptr;
+   llvm::Value *ram_size_ = nullptr;
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -324,6 +324,19 @@
+           builder_.CreateSub(builder_.CreatePtrToInt(mem2_, wide), builder_.getInt64(WII_MEM2_BASE)),
+           "host.mem2.bias");
+       function_->addFnAttr("dolrecomp-native-address-lowering", "287");
++      // GEKKOAOT_NATIVE_LOCKED_CACHE_V308: stable owner storage shared with
++      // SDK DMA. Resolve once per body; no CPUState publication per access.
++      const char* lc = std::getenv("DOLRECOMP_NATIVE_LOCKED_CACHE");
++      if (!lc || lc[0] != '0') {
++        auto lcGetter = module_.getOrInsertFunction("gekkoaot_native_locked_cache_base",
++            FunctionType::get(pointer, {pointer}, false));
++        auto* lcService = cast<Function>(lcGetter.getCallee());
++        lcService->setOnlyReadsMemory();
++        lcService->setDoesNotThrow();
++        lcService->addFnAttr(Attribute::WillReturn);
++        native_locked_cache_base_ = builder_.CreateCall(lcGetter, {ctx_}, "host.locked.cache.base");
++        function_->addFnAttr("dolrecomp-native-locked-cache", "308");
++      }
+       // GEKKOAOT_NATIVE_FLAT_VMEM_V304: obtain a stable owner-specific cell,
+       // not a cached mapping permission. Its size is reloaded at each access.
+       const char* flat = std::getenv("DOLRECOMP_NATIVE_FLAT_VMEM");
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -294,6 +294,24 @@
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(slowBlock);
++  Value* lcValue = nullptr;
++  BasicBlock* lcEnd = nullptr;
++  if (native_locked_cache_base_) {
++    // Exact original EA and full-width range check: aliases and boundary
++    // crossings must still reach the original external memory service.
++    Value* offset = builder_.CreateSub(address, builder_.getInt32(0xe0000000u));
++    Value* admitted = builder_.CreateAnd(builder_.CreateIsNotNull(native_locked_cache_base_),
++        builder_.CreateICmpULE(offset, builder_.getInt32(0x40000u - width)));
++    auto* direct = BasicBlock::Create(context_, "load_locked_cache", function_);
++    auto* fallback = BasicBlock::Create(context_, "load_locked_cache_fallback", function_);
++    builder_.CreateCondBr(admitted, direct, fallback);
++    builder_.SetInsertPoint(direct);
++    lcValue = endianLoad(builder_.CreateInBoundsGEP(builder_.getInt8Ty(),
++        native_locked_cache_base_, offset), resultType, width, loopPollingLoad);
++    lcEnd = builder_.GetInsertBlock();
++    builder_.CreateBr(join);
++    builder_.SetInsertPoint(fallback);
++  }
+   Value* flatValue = nullptr;
+   BasicBlock* flatEnd = nullptr;
+   if (native_flat_vmem_view_) {
+@@ -329,7 +347,8 @@
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(join);
+-  PHINode *phi = builder_.CreatePHI(resultType, flatValue ? 4 : 3);
++  PHINode *phi = builder_.CreatePHI(resultType, 3 + (flatValue ? 1 : 0) + (lcValue ? 1 : 0));
++  if (lcValue) phi->addIncoming(lcValue, lcEnd);
+   if (flatValue) phi->addIncoming(flatValue, flatEnd);
+   phi->addIncoming(mem1Value, mem1Block);
+   phi->addIncoming(mem2Value, mem2Block);
+@@ -549,6 +568,19 @@
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(slowBlock);
++  if (native_locked_cache_base_) {
++    Value* offset = builder_.CreateSub(address, builder_.getInt32(0xe0000000u));
++    Value* admitted = builder_.CreateAnd(builder_.CreateIsNotNull(native_locked_cache_base_),
++        builder_.CreateICmpULE(offset, builder_.getInt32(0x40000u - width)));
++    auto* direct = BasicBlock::Create(context_, "store_locked_cache", function_);
++    auto* fallback = BasicBlock::Create(context_, "store_locked_cache_fallback", function_);
++    builder_.CreateCondBr(admitted, direct, fallback);
++    builder_.SetInsertPoint(direct);
++    endianStore(builder_.CreateInBoundsGEP(builder_.getInt8Ty(),
++        native_locked_cache_base_, offset), value, width);
++    builder_.CreateBr(join);
++    builder_.SetInsertPoint(fallback);
++  }
+   if (native_flat_vmem_view_) {
+     Type* pointer = PointerType::getUnqual(context_);
+     auto* viewType = StructType::get(context_, {pointer, builder_.getInt32Ty()});
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -240,7 +240,7 @@
+       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+       "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
+       "x86-return-registers=3|"
+-      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s%s%s",
++      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s%s%s%s",
+       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+       static_cast<unsigned>(options ? options->native_abi_policy
+@@ -265,6 +265,11 @@
+           std::string(std::getenv("DOLRECOMP_NATIVE_ADDRESS_LOWERING")) == "1" &&
+           (!std::getenv("DOLRECOMP_NATIVE_FLAT_VMEM") ||
+            std::string(std::getenv("DOLRECOMP_NATIVE_FLAT_VMEM")) != "0")
+-          ? "|native-flat-vmem=304-on" : "|native-flat-vmem=304-off");
++          ? "|native-flat-vmem=304-on" : "|native-flat-vmem=304-off",
++      std::getenv("DOLRECOMP_NATIVE_ADDRESS_LOWERING") &&
++          std::string(std::getenv("DOLRECOMP_NATIVE_ADDRESS_LOWERING")) == "1" &&
++          (!std::getenv("DOLRECOMP_NATIVE_LOCKED_CACHE") ||
++           std::string(std::getenv("DOLRECOMP_NATIVE_LOCKED_CACHE")) != "0")
++          ? "|native-locked-cache=308-on" : "|native-locked-cache=308-off");
+   return written >= 0 && static_cast<size_t>(written) < size;
+ }

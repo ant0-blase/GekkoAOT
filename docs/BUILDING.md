@@ -7,7 +7,7 @@ The public CI validates:
 - Linux x86_64;
 - Windows x86_64 (Visual Studio 2022 / MSVC).
 
-Other hosts may work but are not part of the v0.0.1 release matrix.
+Other hosts may work but are not part of the release build matrix.
 
 ## Common requirements
 

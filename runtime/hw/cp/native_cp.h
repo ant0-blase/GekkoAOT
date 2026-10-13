@@ -26,11 +26,31 @@ public:
   // Returns true only when one or more complete 32-byte gather bursts changed
   // guest-visible CP FIFO accounting.
   bool NotifyGatherWrite(std::uint32_t bytes);
+  // NativeHW fast path: HostRuntime has already submitted the just-completed
+  // gather line directly to Aurora. Update the exact guest-visible FIFO state
+  // without re-reading the same 32 bytes through the callback. This is only
+  // valid for an empty synchronous FIFO with no active breakpoint.
+  bool NotifyDirectGatherWrite(std::uint32_t bytes);
   using ReadBurst = bool (*)(void* user, std::uint32_t address);
+  using ReadBurstBatch = bool (*)(void* user, std::uint32_t address, std::uint32_t burst_count);
   void SetReadBurstCallback(ReadBurst callback, void* user) {
     read_burst_ = callback;
     read_burst_user_ = user;
   }
+  // v161: when no CP breakpoint is active, drain a contiguous run of 32-byte
+  // gather lines through one host callback.  The single-burst ABI remains the
+  // exact fallback for breakpoint-sensitive traffic.
+  void SetReadBurstBatchCallback(ReadBurstBatch callback, void* user) {
+    read_burst_batch_ = callback;
+    read_burst_batch_user_ = user;
+  }
+
+  // Releasing an armed breakpoint does not execute the whole backlog on the
+  // MMIO call stack. The runtime services that release at a hardware boundary,
+  // allowing GXDisableBreakPt -> stop GP -> rearm BP to complete first.
+  void SetDeferredRegisterDrain(bool enabled) { defer_register_drain_ = enabled; }
+  bool RegisterDrainPending() const { return register_drain_pending_; }
+  void ServiceRegisterDrain();
 
   bool InterruptPending() const;
   bool GPReadEnabled() const { return (control_ & kCtrlGpReadEnable) != 0; }
@@ -81,6 +101,7 @@ private:
   bool BreakpointActive() const;
   void AdvancePointer(std::uint32_t* pointer);
   void DrainSynchronousGpu();
+  void RequestRegisterDrain();
 
   std::uint16_t control_ = 0;
   std::uint16_t perf_select_ = 0;
@@ -93,9 +114,17 @@ private:
   std::uint32_t fifo_write_pointer_ = 0;
   std::uint32_t fifo_read_pointer_ = 0;
   std::uint32_t fifo_breakpoint_ = 0;
+  // CPBreakpoint is exposed as two 16-bit MMIO registers. Do not let the
+  // synchronous host GPU observe/drain on the transient half-written address.
+  // Bit 0 = low half written, bit 1 = high half written.
+  std::uint8_t breakpoint_write_mask_ = 0;
+  bool defer_register_drain_ = false;
+  bool register_drain_pending_ = false;
   std::uint32_t gather_bytes_ = 0;
   ReadBurst read_burst_ = nullptr;
   void* read_burst_user_ = nullptr;
+  ReadBurstBatch read_burst_batch_ = nullptr;
+  void* read_burst_batch_user_ = nullptr;
 };
 
 } // namespace GekkoAOT::HW::CP

@@ -1,0 +1,350 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -111,6 +111,7 @@
+         src/backend/llvm/abi_policy.cpp
+         src/backend/llvm/call_liveness.cpp
+         src/backend/llvm/abi_stats.cpp
++        src/backend/llvm/side_exit_analysis.cpp
+         src/backend/llvm/cache_control.cpp
+         src/backend/llvm/instruction_service.cpp
+         src/backend/llvm/memory.cpp
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -18,6 +18,7 @@
+ #include "platform/strutil.h"
+ #ifdef DOLRECOMP_ENABLE_LLVM
+ #include "backend/llvm/llvm_backend.h"
++#include "backend/llvm/side_exit_analysis.h"
+ #include "cpu/cpu.h"
+ #include "ir/dolir_builder.h"
+ #endif
+@@ -642,6 +643,15 @@
+                                       u32 section_count,
+                                       DolLLVMFunctionRange* ranges,
+                                       u32 range_count, DolLLVMRuntime runtime) {
++    const char* report_path = getenv("DOLRECOMP_SIDE_EXIT_REPORT");
++    void* side_report = NULL;
++    if (report_path && report_path[0]) {
++        side_report = dolllvm_side_exit_begin(report_path, ranges, range_count);
++        if (!side_report) {
++            fprintf(stderr, "error: cannot begin side-exit analysis: %s\n", report_path);
++            return 0;
++        }
++    }
+     DolLLVMCallEdge* edges = NULL;
+     u32 edge_count = 0;
+     u32 edge_capacity = 0;
+@@ -684,6 +694,10 @@
+                 goto fail;
+             }
+             const DolIRFunction* function = &module.functions[0];
++            if (side_report && !dolllvm_side_exit_add(side_report, function)) {
++                dolir_module_free(&module);
++                goto fail;
++            }
+             for (u32 block = 0; block < function->block_count; block++) {
+             const DolIRTerminator* term = &function->blocks[block].terminator;
+             u64 live_after[DOLIR_STATE_MASK_WORDS] = {0};
+@@ -733,8 +747,13 @@
+                                          edge_count))
+         goto fail;
+     free(edges);
++    if (side_report && !dolllvm_side_exit_end(side_report, true)) {
++        fprintf(stderr, "error: cannot publish complete side-exit report\n");
++        return 0;
++    }
+     return 1;
+ fail:
++    if (side_report) dolllvm_side_exit_end(side_report, false);
+     free(edges);
+     return 0;
+ }
+@@ -1261,6 +1280,23 @@
+                                          sizeof(triple)))
+                 dolllvm_report_abi_stats(ranges, range_count, triple, stdout);
+         }
++    }
++    const char* analysis_only = getenv("DOLRECOMP_SIDE_EXIT_ANALYSIS_ONLY");
++    if (analysis_only && strcmp(analysis_only, "1") == 0) {
++        const char* report = getenv("DOLRECOMP_SIDE_EXIT_REPORT");
++        if (!report || !report[0]) {
++            fprintf(stderr, "error: analysis-only requires DOLRECOMP_SIDE_EXIT_REPORT\n");
++            goto fail;
++        }
++        // An audit must never leave a generated header that can be mistaken for
++        // a runnable compiled module, nor reuse/emit LLVM object-cache entries.
++        fclose(header); fclose(manifest); fclose(fallback_report);
++        remove(header_path); remove(output_path); remove(fallback_path);
++        remove(symbol_header_path);
++        smc_analysis_free(&smc); function_list_free(&funcs);
++        free(ranges); free(entry_points); free(partition_points);
++        printf("GEKKOAOT_SIDE_EXIT_ANALYSIS_V232=1 report=\"%s\" objects=0 full_native=0\n", report);
++        return 1;
+     }
+     u32 emitted_range_count = 0;
+     for (u32 s = 0; s < section_count; s++) {
+diff --git a/src/backend/llvm/side_exit_analysis.h b/src/backend/llvm/side_exit_analysis.h
+new file mode 100644
+--- /dev/null
++++ b/src/backend/llvm/side_exit_analysis.h
+@@ -0,0 +1,15 @@
++#ifndef GEKKOAOT_SIDE_EXIT_ANALYSIS_H
++#define GEKKOAOT_SIDE_EXIT_ANALYSIS_H
++#include "backend/llvm/llvm_backend.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Analysis of IR obligations, not a claim about optimized machine-code sites.
++void* dolllvm_side_exit_begin(const char* path,
++                              const DolLLVMFunctionRange* ranges, u32 count);
++bool dolllvm_side_exit_add(void* report, const DolIRFunction* function);
++bool dolllvm_side_exit_end(void* report, bool success);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/backend/llvm/side_exit_analysis.cpp b/src/backend/llvm/side_exit_analysis.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/backend/llvm/side_exit_analysis.cpp
+@@ -0,0 +1,238 @@
++#include "backend/llvm/side_exit_analysis.h"
++#include "cpu/cpu.h"
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <map>
++#include <memory>
++#include <set>
++#include <sstream>
++#include <string>
++
++namespace {
++using Counts = std::map<std::string, u64>;
++Counts emptyCounts() {
++  Counts counts;
++  for (const char* key : {"regions", "ppc_instruction_sites", "direct_target_known",
++       "direct_target_unknown", "indirect_control", "indirect_returns",
++       "indirect_ctr", "indirect_lr_other", "indirect_other", "fallback_terminators",
++       "explicit_side_exits", "system_calls", "rfi", "memory_mem1_proven",
++       "memory_mem2", "memory_mmio", "memory_fifo", "memory_unproven",
++       "fp_availability_checks", "numeric_helpers", "quantized_memory_helpers",
++       "timebase_reads", "timebase_writes", "architectural_helpers",
++       "fallback_instruction_helpers", "unknown_helpers", "may_raise_operations",
++       "sdk_entries", "sdk_getter_candidates"}) counts[key] = 0;
++  return counts;
++}
++std::string quoted(const std::string& value) {
++  std::string result = "\"";
++  for (unsigned char ch : value) {
++    if (ch == '"' || ch == '\\') { result += '\\'; result += ch; }
++    else if (ch < 32) { char escaped[7]; std::snprintf(escaped, sizeof escaped, "\\u%04x", ch); result += escaped; }
++    else result += ch;
++  }
++  return result + '"';
++}
++void writeCounts(std::ostream& out, const Counts& counts) {
++  out << '{'; bool first = true;
++  for (const auto& [key, value] : counts) {
++    if (!first) out << ',';
++    first = false; out << quoted(key) << ':' << value;
++  }
++  out << '}';
++}
++struct Report {
++  std::string path, temporary;
++  std::ofstream output;
++  const DolLLVMFunctionRange* ranges;
++  u32 range_count;
++  Counts totals = emptyCounts();
++  std::map<u32, std::string> sdk;
++  std::set<u32> seen;
++};
++bool number(const std::string& text, u32& result) {
++  if (text.empty() || text[0] == '-') return false;
++  char* end = nullptr;
++  const auto value = std::strtoull(text.c_str(), &end, 0);
++  if (end == text.c_str() || *end || value > 0xffffffffull) return false;
++  result = static_cast<u32>(value); return true;
++}
++bool readSDK(Report& report) {
++  const char* path = std::getenv("DOLRECOMP_STATIC_INTERCEPTS");
++  if (!path || !*path) return true;
++  std::ifstream input(path); if (!input) return false;
++  std::string line;
++  while (std::getline(input, line)) {
++    std::istringstream row(line);
++    std::string address, name, token, extra;
++    if (!(row >> address) || address[0] == '#') continue;
++    u32 parsed = 0, parsed_token = 0;
++    if (!(row >> name) || !number(address, parsed) || (parsed & 3)) return false;
++    if ((row >> token) && !number(token, parsed_token)) return false;
++    if (row >> extra) return false;
++    if (!report.sdk.emplace(parsed, name).second) return false;
++  }
++  return input.eof();
++}
++bool knownTarget(const Report& report, u32 address) {
++  // Ranges are ordered by section, not necessarily by address. Avoid assuming
++  // a sorting property that is not part of the compiler's public contract.
++  if (address & 3) return false;
++  for (u32 i = 0; i < report.range_count; ++i)
++    if (address >= report.ranges[i].start && address < report.ranges[i].end)
++      return true;
++  return false;
++}
++bool getterCandidate(const DolIRFunction& function, u32 address, const std::string& name) {
++  // Candidate only. No interception, timing or code-admission rule is changed.
++  for (u32 i = 0; i + 1 < function.block_count; ++i) {
++    const auto& head = function.blocks[i]; const auto& tail = function.blocks[i+1];
++    if (head.guest_address != address || tail.guest_address != address + 4 || tail.raw != 0x4e800020u) continue;
++    if (name == "OSGetTick" && head.raw == 0x7c6c42e6u) return true;
++    if (name == "OSGetCurrentContext" && head.raw == 0x806000d4u) return true;
++    if (name == "OSGetStackPointer" && head.raw == 0x7c230b78u) return true;
++  }
++  return false;
++}
++void helper(Counts& counts, u32 kind) {
++  switch (kind) {
++  case DOLIR_HELPER_FP_AVAILABLE: ++counts["fp_availability_checks"]; break;
++  case DOLIR_HELPER_EXACT_FLOAT: case DOLIR_HELPER_EXACT_PAIRED:
++    ++counts["numeric_helpers"]; break;
++  case DOLIR_HELPER_PSQ_LOAD: case DOLIR_HELPER_PSQ_STORE:
++    ++counts["quantized_memory_helpers"]; break;
++  case DOLIR_HELPER_TIMEBASE_READ: ++counts["timebase_reads"]; break;
++  case DOLIR_HELPER_TIMEBASE_WRITE: ++counts["timebase_writes"]; break;
++  case DOLIR_HELPER_FALLBACK_INSTRUCTION: ++counts["fallback_instruction_helpers"]; break;
++  case DOLIR_HELPER_SYSTEM_CALL: case DOLIR_HELPER_RFI:
++  case DOLIR_HELPER_PROGRAM_EXCEPTION: case DOLIR_HELPER_FPSCR_UPDATED:
++  case DOLIR_HELPER_DCBZ_L: case DOLIR_HELPER_ECIWX: case DOLIR_HELPER_ECOWX:
++  case DOLIR_HELPER_TLBIE: case DOLIR_HELPER_MEMORY_FENCE:
++  case DOLIR_HELPER_STORE_CONDITIONAL: case DOLIR_HELPER_FPSCR_BIT:
++  case DOLIR_HELPER_SPR_READ: case DOLIR_HELPER_SPR_WRITE:
++  case DOLIR_HELPER_LSWX: case DOLIR_HELPER_CACHE_CONTROL:
++    ++counts["architectural_helpers"]; break;
++  default: ++counts["unknown_helpers"]; break;
++  }
++}
++}
++
++extern "C" void* dolllvm_side_exit_begin(const char* path, const DolLLVMFunctionRange* ranges, u32 count) {
++  if (!path || !*path || !ranges || !count) return nullptr;
++  auto report = std::make_unique<Report>();
++  report->path = path; report->temporary = report->path + ".tmp";
++  report->ranges = ranges; report->range_count = count;
++  if (!readSDK(*report)) return nullptr;
++  report->output.open(report->temporary, std::ios::trunc);
++  if (!report->output) return nullptr;
++  report->output << "{\"schema\":1,\"analysis\":\"SideExitAnalysis\","
++    "\"stage\":\"dolir-before-llvm\",\"scope\":\"input-image-code-sections\","
++    "\"full_native\":false,\"proof_complete\":false,"
++    "\"blockers\":[\"hardware-service-elimination-unproven\","
++    "\"whole-program-and-rel-coverage-unproven\",\"final-binary-audit-missing\"],"
++    "\"hardware\":{\"gx_fifo\":null,\"vi\":null,\"si\":null,\"di\":null,"
++    "\"exi\":null,\"dsp\":null,\"guest_interrupts\":null},\"functions\":[";
++  return report.release();
++}
++
++extern "C" bool dolllvm_side_exit_add(void* handle, const DolIRFunction* function) {
++  if (!handle || !function) return false;
++  auto& report = *static_cast<Report*>(handle);
++  bool exact_range = false;
++  for (u32 i = 0; i < report.range_count; ++i)
++    if (function->guest_start == report.ranges[i].start && function->guest_end == report.ranges[i].end)
++      exact_range = true;
++  if (!exact_range || !report.seen.insert(function->guest_start).second) return false;
++  Counts counts = emptyCounts(); counts["regions"] = 1;
++  for (u32 b = 0; b < function->block_count; ++b) {
++    const auto& block = function->blocks[b]; ++counts["ppc_instruction_sites"];
++    const auto& term = block.terminator;
++    switch (term.kind) {
++    case DOLIR_TERM_FALLTHROUGH: case DOLIR_TERM_BRANCH: case DOLIR_TERM_COND_BRANCH: {
++      const u32 targets = term.kind == DOLIR_TERM_COND_BRANCH ? 2u : 1u;
++      for (u32 slot = 0; slot < targets; ++slot) {
++        if (term.targets[slot] != DOLIR_NO_BLOCK) continue;
++        ++counts[knownTarget(report, term.target_addresses[slot]) ? "direct_target_known" : "direct_target_unknown"];
++      }
++      break;
++    }
++    case DOLIR_TERM_INDIRECT:
++      ++counts["indirect_control"];
++      if (block.raw == 0x4e800020u) ++counts["indirect_returns"];
++      else if ((block.raw >> 26) == 19u && ((block.raw >> 1) & 0x3ffu) == 528u) ++counts["indirect_ctr"];
++      else if ((block.raw >> 26) == 19u && ((block.raw >> 1) & 0x3ffu) == 16u) ++counts["indirect_lr_other"];
++      else ++counts["indirect_other"];
++      break;
++    case DOLIR_TERM_SIDE_EXIT: ++counts["explicit_side_exits"]; break;
++    case DOLIR_TERM_FALLBACK: ++counts["fallback_terminators"]; break;
++    case DOLIR_TERM_SYSTEM_CALL: ++counts["system_calls"]; break;
++    case DOLIR_TERM_RFI: ++counts["rfi"]; break;
++    default: break;
++    }
++    for (u32 i = 0; i < block.instruction_count; ++i) {
++      const auto& inst = block.instructions[i];
++      if (inst.effects & DOLIR_EFFECT_MAY_RAISE) ++counts["may_raise_operations"];
++      if (inst.op == DOLIR_OP_HELPER_CALL) helper(counts, inst.aux);
++      if (inst.op != DOLIR_OP_GUEST_LOAD && inst.op != DOLIR_OP_GUEST_STORE) continue;
++      const u32 width = inst.aux & 0xffu;
++      const u32 address = inst.address_lower & ~0x40000000u;
++      switch (inst.address_domain) {
++      case DOLIR_ADDRESS_MEM1:
++        // The domain alone is not enough: this matches the existing direct
++        // memory ABI admission, including exact address and full-width bounds.
++        if (inst.address_lower == inst.address_upper && width && width <= GC_MAIN_RAM_SIZE &&
++            address >= GC_RAM_BASE && address - GC_RAM_BASE <= GC_MAIN_RAM_SIZE - width)
++          ++counts["memory_mem1_proven"];
++        else ++counts["memory_unproven"];
++        break;
++      case DOLIR_ADDRESS_MEM2: ++counts["memory_mem2"]; break;
++      case DOLIR_ADDRESS_MMIO: ++counts["memory_mmio"]; break;
++      case DOLIR_ADDRESS_FIFO: ++counts["memory_fifo"]; break;
++      default: ++counts["memory_unproven"]; break;
++      }
++    }
++  }
++  if (report.totals["regions"]) report.output << ',';
++  report.output << "{\"start\":" << function->guest_start << ",\"end\":" << function->guest_end << ",\"sdk\":[";
++  bool first = true;
++  for (auto it = report.sdk.lower_bound(function->guest_start); it != report.sdk.end() && it->first < function->guest_end; ++it) {
++    if (!first) report.output << ',';
++    first = false;
++    const bool candidate = getterCandidate(*function, it->first, it->second);
++    ++counts["sdk_entries"]; counts["sdk_getter_candidates"] += candidate;
++    report.output << "{\"address\":" << it->first << ",\"name\":" << quoted(it->second)
++                  << ",\"getter_candidate\":" << (candidate ? "true" : "false") << ",\"lowered\":false}";
++  }
++  report.output << "],\"external_edges\":[";
++  first = true;
++  for (u32 b = 0; b < function->block_count; ++b) {
++    const auto& term = function->blocks[b].terminator;
++    const u32 targets = term.kind == DOLIR_TERM_COND_BRANCH ? 2u :
++        term.kind == DOLIR_TERM_BRANCH || term.kind == DOLIR_TERM_FALLTHROUGH ? 1u : 0u;
++    for (u32 slot = 0; slot < targets; ++slot) {
++      if (term.targets[slot] != DOLIR_NO_BLOCK) continue;
++      if (!first) report.output << ',';
++      first = false;
++      report.output << "{\"pc\":" << function->blocks[b].guest_address << ",\"target\":" << term.target_addresses[slot]
++                    << ",\"linked\":" << (term.linked ? "true" : "false")
++                    << ",\"target_known\":" << (knownTarget(report, term.target_addresses[slot]) ? "true" : "false") << '}';
++    }
++  }
++  report.output << "],\"counts\":"; writeCounts(report.output, counts); report.output << '}';
++  for (const auto& [key, value] : counts) report.totals[key] += value;
++  return static_cast<bool>(report.output);
++}
++
++extern "C" bool dolllvm_side_exit_end(void* handle, bool success) {
++  std::unique_ptr<Report> report(static_cast<Report*>(handle));
++  if (!report) return false;
++  success = success && report->seen.size() == report->range_count;
++  if (success) {
++    report->output << "],\"totals\":"; writeCounts(report->output, report->totals);
++    report->output << ",\"complete_input_scan\":true}\n";
++  }
++  report->output.close(); success = success && !report->output.fail();
++  if (success && std::rename(report->temporary.c_str(), report->path.c_str()) == 0) return true;
++  std::remove(report->temporary.c_str()); return false;
++}

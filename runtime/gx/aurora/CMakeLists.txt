@@ -577,6 +577,37 @@ void present_texture_blend(const webgpu::TextureWithSampler& previous,
 endif()
 
 
+# Clip the source's one-pixel colored guard edge from 4:3 scanout. Apply after
+# the XFB hook so fresh and already-patched Aurora checkouts get the same fix.
+if(EXISTS "${_gekkoaot_aurora_main}")
+  file(READ "${_gekkoaot_aurora_main}" _gekkoaot_aurora_main_text)
+  if(NOT _gekkoaot_aurora_main_text MATCHES "GEKKOAOT_PRESENT_EDGE_CLIP_V175")
+    set(_gekkoaot_edge_anchor [=[  set_present_viewport(pass, viewport,
+                       webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                       webgpu::g_graphicsConfig.surfaceConfiguration.height);
+  pass.Draw(3);]=])
+    set(_gekkoaot_edge_replacement [=[  set_present_viewport(pass, viewport,
+                       webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                       webgpu::g_graphicsConfig.surfaceConfiguration.height);
+  // GEKKOAOT_PRESENT_EDGE_CLIP_V175: retain the black clear at the left and
+  // bottom of the 4:3 pillarbox; full-window aspect retains all its pixels.
+  if (viewport.left > 0.f && viewport.width > 2.f && viewport.height > 1.f) {
+    pass.SetScissorRect(static_cast<uint32_t>(viewport.left) + 1u,
+                        static_cast<uint32_t>(viewport.top),
+                        static_cast<uint32_t>(viewport.width) - 2u,
+                        static_cast<uint32_t>(viewport.height) - 1u);
+  }
+  pass.Draw(3);]=])
+    string(FIND "${_gekkoaot_aurora_main_text}" "${_gekkoaot_edge_anchor}" _gekkoaot_edge_pos)
+    if(_gekkoaot_edge_pos EQUAL -1)
+      message(FATAL_ERROR "Pinned Aurora aurora.cpp changed: VI scanout edge anchor missing")
+    endif()
+    string(REPLACE "${_gekkoaot_edge_anchor}" "${_gekkoaot_edge_replacement}"
+      _gekkoaot_aurora_main_text "${_gekkoaot_aurora_main_text}")
+    file(WRITE "${_gekkoaot_aurora_main}" "${_gekkoaot_aurora_main_text}")
+  endif()
+endif()
+
 # GekkoAOT v158 selective orthographic widescreen correction.
 # Perspective draws are always Hor+ corrected. Orthographic UI draws are also
 # counter-scaled so final 4:3->window scanout does not flatten the HUD. The one
@@ -586,20 +617,29 @@ endif()
 set(_gekkoaot_aurora_shader_info "${GEKKOAOT_AURORA_SOURCE}/lib/gx/shader_info.cpp")
 if(EXISTS "${_gekkoaot_aurora_shader_info}")
   file(READ "${_gekkoaot_aurora_shader_info}" _gekkoaot_shader_info_text)
-  if(NOT _gekkoaot_shader_info_text MATCHES "GEKKOAOT_WIDESCREEN_PROJECTION_V128")
+  if(NOT _gekkoaot_shader_info_text MATCHES "GEKKOAOT_WIDESCREEN_PROJECTION_V166")
     set(_gekkoaot_wide_decl_anchor [=[#include <tracy/Tracy.hpp>
 
 namespace aurora::gx {]=])
     set(_gekkoaot_wide_decl_replacement [=[#include <tracy/Tracy.hpp>
 
-// GEKKOAOT_WIDESCREEN_PROJECTION_V128
+// GEKKOAOT_WIDESCREEN_PROJECTION_V166
 extern "C" float gekkoaot_native_gx_widescreen_x_scale() noexcept;
+extern "C" float gekkoaot_native_gx_widescreen_projection_scale(float, float, float, float) noexcept;
+extern "C" bool gekkoaot_native_gx_screen_copy(int, int, float, float) noexcept;
+extern "C" void gekkoaot_native_gx_widescreen_diag(int, float, float, float, float,
+    int, int, int, int, bool, bool, float) noexcept;
 
 namespace aurora::gx {]=])
     set(_gekkoaot_wide_proj_anchor [=[  auto proj = g_gxState.proj;
 ]=])
     set(_gekkoaot_wide_proj_replacement [=[  auto proj = g_gxState.proj;
-  const float gekkoaotWideX = gekkoaot_native_gx_widescreen_x_scale();
+  const auto& gekkoaotView = g_gxState.logicalViewport;
+  const bool gekkoaotOffscreen = gfx::is_offscreen();
+  const float gekkoaotWideX = g_gxState.projType == GX_PERSPECTIVE
+      ? gekkoaot_native_gx_widescreen_projection_scale(
+            proj.m0[0], proj.m1[1], gekkoaotView.width, gekkoaotView.height)
+      : gekkoaot_native_gx_widescreen_x_scale();
 
   // v158: keep normal 2D/UI at the same physical proportions as 4:3 while
   // final scanout fills the widescreen window. The exception is an
@@ -612,7 +652,10 @@ namespace aurora::gx {]=])
       if (!info.sampledTextures.test(i))
         continue;
       const auto& obj = g_gxState.loadedTextures[i];
-      if (obj.data != nullptr && g_gxState.copyTextures.find(obj.data) != g_gxState.copyTextures.end()) {
+      const auto copy = g_gxState.copyTextures.find(obj.data);
+      if (obj.data != nullptr && copy != g_gxState.copyTextures.end() &&
+          gekkoaot_native_gx_screen_copy(copy->second.guestSource.width,
+              copy->second.guestSource.height, gekkoaotView.width, gekkoaotView.height)) {
         gekkoaotOrthoSamplesEfbCopy = true;
         break;
       }
@@ -620,11 +663,17 @@ namespace aurora::gx {]=])
   }
 
   const bool gekkoaotApplyWideX =
-      g_gxState.projType == GX_PERSPECTIVE ||
+      (g_gxState.projType == GX_PERSPECTIVE && !gekkoaotOffscreen) ||
       (g_gxState.projType == GX_ORTHOGRAPHIC && !gekkoaotOrthoSamplesEfbCopy);
   if (gekkoaotWideX != 1.0f && gekkoaotApplyWideX) {
     proj.m0 = proj.m0 * Vec4{gekkoaotWideX, gekkoaotWideX, gekkoaotWideX, gekkoaotWideX};
   }
+  const auto& gekkoaotScissor = g_gxState.logicalScissor;
+  gekkoaot_native_gx_widescreen_diag(static_cast<int>(g_gxState.projType),
+      gekkoaotView.left, gekkoaotView.top, gekkoaotView.width, gekkoaotView.height,
+      gekkoaotScissor.x, gekkoaotScissor.y, gekkoaotScissor.width, gekkoaotScissor.height,
+      gekkoaotOffscreen, gekkoaotOrthoSamplesEfbCopy,
+      gekkoaotApplyWideX ? gekkoaotWideX : 1.f);
 ]=])
     string(FIND "${_gekkoaot_shader_info_text}" "${_gekkoaot_wide_decl_anchor}" _gekkoaot_wide_decl_pos)
     string(FIND "${_gekkoaot_shader_info_text}" "${_gekkoaot_wide_proj_anchor}" _gekkoaot_wide_proj_pos)
@@ -640,6 +689,37 @@ namespace aurora::gx {]=])
   endif()
 endif()
 
+# HPPOA uses GX_TG_TEX0 while TEX0 is absent from the current vertex format.
+# GX supplies the default (0,0) coordinate in that case. Aurora's pinned
+# shader generator instead aborts on the missing attribute.
+set(_gekkoaot_aurora_shader "${GEKKOAOT_AURORA_SOURCE}/lib/gx/shader.cpp")
+if(EXISTS "${_gekkoaot_aurora_shader}")
+  file(READ "${_gekkoaot_aurora_shader}" _gekkoaot_shader_text)
+  if(NOT _gekkoaot_shader_text MATCHES "GEKKOAOT_MISSING_TEXCOORD_V175")
+    set(_gekkoaot_missing_tex_anchor [=[    if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+      return "vec4f(0.0, 0.0, 0.0, 0.0)"s;
+    }
+    UNLIKELY FATAL("unmapped vtx attr {}", underlying(attr));]=])
+    set(_gekkoaot_missing_tex_replacement [=[    if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+      return "vec4f(0.0, 0.0, 0.0, 0.0)"s;
+    }
+    // GEKKOAOT_MISSING_TEXCOORD_V175: missing GX texture attributes supply
+    // zero ST; the texgen code provides the default homogeneous coordinates.
+    if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
+      return "vec2f(0.0, 0.0)"s;
+    }
+    UNLIKELY FATAL("unmapped vtx attr {}", underlying(attr));]=])
+    string(FIND "${_gekkoaot_shader_text}" "${_gekkoaot_missing_tex_anchor}"
+      _gekkoaot_missing_tex_pos)
+    if(_gekkoaot_missing_tex_pos EQUAL -1)
+      message(FATAL_ERROR "Pinned Aurora shader.cpp changed: missing texcoord anchor missing")
+    endif()
+    string(REPLACE "${_gekkoaot_missing_tex_anchor}" "${_gekkoaot_missing_tex_replacement}"
+      _gekkoaot_shader_text "${_gekkoaot_shader_text}")
+    file(WRITE "${_gekkoaot_aurora_shader}" "${_gekkoaot_shader_text}")
+  endif()
+endif()
+
 # GekkoAOT owns DVD/nod and memory. Aurora owns GX/WebGPU + SDL presentation.
 set(AURORA_ENABLE_GX ON CACHE BOOL "" FORCE)
 set(AURORA_ENABLE_DVD OFF CACHE BOOL "" FORCE)
@@ -648,6 +728,159 @@ set(AURORA_ENABLE_THP OFF CACHE BOOL "" FORCE)
 set(AURORA_ENABLE_RMLUI OFF CACHE BOOL "" FORCE)
 set(AURORA_DAWN_PROVIDER package CACHE STRING "" FORCE)
 set(AURORA_SDL3_PROVIDER auto CACHE STRING "" FORCE)
+
+# GEKKOAOT_BUILD_UNBLOCK_V159
+# Aurora 9c0bf66f asks for an xxHash CMake package first.  Arch and several
+# other distributions ship libxxhash + xxhash.h without xxHashConfig.cmake,
+# which makes Aurora fall through to FetchContent.  That unnecessarily turns
+# an otherwise local build into a network-dependent configure and can leave a
+# half-populated _deps tree after an interrupted download.  Publish the normal
+# xxHash::xxhash target ourselves when a system installation is present;
+# Aurora will keep its existing FetchContent fallback when it is not.
+if(NOT TARGET xxHash::xxhash)
+  # v159e: keep executable search roots such as /usr/bin out of C/C++ include
+  # paths.  Also clear stale results from the previous generic find_path().
+  unset(GEKKOAOT_XXHASH_INCLUDE_DIR CACHE)
+  unset(GEKKOAOT_XXHASH_LIBRARY CACHE)
+
+  find_path(GEKKOAOT_XXHASH_INCLUDE_DIR
+    NAMES xxhash.h
+    PATHS /usr/include /usr/local/include
+    NO_DEFAULT_PATH)
+  find_library(GEKKOAOT_XXHASH_LIBRARY
+    NAMES xxhash libxxhash
+    PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64
+    NO_DEFAULT_PATH)
+
+  if(GEKKOAOT_XXHASH_INCLUDE_DIR AND GEKKOAOT_XXHASH_LIBRARY)
+    add_library(gekkoaot_system_xxhash UNKNOWN IMPORTED GLOBAL)
+    set_target_properties(gekkoaot_system_xxhash PROPERTIES
+      IMPORTED_LOCATION "${GEKKOAOT_XXHASH_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${GEKKOAOT_XXHASH_INCLUDE_DIR}")
+    add_library(xxHash::xxhash ALIAS gekkoaot_system_xxhash)
+    message(STATUS "gekkoaot: using system xxhash: ${GEKKOAOT_XXHASH_LIBRARY} include=${GEKKOAOT_XXHASH_INCLUDE_DIR}")
+  endif()
+endif()
+
+# v161f: compose safely with gekkoaot-storage-staging-v4. That patch replaces
+# the upstream numeric StorageBufferSize literal with the
+# GEKKOAOT_AURORA_STORAGE_BUFFER_SIZE macro (currently 64 MiB). Treat that as
+# authoritative and never shrink it. Numeric upstream/older forms are still
+# grown to at least 32 MiB. Unknown future forms are left untouched instead of
+# making the entire Aurora configure fail.
+set(_gekkoaot_aurora_resources_hpp "${GEKKOAOT_AURORA_SOURCE}/lib/gfx/resources.hpp")
+if(EXISTS "${_gekkoaot_aurora_resources_hpp}")
+  file(READ "${_gekkoaot_aurora_resources_hpp}" _gekkoaot_resources_text)
+
+  if(_gekkoaot_resources_text MATCHES "GEKKOAOT_AURORA_STORAGE_BUFFER_SIZE")
+    message(STATUS
+      "GEKKOAOT_STORAGE_ARENA_V161F=1 storage-mib=64 action=keep-storage-staging-v4 policy=no-shrink")
+  else()
+    string(REGEX MATCH
+      "inline constexpr uint64_t StorageBufferSize = ([0-9]+);"
+      _gekkoaot_storage_match "${_gekkoaot_resources_text}")
+
+    if(_gekkoaot_storage_match)
+      set(_gekkoaot_storage_bytes "${CMAKE_MATCH_1}")
+      if(_gekkoaot_storage_bytes LESS 33554432)
+        string(REGEX REPLACE
+          "inline constexpr uint64_t StorageBufferSize = [0-9]+;[^\n]*"
+          "// GEKKOAOT_STORAGE_ARENA_V161F\ninline constexpr uint64_t StorageBufferSize = 33554432; // 32 MiB"
+          _gekkoaot_resources_text "${_gekkoaot_resources_text}")
+        file(WRITE "${_gekkoaot_aurora_resources_hpp}" "${_gekkoaot_resources_text}")
+        message(STATUS
+          "GEKKOAOT_STORAGE_ARENA_V161F=1 storage-mib=32 action=grow policy=reduce-dawn-map-rollovers")
+      else()
+        math(EXPR _gekkoaot_storage_mib "${_gekkoaot_storage_bytes} / 1048576")
+        message(STATUS
+          "GEKKOAOT_STORAGE_ARENA_V161F=1 storage-mib=${_gekkoaot_storage_mib} action=keep-existing policy=no-shrink")
+      endif()
+    else()
+      message(WARNING
+        "GEKKOAOT_STORAGE_ARENA_V161F=1 action=leave-unknown-form policy=non-blocking")
+    endif()
+  endif()
+endif()
+
+# v161c: install the multi-state GX pipeline cache after the controller has
+# composed all Aurora source patches. Keeping this out of gekkoaotctl.cpp
+# makes the optimization resilient to local controller edits/rebases.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_LIST_DIR}/aurora_pipeline_multistate_v161.py"
+          "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE GEKKOAOT_AURORA_V161_RESULT
+  OUTPUT_VARIABLE GEKKOAOT_AURORA_V161_OUTPUT
+  ERROR_VARIABLE GEKKOAOT_AURORA_V161_ERROR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_STRIP_TRAILING_WHITESPACE)
+if(NOT GEKKOAOT_AURORA_V161_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "GekkoAOT v161 Aurora multi-state compose failed: ${GEKKOAOT_AURORA_V161_ERROR}")
+endif()
+if(GEKKOAOT_AURORA_V161_OUTPUT)
+  message(STATUS "${GEKKOAOT_AURORA_V161_OUTPUT}")
+endif()
+
+# v161g: replace per-overflow CreateBuffer(mappedAtCreation) churn from
+# storage-staging-v4 with a bounded persistent MapAsync-remapped pool.
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_LIST_DIR}/aurora_storage_pool_v161g.py"
+          "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE GEKKOAOT_AURORA_STORAGE_POOL_RESULT
+  OUTPUT_VARIABLE GEKKOAOT_AURORA_STORAGE_POOL_OUTPUT
+  ERROR_VARIABLE GEKKOAOT_AURORA_STORAGE_POOL_ERROR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_STRIP_TRAILING_WHITESPACE)
+if(NOT GEKKOAOT_AURORA_STORAGE_POOL_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "GekkoAOT v161g Aurora storage pool compose failed: ${GEKKOAOT_AURORA_STORAGE_POOL_ERROR}")
+endif()
+if(GEKKOAOT_AURORA_STORAGE_POOL_OUTPUT)
+  message(STATUS "${GEKKOAOT_AURORA_STORAGE_POOL_OUTPUT}")
+endif()
+
+# v161h: persistent indexed-array snapshots above the transient storage arena.
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_LIST_DIR}/aurora_persistent_array_cache_v161h.py"
+          "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE GEKKOAOT_AURORA_ARRAY_CACHE_RESULT
+  OUTPUT_VARIABLE GEKKOAOT_AURORA_ARRAY_CACHE_OUTPUT
+  ERROR_VARIABLE GEKKOAOT_AURORA_ARRAY_CACHE_ERROR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_STRIP_TRAILING_WHITESPACE)
+if(NOT GEKKOAOT_AURORA_ARRAY_CACHE_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "GekkoAOT v161h Aurora persistent array cache compose failed: ${GEKKOAOT_AURORA_ARRAY_CACHE_ERROR}")
+endif()
+if(GEKKOAOT_AURORA_ARRAY_CACHE_OUTPUT)
+  message(STATUS "${GEKKOAOT_AURORA_ARRAY_CACHE_OUTPUT}")
+endif()
+
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_LIST_DIR}/aurora_present_counter_v190.py"
+          "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE GEKKOAOT_PRESENT_COUNTER_RESULT)
+if(NOT GEKKOAOT_PRESENT_COUNTER_RESULT EQUAL 0)
+  message(FATAL_ERROR "GekkoAOT Aurora presentation counter compose failed")
+endif()
+
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_LIST_DIR}/aurora_lazy_staging_v236.py"
+          "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE GEKKOAOT_LAZY_STAGING_RESULT
+  OUTPUT_VARIABLE GEKKOAOT_LAZY_STAGING_OUTPUT
+  ERROR_VARIABLE GEKKOAOT_LAZY_STAGING_ERROR)
+if(NOT GEKKOAOT_LAZY_STAGING_RESULT EQUAL 0)
+  message(FATAL_ERROR "GekkoAOT lazy staging compose failed: ${GEKKOAOT_LAZY_STAGING_ERROR}")
+endif()
+message(STATUS "${GEKKOAOT_LAZY_STAGING_OUTPUT}")
+
 add_subdirectory("${GEKKOAOT_AURORA_SOURCE}" aurora EXCLUDE_FROM_ALL)
 
 # Aurora's standalone test executables do not link GekkoAOT's bridge. Supply
@@ -659,7 +892,7 @@ foreach(_gekkoaot_aurora_test IN ITEMS gx_fifo_tests gx_shader_tests gx_texture_
   endif()
 endforeach()
 
-add_library(gekkoaot-native-gx SHARED bridge.cpp)
+add_library(gekkoaot-native-gx SHARED bridge.cpp bounding_box.cpp)
 # aurora::gx and aurora::core reference the VI helper implemented in
 # Aurora's dedicated aurora_vi target (configured_fb_size/configure).  Because
 # gekkoaot-native-gx is a shared object, leaving aurora::vi out can produce a
@@ -689,6 +922,43 @@ if(GEKKOAOT_GX_IPO_OK)
   message(STATUS "gekkoaot: native GX bridge IPO/LTO enabled")
 endif()
 
+# v300: the GX worker and Aurora's render worker spend most of their time in
+# Aurora's static libraries, which otherwise build with generic flags: every
+# cross-file call goes through the PLT and nothing inlines across files. Give
+# them the bridge's code-generation policy (LTO, hidden visibility, direct
+# calls, native ISA). The plugin's exported surface stays the bridge's
+# GEKKOAOT_GX_EXPORT entry points. Opt out: -DGEKKOAOT_GX_AURORA_FAST_CODEGEN=OFF.
+option(GEKKOAOT_GX_AURORA_FAST_CODEGEN "Build Aurora with the native GX bridge code policy" ON)
+if(GEKKOAOT_GX_AURORA_FAST_CODEGEN AND NOT MSVC)
+  foreach(_gekkoaot_aurora_lib IN ITEMS aurora_gx aurora_core aurora_vi)
+    if(TARGET ${_gekkoaot_aurora_lib})
+      set_target_properties(${_gekkoaot_aurora_lib} PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        C_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES)
+      if(GEKKOAOT_GX_IPO_OK)
+        set_property(TARGET ${_gekkoaot_aurora_lib} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+      endif()
+      target_compile_options(${_gekkoaot_aurora_lib} PRIVATE
+        -O3 -fno-semantic-interposition -fno-plt)
+      if(NOT APPLE)
+        target_compile_options(${_gekkoaot_aurora_lib} PRIVATE -march=native -mtune=native)
+      endif()
+    endif()
+  endforeach()
+  if(UNIX AND NOT APPLE)
+    # Bind the plugin's own function references locally, including the
+    # prebuilt Dawn archive (ErrorMonad::IsError@plt, RefCounted@plt, ...).
+    # SDL stays interposable: the plugin carries SDL3-static, but at runtime it
+    # must share the host's libSDL3 instance (input, events, video init).
+    set(_gekkoaot_gx_dynamic_list "${CMAKE_CURRENT_BINARY_DIR}/gekkoaot-native-gx.dynamic-list")
+    file(WRITE "${_gekkoaot_gx_dynamic_list}" "{\n  SDL_*;\n};\n")
+    target_link_options(gekkoaot-native-gx PRIVATE
+      -Wl,-Bsymbolic-functions "-Wl,--dynamic-list=${_gekkoaot_gx_dynamic_list}")
+  endif()
+  message(STATUS "gekkoaot: Aurora fast codegen v300 enabled (ipo=${GEKKOAOT_GX_IPO_OK})")
+endif()
+
 find_package(X11 QUIET)
 if(X11_FOUND)
   target_compile_definitions(gekkoaot-native-gx PRIVATE GEKKOAOT_HAVE_X11=1)
@@ -713,4 +983,99 @@ else()
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(gekkoaot-native-gx PRIVATE -fpermissive)
   endif()
+endif()
+
+# Decode the raster offset shared by the GX viewport and scissor (BP59).
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_scissor_offset_v247.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_scissor_status)
+if(NOT _gekkoaot_scissor_status EQUAL 0)
+  message(FATAL_ERROR "Aurora BP59 offset overlay failed")
+endif()
+
+# Preserve projections of EFB regions proven to produce texture copies.
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_texture_viewport_v250.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_texture_viewport_result)
+if(NOT _gekkoaot_texture_viewport_result EQUAL 0)
+  message(FATAL_ERROR "Aurora texture viewport overlay failed")
+endif()
+
+# GX movie renderers commonly submit integer UVs with manual SU scale=1.
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_texcoord_scale_v251.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_texcoord_scale_result)
+if(NOT _gekkoaot_texcoord_scale_result EQUAL 0)
+  message(FATAL_ERROR "Aurora ordinary texture coordinate scale overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_screen_fill_v253.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_screen_fill_result)
+if(NOT _gekkoaot_screen_fill_result EQUAL 0)
+  message(FATAL_ERROR "Aurora screen fill overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_bounding_box_v257.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_bounding_box_result)
+if(NOT _gekkoaot_bounding_box_result EQUAL 0)
+  message(FATAL_ERROR "Aurora native GPU bounding box overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_ui_scissor_v257.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_ui_scissor_result)
+if(NOT _gekkoaot_ui_scissor_result EQUAL 0)
+  message(FATAL_ERROR "Aurora UI scissor overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_bind_group_cache_v297.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_bind_group_cache_result)
+if(NOT _gekkoaot_bind_group_cache_result EQUAL 0)
+  message(FATAL_ERROR "Aurora native bind group cache overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_gx_hotpath_v300.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_gx_hotpath_result)
+if(NOT _gekkoaot_gx_hotpath_result EQUAL 0)
+  message(FATAL_ERROR "Aurora GX hot path v300 overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_native_snapshot_v301.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_native_snapshot_result)
+if(NOT _gekkoaot_native_snapshot_result EQUAL 0)
+  message(FATAL_ERROR "Aurora immutable native snapshot v301 overlay failed")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_native_snapshot_v301.py"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_resolved_batch_v302.py"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_native_upload_v314.py"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_native_cache_lifetime_v317.py"
+  "${CMAKE_CURRENT_LIST_DIR}/../native_snapshot_atlas.h"
+  "${CMAKE_CURRENT_LIST_DIR}/../native_resource_table.h"
+  "${CMAKE_CURRENT_LIST_DIR}/../native_index_batch.h")
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_resolved_batch_v302.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_resolved_batch_result)
+if(NOT _gekkoaot_resolved_batch_result EQUAL 0)
+  message(FATAL_ERROR "Aurora resolved native draw batch v302 overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_native_upload_v314.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_native_upload_result)
+if(NOT _gekkoaot_native_upload_result EQUAL 0)
+  message(FATAL_ERROR "Aurora native upload arena v314 overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_native_cache_lifetime_v317.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_native_cache_lifetime_result)
+if(NOT _gekkoaot_native_cache_lifetime_result EQUAL 0)
+  message(FATAL_ERROR "Aurora native cache lifetime v317 overlay failed")
 endif()

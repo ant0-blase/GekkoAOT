@@ -1,0 +1,91 @@
+diff --git a/src/backend/dispatch.c b/src/backend/dispatch.c
+index c6379a7..048136e 100644
+--- a/src/backend/dispatch.c
++++ b/src/backend/dispatch.c
+@@ -22,6 +22,63 @@ static DispatchLookupMode dispatch_lookup_mode(void) {
+     return DISPATCH_LOOKUP_LINEAR;
+ }
+
++static int static_intercept_compare(const void* left, const void* right) {
++    const u32 a = *(const u32*)left;
++    const u32 b = *(const u32*)right;
++    return a < b ? -1 : a > b ? 1 : 0;
++}
++
++/* GekkoAOT v278: emit a compile-time positive filter for the SDK/HLE
++ * manifest. The generic dispatcher otherwise calls CPUState::host_call before
++ * local AOT dispatch for every guest edge. With a complete manifest, only
++ * exact intercepted entrypoints need that boundary. Missing/malformed input
++ * deliberately emits `return 1`, preserving upstream dynamic behaviour. */
++static void emit_static_hostcall_filter(FILE* out) {
++    const char* path = getenv("DOLRECOMP_STATIC_INTERCEPTS");
++    FILE* in = path && path[0] ? fopen(path, "r") : NULL;
++    u32* addresses = NULL;
++    u32 count = 0u, capacity = 0u;
++    int valid = in != NULL;
++    char line[1024];
++
++    while (valid && fgets(line, sizeof(line), in)) {
++        char* p = line;
++        while (*p == ' ' || *p == '\t') ++p;
++        if (*p == '\0' || *p == '\n' || *p == '#') continue;
++        char* end = NULL;
++        unsigned long value = strtoul(p, &end, 0);
++        if (end == p || value > 0xfffffffful) { valid = 0; break; }
++        if (count == capacity) {
++            u32 next = capacity ? capacity * 2u : 64u;
++            u32* grown = (u32*)realloc(addresses, next * sizeof(*addresses));
++            if (!grown) { valid = 0; break; }
++            addresses = grown;
++            capacity = next;
++        }
++        addresses[count++] = (u32)value;
++    }
++    if (in) fclose(in);
++
++    if (!valid) {
++        fprintf(out, "\nstatic inline int dolrecomp_static_hostcall_candidate(u32 address) { (void)address; return 1; }\n");
++        free(addresses);
++        return;
++    }
++
++    qsort(addresses, count, sizeof(*addresses), static_intercept_compare);
++    fprintf(out, "\nstatic inline int dolrecomp_static_hostcall_candidate(u32 address) {\n");
++    fprintf(out, "    switch (address) {\n");
++    u32 previous = 0u;
++    int have_previous = 0;
++    for (u32 i = 0; i < count; ++i) {
++        if (have_previous && addresses[i] == previous) continue;
++        previous = addresses[i]; have_previous = 1;
++        fprintf(out, "    case 0x%08Xu: return 1;\n", addresses[i]);
++    }
++    fprintf(out, "    default: return 0;\n    }\n}\n");
++    free(addresses);
++}
++
+ void emit_chunk_prototype(FILE* out, u32 func_addr) {
+     fprintf(out, "void func_%08X(CPUState* ctx);\n", func_addr);
+ }
+@@ -339,6 +396,7 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
+     if (dispatch_lookup_mode() != DISPATCH_LOOKUP_INDEXED ||
+         !emit_lookup_indexed(out, funcs))
+         emit_function_lookup(out, funcs, "");
++    emit_static_hostcall_filter(out);
+     fprintf(out, "\nstatic inline int dolrecomp_call_original(CPUState* ctx, u32 address) {\n");
+     fprintf(out, "    DolRecompFunction fn = dolrecomp_find_original(address);\n");
+     fprintf(out, "    if (!fn) return 0;\n");
+@@ -357,12 +415,12 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
+     fprintf(out, "    u32 alias;\n");
+     fprintf(out, "    ctx->pc = address;\n");
+     fprintf(out, "    if (dolrecomp_dispatch_replacement(ctx, address)) return 1;\n");
+-    fprintf(out, "    if (ctx->host_call && ppc_host_call(ctx, address)) return 1;\n");
++    fprintf(out, "    if (dolrecomp_static_hostcall_candidate(address) && ctx->host_call && ppc_host_call(ctx, address)) return 1;\n");
+     fprintf(out, "    if (dolrecomp_call_original(ctx, address)) return 1;\n");
+     fprintf(out, "    if (dolrecomp_physical_pc_alias(ctx, address, &alias)) {\n");
+     fprintf(out, "        ctx->pc = alias;\n");
+     fprintf(out, "        if (dolrecomp_dispatch_replacement(ctx, alias)) return 1;\n");
+-    fprintf(out, "        if (ctx->host_call && ppc_host_call(ctx, alias)) return 1;\n");
++    fprintf(out, "        if (dolrecomp_static_hostcall_candidate(alias) && ctx->host_call && ppc_host_call(ctx, alias)) return 1;\n");
+     fprintf(out, "        if (dolrecomp_call_original(ctx, alias)) return 1;\n");
+     fprintf(out, "    }\n");
+     fprintf(out, "    return 0;\n");

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 
 #define CHECK(condition) do { if (!(condition)) { \
   std::cerr << __LINE__ << ": " #condition "\n"; std::exit(1); \
@@ -36,6 +37,14 @@ int main() {
   CHECK(ai.StreamSampleRateHz() == 48043u);
   CHECK(ai.DspSampleRateHz() == 32028u);
   CHECK(!ai.IsPlaying());
+  CHECK(ai.CyclesUntilInterrupt() == std::numeric_limits<std::uint64_t>::max());
+
+  NativeAI deadline;
+  Write(deadline, kTrigger, 3u);
+  Write(deadline, kControl, kPlaying | kInterruptMask);
+  CHECK(deadline.CyclesUntilInterrupt() == CyclesForSamples(3u));
+  deadline.AdvanceCycles(CyclesForSamples(3u));
+  CHECK(deadline.CyclesUntilInterrupt() == 0u);
 
   // The optical stream counter advances on the AI clock, including when its
   // CPU interrupt is masked. The latched cause becomes visible on unmask.

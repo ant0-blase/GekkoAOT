@@ -187,7 +187,8 @@ std::uint32_t WalkFst(std::uint32_t index, NodNodeKind kind, const char* raw_nam
   // it as PPC code, so ordinary assets remain inert even though they are made
   // available for classification.
   if (extension == ".rel" || extension == ".elf" || extension == ".dol" ||
-      extension == ".bin") {
+      extension == ".bin" ||
+      ((extension == ".arc" || extension == ".szs") && lower.find("rel") != std::string::npos)) {
     if (!CopyFile(state.partition, index, size, state.output / "files" / relative, &state.error)) {
       state.ok = false;
       return NOD_FST_STOP;
@@ -303,6 +304,10 @@ int DiscMain(const fs::path& image_arg, const fs::path& output_arg) {
       "\",\n  \"game_id\": \"" + JsonEscape(game_id) + "\"\n}\n";
   if (!WriteText(output / "meta/disc-source.json", source_json)) {
     std::cerr << "could not write nod source metadata\n";
+    return 1;
+  }
+  if (!WriteText(output / "meta/exec-cache-policy.txt", "v4-fst-subdirectories\n")) {
+    std::cerr << "could not write executable cache policy\n";
     return 1;
   }
 

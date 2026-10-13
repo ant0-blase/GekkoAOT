@@ -37,6 +37,13 @@ int main() {
   CHECK(!pe.FinishInterruptPending());
   std::uint64_t value = 0;
   CHECK(pe.Read(0xcc00100a, 2, &value) && value == 3);
+  pe.SetBoundingBox({17, 43, 22, 51});
+  CHECK(pe.Read(0xcc001010, 2, &value) && value == 17);
+  CHECK(pe.Read(0xcc001012, 2, &value) && value == 43);
+  CHECK(pe.Read(0xcc001014, 4, &value) && value == 0x00160033u);
+  CHECK(!pe.Write(0xcc001010, 0, 2));
+  pe.Reset();
+  CHECK(pe.Read(0xcc001010, 4, &value) && value == 0);
 
   GekkoAOT::HW::VI::NativeVI vi;
   CHECK(vi.Write(0xcc002000, 2u << 4, 2)); // 2 active lines per field

@@ -10,9 +10,124 @@
 #else
 #include <dlfcn.h>
 #endif
+#if defined(__linux__)
+#include <elf.h>
+#include <link.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <vector>
+#endif
 
 namespace GekkoAOT::Native {
 namespace {
+
+#if defined(__linux__)
+// v326: the AOT main thread is frontend bound and ~19% of its cycles are iTLB
+// stalls (HPCOS main thread, TopdownL3): a game module carries 100-250 MiB of
+// text and its hot code touches thousands of 4 KiB pages. Move the 2 MiB-
+// aligned interior of a large module's executable segment onto anonymous
+// transparent huge pages. The copy is fully prepared (MADV_HUGEPAGE, bytes,
+// read+execute) and then swapped over the original with one mremap, so a
+// failure at any step leaves the loaded file mapping untouched. Addresses do
+// not change; only the backing pages do. GEKKOAOT_HUGE_TEXT=0 disables it.
+struct TextSegment {
+  ElfW(Addr) base = 0;
+  std::uintptr_t start = 0, end = 0;
+};
+
+int FindTextSegment(dl_phdr_info* info, size_t, void* data) {
+  auto* segment = static_cast<TextSegment*>(data);
+  if (info->dlpi_addr != segment->base) return 0;
+  for (int i = 0; i < info->dlpi_phnum; ++i) {
+    const auto& header = info->dlpi_phdr[i];
+    if (header.p_type == PT_LOAD && (header.p_flags & PF_X) != 0) {
+      segment->start = info->dlpi_addr + header.p_vaddr;
+      segment->end = segment->start + header.p_memsz;
+      break;
+    }
+  }
+  return 1;
+}
+
+// perf cannot symbolize anonymous text; publish the module's function symbols
+// for the remapped range in the JIT map format when profiling asks for it.
+void WriteHugeTextPerfMap(const char* path, ElfW(Addr) base, std::uintptr_t begin,
+                          std::uintptr_t end) {
+  std::ifstream file(path, std::ios::binary);
+  std::vector<char> image((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  if (image.size() < sizeof(ElfW(Ehdr))) return;
+  const auto* header = reinterpret_cast<const ElfW(Ehdr)*>(image.data());
+  if (header->e_shoff == 0 || header->e_shoff + std::size_t(header->e_shnum) * sizeof(ElfW(Shdr)) > image.size())
+    return;
+  const auto* sections = reinterpret_cast<const ElfW(Shdr)*>(image.data() + header->e_shoff);
+  char map_path[64];
+  std::snprintf(map_path, sizeof(map_path), "/tmp/perf-%d.map", static_cast<int>(getpid()));
+  std::FILE* out = std::fopen(map_path, "a");
+  if (!out) return;
+  for (unsigned i = 0; i < header->e_shnum; ++i) {
+    if (sections[i].sh_type != SHT_SYMTAB || sections[i].sh_link >= header->e_shnum) continue;
+    const auto& strings = sections[sections[i].sh_link];
+    if (sections[i].sh_offset + sections[i].sh_size > image.size() ||
+        strings.sh_offset + strings.sh_size > image.size()) continue;
+    const auto* symbols = reinterpret_cast<const ElfW(Sym)*>(image.data() + sections[i].sh_offset);
+    const std::size_t count = sections[i].sh_size / sizeof(ElfW(Sym));
+    for (std::size_t k = 0; k < count; ++k) {
+      const auto& symbol = symbols[k];
+      if (ELF64_ST_TYPE(symbol.st_info) != STT_FUNC || symbol.st_size == 0 ||
+          symbol.st_name >= strings.sh_size) continue;
+      const std::uintptr_t address = base + symbol.st_value;
+      if (address < begin || address >= end) continue;
+      std::fprintf(out, "%lx %lx %s\n", static_cast<unsigned long>(address),
+                   static_cast<unsigned long>(symbol.st_size),
+                   image.data() + strings.sh_offset + symbol.st_name);
+    }
+  }
+  std::fclose(out);
+}
+
+void RemapModuleTextToHugePages(void* handle) {
+  const char* setting = std::getenv("GEKKOAOT_HUGE_TEXT");
+  if (!handle || (setting && setting[0] == '0')) return;
+  link_map* map = nullptr;
+  if (dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 || !map) return;
+  TextSegment segment{map->l_addr};
+  dl_iterate_phdr(FindTextSegment, &segment);
+  constexpr std::uintptr_t kHuge = std::uintptr_t{2} << 20;
+  const std::uintptr_t begin = (segment.start + kHuge - 1u) & ~(kHuge - 1u);
+  const std::uintptr_t end = segment.end & ~(kHuge - 1u);
+  // Small modules (REL side modules, test fixtures) gain nothing.
+  if (segment.start == 0u || end <= begin || end - begin < 4u * kHuge) return;
+  const std::size_t bytes = end - begin;
+
+  void* reserved = mmap(nullptr, bytes + kHuge, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (reserved == MAP_FAILED) return;
+  const auto raw = reinterpret_cast<std::uintptr_t>(reserved);
+  const std::uintptr_t aligned = (raw + kHuge - 1u) & ~(kHuge - 1u);
+  if (aligned != raw) munmap(reserved, aligned - raw);
+  if (const std::uintptr_t tail = raw + bytes + kHuge - (aligned + bytes); tail != 0u)
+    munmap(reinterpret_cast<void*>(aligned + bytes), tail);
+  auto* copy = reinterpret_cast<void*>(aligned);
+  madvise(copy, bytes, MADV_HUGEPAGE);
+  std::memcpy(copy, reinterpret_cast<const void*>(begin), bytes);
+  if (mprotect(copy, bytes, PROT_READ | PROT_EXEC) != 0 ||
+      mremap(copy, bytes, bytes, MREMAP_MAYMOVE | MREMAP_FIXED,
+             reinterpret_cast<void*>(begin)) == MAP_FAILED) {
+    munmap(copy, bytes);
+    std::fprintf(stderr, "GEKKOAOT_HUGE_TEXT_V326=0 reason=remap-failed bytes=%zu\n", bytes);
+    return;
+  }
+  const char* perf_map = std::getenv("GEKKOAOT_HUGE_TEXT_PERF_MAP");
+  if (perf_map && perf_map[0] == '1')
+    WriteHugeTextPerfMap(map->l_name, map->l_addr, begin, end);
+  std::fprintf(stderr, "GEKKOAOT_HUGE_TEXT_V326=1 module=\"%s\" text_mib=%zu huge_mib=%zu perf_map=%u\n",
+               map->l_name, static_cast<std::size_t>((segment.end - segment.start) >> 20),
+               bytes >> 20, perf_map && perf_map[0] == '1' ? 1u : 0u);
+}
+#endif
 
 bool RangesValid(const GekkoAOTRange* ranges, std::uint32_t count) {
   if (!ranges || count == 0) return false;
@@ -59,7 +174,11 @@ bool RelModulesValid(const GekkoAOTModuleDesc* d) {
       const std::uint64_t end = std::uint64_t(section.linked_start) + section.size;
       if (section.module_id != module.module_id || section.section_index >= module.section_count ||
           section.size == 0 || section.linked_start < 0x80000000u ||
-          end > 0x81800000ull) return false;
+          end > 0x100000000ull) return false;
+      // linked_start is a compiler-assigned identity, not a live RAM address.
+      // Hundreds of mutually exclusive overlays can exceed retail MEM1 in
+      // this namespace. RefreshRelMappings separately validates their actual
+      // OSLink addresses and sizes before publishing any runtime mapping.
       if (AddressCovered(d->code_ranges, d->num_code_ranges, section.linked_start))
         has_code_section = true;
     }
@@ -169,6 +288,9 @@ ModuleStatus ModuleLibrary::Open(const std::filesystem::path& path, const char* 
     Close();
     return status;
   }
+#if defined(__linux__)
+  RemapModuleTextToHugePages(handle_);
+#endif
   using CapabilitiesFn = std::uint32_t (*)();
 #ifdef _WIN32
   auto capabilities = reinterpret_cast<CapabilitiesFn>(
@@ -180,6 +302,15 @@ ModuleStatus ModuleLibrary::Open(const std::filesystem::path& path, const char* 
   (void)dlerror();
 #endif
   capabilities_ = capabilities ? capabilities() : 0u;
+#ifdef _WIN32
+  rel_import_proofs_ = reinterpret_cast<GekkoAOTRelImportProofsFn>(
+      GetProcAddress(reinterpret_cast<HMODULE>(handle_), "gekkoaot_rel_import_proofs"));
+#else
+  dlerror();
+  rel_import_proofs_ = reinterpret_cast<GekkoAOTRelImportProofsFn>(
+      dlsym(handle_, "gekkoaot_rel_import_proofs"));
+  (void)dlerror();
+#endif
   return ModuleStatus::Ok;
 }
 
@@ -198,9 +329,100 @@ int ModuleLibrary::FlushProfile() const {
   return flush_profile ? flush_profile() : -1;
 }
 
+bool ModuleLibrary::BindNativeHardware(const GekkoAOTNativeHardware& services) const {
+  if (!handle_) return false;
+#ifdef _WIN32
+  auto bind = reinterpret_cast<GekkoAOTBindNativeHardware>(
+      GetProcAddress(reinterpret_cast<HMODULE>(handle_), "gekkoaot_bind_native_hardware"));
+#else
+  dlerror();
+  auto bind = reinterpret_cast<GekkoAOTBindNativeHardware>(
+      dlsym(handle_, "gekkoaot_bind_native_hardware"));
+  (void)dlerror();
+#endif
+  return bind && bind(&services) == 1;
+}
+
+bool ModuleLibrary::BindNativeWgpipeTry(const GekkoAOTNativeWgpipeTry& services) const {
+  if (!handle_) return false;
+#ifdef _WIN32
+  auto bind = reinterpret_cast<GekkoAOTBindNativeWgpipeTry>(
+      GetProcAddress(reinterpret_cast<HMODULE>(handle_), "gekkoaot_bind_native_wgpipe_try"));
+#else
+  dlerror();
+  auto bind = reinterpret_cast<GekkoAOTBindNativeWgpipeTry>(
+      dlsym(handle_, "gekkoaot_bind_native_wgpipe_try"));
+  (void)dlerror();
+#endif
+  return bind && bind(&services) == 1;
+}
+
+bool ModuleLibrary::BindNativeStableMmio(const GekkoAOTNativeStableMmio& services) const {
+  if (!handle_) return false;
+#ifdef _WIN32
+  auto bind = reinterpret_cast<GekkoAOTBindNativeStableMmio>(
+      GetProcAddress(reinterpret_cast<HMODULE>(handle_), "gekkoaot_bind_native_stable_mmio"));
+#else
+  dlerror();
+  auto bind = reinterpret_cast<GekkoAOTBindNativeStableMmio>(
+      dlsym(handle_, "gekkoaot_bind_native_stable_mmio"));
+  (void)dlerror();
+#endif
+  return bind && bind(&services) == 1;
+}
+
+bool ModuleLibrary::BindNativeAddressWindow(const GekkoAOTNativeAddressWindow& services) const {
+  if (!handle_) return false;
+#ifdef _WIN32
+  auto bind = reinterpret_cast<GekkoAOTBindNativeAddressWindow>(
+      GetProcAddress(reinterpret_cast<HMODULE>(handle_), "gekkoaot_bind_native_address_window"));
+#else
+  dlerror();
+  auto bind = reinterpret_cast<GekkoAOTBindNativeAddressWindow>(
+      dlsym(handle_, "gekkoaot_bind_native_address_window"));
+  (void)dlerror();
+#endif
+  return bind && bind(&services) == 1;
+}
+
+bool ModuleLibrary::BindNativeFlatVmem(const GekkoAOTNativeFlatVmem& services) const {
+  if (!handle_) return false;
+#ifdef _WIN32
+  auto bind = reinterpret_cast<GekkoAOTBindNativeFlatVmem>(
+      GetProcAddress(reinterpret_cast<HMODULE>(handle_), "gekkoaot_bind_native_flat_vmem"));
+#else
+  dlerror();
+  auto bind = reinterpret_cast<GekkoAOTBindNativeFlatVmem>(
+      dlsym(handle_, "gekkoaot_bind_native_flat_vmem"));
+  (void)dlerror();
+#endif
+  if (!bind) return false;
+  if (bind(&services) == 1) return true;
+  // v322: modules built before the paged mirror accept only version 1. Its
+  // view prefix (data, size) is unchanged, so the same getter remains valid.
+  GekkoAOTNativeFlatVmem v1 = services;
+  v1.version = 1u;
+  return bind(&v1) == 1;
+}
+
+bool ModuleLibrary::BindNativeLockedCache(const GekkoAOTNativeLockedCache& services) const {
+  if (!handle_) return false;
+#ifdef _WIN32
+  auto bind = reinterpret_cast<GekkoAOTBindNativeLockedCache>(
+      GetProcAddress(reinterpret_cast<HMODULE>(handle_), "gekkoaot_bind_native_locked_cache"));
+#else
+  dlerror();
+  auto bind = reinterpret_cast<GekkoAOTBindNativeLockedCache>(
+      dlsym(handle_, "gekkoaot_bind_native_locked_cache"));
+  (void)dlerror();
+#endif
+  return bind && bind(&services) == 1;
+}
+
 void ModuleLibrary::Close() {
   descriptor_ = nullptr;
   capabilities_ = 0u;
+  rel_import_proofs_ = nullptr;
   if (!handle_) return;
 #ifdef _WIN32
   FreeLibrary(reinterpret_cast<HMODULE>(handle_));

@@ -7,6 +7,18 @@
 
 int main(int argc, char** argv)
 {
+    // Native lowering and bounded FIFO publication are the normal launch policy.
+    // Keep explicit environment overrides, including "0", authoritative.
+    for (const char* option : {
+             "GEKKOAOT_NATIVE_SDK_CLOCK_LOWERING",
+             "GEKKOAOT_NATIVE_HARDWARE_LOWERING",
+             "GEKKOAOT_NATIVE_WGPIPE_TRY_LOWERING",
+             "GEKKOAOT_NATIVE_GX_STREAM_FIFO",
+             "GEKKOAOT_GX_DIRECT_BATCH_SLOT"}) {
+        if (!qEnvironmentVariableIsSet(option))
+            qputenv(option, QByteArrayLiteral("1"));
+    }
+
     // Preserve fractional monitor scales such as GNOME 125/150/175% instead of
     // rounding them to 1x or 2x. Qt 6 is high-DPI aware by default; this policy
     // controls only fractional rounding and therefore works on both X11 and

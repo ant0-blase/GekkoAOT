@@ -6,15 +6,15 @@ GekkoAOT is GPL-3.0-or-later. The repository also integrates with or carries pat
 
 Upstream: `https://github.com/ExpansionPak/DolRecomp`
 
-Pinned revision in v0.0.1: `71ce7f97419b1bb1ba9a9596c41507f6629e0fb0`
+Default pinned revision: `71ce7f97419b1bb1ba9a9596c41507f6629e0fb0`
 
-License: GNU General Public License v3.0. GekkoAOT's top-level `LICENSE` contains the GPLv3 text. Local changes are represented as patches under `patches/dolrecomp/` and are distributed under compatible GPL terms.
+License: GNU General Public License v3.0. GekkoAOT's `COPYING` contains the full GPLv3 text. Local changes are represented as patches under `patches/dolrecomp/` and are distributed under compatible GPL terms.
 
 ## Aurora
 
 Upstream: `https://github.com/encounter/aurora`
 
-Pinned revision in v0.0.1: `3840bf9ae735191026e4d4edb0ce6f24d91f7eea`
+Default pinned revision: `9c0bf66f1ed3276b60ad1cd746e2fb48818a6298` (explicit CMake overrides are supported).
 
 License: MIT.
 
@@ -30,7 +30,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Upstream: `https://github.com/encounter/nod`
 
-Pinned release in v0.0.1: `v2.0.0-alpha.12`
+Pinned release: `v2.0.0-alpha.12`
 
 nod is available under MIT OR Apache-2.0. GekkoAOT release packaging uses the MIT grant for redistribution of the linked prebuilt library.
 
@@ -44,7 +44,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ## Qt
 
-Qt 6 is used by the optional desktop frontend. The v0.0.1 GitHub archives created by this repository do **not** intentionally bundle Qt runtime libraries; users/build systems provide Qt separately. Qt itself is available under its own commercial/open-source license options.
+Qt 6 is used by the optional desktop frontend. Portable releases deploy Qt runtime libraries and platform plugins, including the Windows Qt runtime and the Linux AppImage deployment. Qt retains its commercial/open-source licensing terms and upstream notices. Source builds may use a system Qt installation.
 
 ## Game and platform trademarks
 
@@ -62,3 +62,19 @@ License: zlib License. Portable builds may statically link SDL3 to provide nativ
 Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
 
 This software is provided 'as-is', without any express or implied warranty. In no event will the authors be held liable for any damages arising from the use of this software. Permission is granted to anyone to use this software for any purpose, including commercial applications, and to alter it and redistribute it freely, subject to the conditions of the SDL zlib license.
+
+## Standalone DSP compatibility code
+
+The optional standalone DSP fallback builds a subset of the open-source
+[Dolphin](https://github.com/dolphin-emu/dolphin) DSP implementation under its
+GPL terms. GekkoAOT does not use Dolphin's Core/System runtime chassis and does
+not distribute Nintendo DSP ROMs. Source staging is managed by the controller and the standalone DSP build
+configuration in `runtime/native/CMakeLists.txt`.
+
+## Portable development toolchain
+
+Release packages can include LLVM/Clang, CMake, Ninja and Zig. Their original
+license notices are retained by the portable toolchain staging process under
+`toolchain/licenses`; these components are not relicensed as GekkoAOT code.
+Optional system FFmpeg libraries retain the license terms of the selected host
+build.

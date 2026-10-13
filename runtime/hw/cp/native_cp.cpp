@@ -57,6 +57,8 @@ void NativeCP::Reset() {
   fifo_write_pointer_ = 0;
   fifo_read_pointer_ = 0;
   fifo_breakpoint_ = 0;
+  breakpoint_write_mask_ = 0;
+  register_drain_pending_ = false;
   gather_bytes_ = 0;
 }
 
@@ -155,10 +157,18 @@ bool NativeCP::Read16(std::uint32_t offset, std::uint16_t* value) const {
 
 bool NativeCP::Write16(std::uint32_t offset, std::uint16_t value) {
   switch (offset) {
-  case kControl:
+  case kControl: {
+    const auto previous = control_;
     control_ = value & 0x003fu;
-    if (GPReadEnabled()) DrainSynchronousGpu();
+    // Only defer a release of an armed breakpoint with queued work. Ordinary
+    // GP enable/gather paths retain their synchronous fast-path contract.
+    if (defer_register_drain_ && (previous & kCtrlBpEnable) != 0u &&
+        (control_ & kCtrlBpEnable) == 0u && GPReadEnabled() &&
+        fifo_rw_distance_ != 0u)
+      register_drain_pending_ = true;
+    if (GPReadEnabled()) RequestRegisterDrain();
     return true;
+  }
   case kClear:
     // Overflow/underflow are level conditions derived from the current FIFO
     // distance. Accept the SDK clear pulse; the condition naturally reasserts
@@ -182,11 +192,25 @@ bool NativeCP::Write16(std::uint32_t offset, std::uint16_t value) {
   CP_WRITE_PAIR(kFifoReadPointerLo, kFifoReadPointerHi, fifo_read_pointer_);
   case kFifoBreakpointLo:
     WriteLow(&fifo_breakpoint_, value);
-    DrainSynchronousGpu();
+    breakpoint_write_mask_ |= 0x1u;
+    // The SDK programs CPBreakpoint through two adjacent 16-bit MMIO writes.
+    // Draining after the first half exposes a transient address to the
+    // synchronous GPU.  In particular, moving 0x0035xxxx -> 0x0036xxxx with
+    // the low half written first can make the reader run past the intended
+    // stop before the high half arrives.  Commit GPU progress only after both
+    // halves have been observed; either write order is accepted.
+    if (breakpoint_write_mask_ == 0x3u) {
+      breakpoint_write_mask_ = 0;
+      RequestRegisterDrain();
+    }
     return true;
   case kFifoBreakpointHi:
     WriteHigh(&fifo_breakpoint_, value);
-    DrainSynchronousGpu();
+    breakpoint_write_mask_ |= 0x2u;
+    if (breakpoint_write_mask_ == 0x3u) {
+      breakpoint_write_mask_ = 0;
+      RequestRegisterDrain();
+    }
     return true;
 #undef CP_WRITE_PAIR
   default:
@@ -239,6 +263,17 @@ void NativeCP::AdvancePointer(std::uint32_t* pointer) {
     *pointer = static_cast<std::uint32_t>(next) & kAddressMask;
 }
 
+void NativeCP::RequestRegisterDrain() {
+  if (register_drain_pending_) return;
+  DrainSynchronousGpu();
+}
+
+void NativeCP::ServiceRegisterDrain() {
+  if (!register_drain_pending_) return;
+  register_drain_pending_ = false;
+  DrainSynchronousGpu();
+}
+
 void NativeCP::DrainSynchronousGpu() {
   // NativeGX consumes the raw gather stream synchronously, but guest-visible
   // CP state must still advance exactly as the Flipper FIFO does. In
@@ -247,7 +282,7 @@ void NativeCP::DrainSynchronousGpu() {
   // are consumed. Teleporting read := write skips every breakpoint between
   // the two pointers and leaves games spinning forever waiting for their
   // GXBreakPtCallback.
-  if (!GPReadEnabled()) return;
+  if (!GPReadEnabled() || register_drain_pending_) return;
 
   // Synchronous GekkoAOT normally receives exactly one newly completed gather
   // line and drains it immediately. Handle that overwhelmingly common case
@@ -257,6 +292,69 @@ void NativeCP::DrainSynchronousGpu() {
     AdvancePointer(&fifo_read_pointer_);
     fifo_rw_distance_ = 0u;
     return;
+  }
+
+  // v161: a renderer call per 32-byte gather line becomes expensive whenever
+  // the guest lets the CP FIFO build a backlog (MOH Frontline is a prominent
+  // example).  With no breakpoint armed, process a contiguous run in one host
+  // callback.  Stop at the ring end so HostRuntime can resolve one contiguous
+  // MEM1 span.  Breakpoint traffic remains on the exact one-line path below.
+  constexpr std::uint32_t kMaxBatchBursts = 128u;
+  while (fifo_rw_distance_ >= 64u && !BreakpointActive() && read_burst_batch_) {
+    const std::uint32_t available = fifo_rw_distance_ / 32u;
+    const std::uint32_t bytes_to_end =
+        fifo_read_pointer_ <= fifo_end_ ? fifo_end_ - fifo_read_pointer_ : 0u;
+    const std::uint32_t contiguous = bytes_to_end / 32u + 1u;
+    std::uint32_t batch = std::min({available, contiguous, kMaxBatchBursts});
+
+    // A programmed CP breakpoint is a FIFO *boundary*, not merely a status
+    // condition to sample before/after a host batch.  The v161 batch path used
+    // BreakpointActive() as its only guard, which is false until the read
+    // pointer is already equal to CPBreakpoint.  A multi-burst callback could
+    // therefore advance from before the breakpoint to after it in one shot and
+    // permanently miss the CP interrupt.  Star Fox Adventures relies on this
+    // interrupt to wake its video-flip OSThreadQueue.
+    //
+    // Keep batching, but never let one callback cross an enabled breakpoint
+    // that lies inside the currently queued FIFO distance.  Consuming exactly
+    // up to the boundary is valid: after the pointer advance below,
+    // BreakpointActive() becomes true and the normal CP status/IRQ path fires.
+    if ((control_ & kCtrlBpEnable) != 0u && fifo_base_ <= fifo_breakpoint_ &&
+        fifo_breakpoint_ <= fifo_end_ && fifo_base_ <= fifo_read_pointer_ &&
+        fifo_read_pointer_ <= fifo_end_) {
+      std::uint32_t bytes_to_breakpoint = 0u;
+      if (fifo_breakpoint_ >= fifo_read_pointer_) {
+        bytes_to_breakpoint = fifo_breakpoint_ - fifo_read_pointer_;
+      } else {
+        bytes_to_breakpoint = (fifo_end_ - fifo_read_pointer_ + 32u) +
+                              (fifo_breakpoint_ - fifo_base_);
+      }
+
+      if (bytes_to_breakpoint != 0u && bytes_to_breakpoint <= fifo_rw_distance_)
+        batch = std::min(batch, bytes_to_breakpoint / 32u);
+    }
+
+    // A one-burst approach to the breakpoint must use the exact path below so
+    // every boundary retains the same callback/accounting semantics.
+    if (batch < 2u || !read_burst_batch_(read_burst_batch_user_, fifo_read_pointer_, batch)) break;
+
+    const std::uint32_t consumed = batch * 32u;
+    // v241: this accepted batch is already capped to a contiguous ring span.
+    // Advance its pointer once; the old loop had no callback/IRQ side effects
+    // between bursts. Retain its exact fallback for malformed FIFO bounds.
+    if ((fifo_base_ != 0u || fifo_end_ != 0u) &&
+        fifo_base_ <= fifo_read_pointer_ && fifo_read_pointer_ <= fifo_end_) {
+      const std::uint64_t next = static_cast<std::uint64_t>(fifo_read_pointer_) + consumed;
+      fifo_read_pointer_ = next > fifo_end_ ? fifo_base_ :
+                          static_cast<std::uint32_t>(next) & kAddressMask;
+    } else {
+      for (std::uint32_t i = 0; i < batch; ++i) AdvancePointer(&fifo_read_pointer_);
+    }
+    fifo_rw_distance_ = fifo_rw_distance_ > consumed ? fifo_rw_distance_ - consumed : 0u;
+    if (fifo_read_pointer_ == fifo_write_pointer_) {
+      fifo_rw_distance_ = 0u;
+      return;
+    }
   }
 
   while (fifo_rw_distance_ != 0u) {
@@ -299,6 +397,23 @@ bool NativeCP::StepPastHandledBreakpointOnce() {
     fifo_rw_distance_ = 0u;
 
   return fifo_read_pointer_ != before;
+}
+
+bool NativeCP::NotifyDirectGatherWrite(std::uint32_t bytes) {
+  if (bytes != 32u || gather_bytes_ != 0u || register_drain_pending_ || !GPLinkEnabled() ||
+      !GPReadEnabled() || BreakpointActive() || fifo_rw_distance_ != 0u ||
+      fifo_read_pointer_ != fifo_write_pointer_)
+    return false;
+
+  // Publish the CPU write to CP state, then consume exactly that line. The
+  // renderer already received these bytes directly from HostRuntime, so no
+  // memory callback is required. Advancing onto a programmed breakpoint is
+  // intentional: the next CP status/IRQ synchronization observes it.
+  AdvancePointer(&fifo_write_pointer_);
+  fifo_rw_distance_ = 32u;
+  AdvancePointer(&fifo_read_pointer_);
+  fifo_rw_distance_ = 0u;
+  return true;
 }
 
 bool NativeCP::NotifyGatherWrite(std::uint32_t bytes) {

@@ -21,6 +21,7 @@ extern "C" {
 
 #define GEKKOAOT_MODULE_ABI_VERSION 3u
 #define GEKKOAOT_MODULE_CAP_MEMORY_RESTART 1u
+#define GEKKOAOT_MODULE_CAP_REL_LIVE_GPRS 2u
 #define GEKKOAOT_GET_MODULE_SYMBOL "gekkoaot_get_module"
 
 typedef struct GekkoAOTRange
@@ -47,6 +48,17 @@ typedef struct GekkoAOTRelModule
     const GekkoAOTRelSection* sections;
     uint32_t num_sections;
 } GekkoAOTRelModule;
+
+// Optional export; the stable descriptor layout remains unchanged. Code and
+// section sizes alone cannot distinguish overlays importing different DOLs.
+typedef struct GekkoAOTRelImportProof
+{
+    uint32_t module_id;
+    uint32_t stream_bytes;
+    uint64_t stream_hash;
+} GekkoAOTRelImportProof;
+typedef const GekkoAOTRelImportProof* (*GekkoAOTRelImportProofsFn)(
+    uint32_t module_id, uint32_t* count);
 
 typedef struct GekkoAOTModuleDesc
 {

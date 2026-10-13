@@ -11,6 +11,7 @@
 #include <QDir>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QDoubleSpinBox>
 #include <QEvent>
 #include <QFile>
 #include <QFileDialog>
@@ -558,6 +559,26 @@ void MainWindow::buildUi()
     m_nativeAbi->addItem("Compact", "compact");
     m_nativeAbi->addItem("Off / compatibility", "off");
 
+    m_nativeOsCheck = new QCheckBox("Enable NativeOS SDK interception", m_advancedPanel);
+    m_nativeOsCheck->setToolTip(
+        "Compile/run recognized GameCube SDK OS calls through NativeOS. "
+        "Disable for the exact guest-AOT SDK path.");
+    m_nativeHwCheck = new QCheckBox("Enable NativeHW", m_advancedPanel);
+    m_nativeHwCheck->setToolTip(
+        "Enabled by default on fresh installations. Enable the full NativeHW "
+        "host-service profile: SI/input, DI/NativeVFS, "
+        "EXI/memory-card+RTC+SRAM, VI/presentation, AI/audio timing, PI/interrupt "
+        "aggregation, MI/host memory, CP/direct Aurora and DSP native task/audio "
+        "backends. Guest-visible MMIO/IRQ contracts remain as exact fallbacks.");
+
+    m_runtimeWorkers = new QComboBox(m_advancedPanel);
+    m_runtimeWorkers->addItem("Parallel CPU + GX + I/O (recommended)", "parallel");
+    m_runtimeWorkers->addItem("Serialized GX / compatibility", "serial");
+    m_runtimeWorkers->setToolTip(
+        "Parallel keeps guest CPU/NativeOS/MMIO/IRQ ordered on one CPU worker, "
+        "while GX and safe I/O services run on separate workers. DSP guest timing "
+        "remains CPU-ordered; host audio/render workers remain asynchronous.");
+
     auto* llvmRow = new QWidget(m_advancedPanel);
     auto* llvmLayout = new QHBoxLayout(llvmRow);
     llvmLayout->setContentsMargins(0, 0, 0, 0);
@@ -579,6 +600,9 @@ void MainWindow::buildUi()
     settingsForm->addRow("Performance", m_profile);
     settingsForm->addRow("Toolchain", m_toolchain);
     settingsForm->addRow("Native ABI", m_nativeAbi);
+    settingsForm->addRow("NativeOS", m_nativeOsCheck);
+    settingsForm->addRow("NativeHW", m_nativeHwCheck);
+    settingsForm->addRow("Runtime workers", m_runtimeWorkers);
     settingsForm->addRow("LLVM", llvmRow);
     settingsForm->addRow("Parallel jobs", m_jobs);
     settingsForm->addRow("Extra runner args", m_runArgs);
@@ -872,7 +896,23 @@ void MainWindow::loadSettings()
     m_windowSystem = "auto";
     m_fullscreen = s.value("graphics/fullscreen", false).toBool();
     m_showFps = s.value("graphics/showFps", true).toBool();
-    m_fpsLimit = qBound(30, s.value("graphics/fpsLimit", 120).toInt(), 360);
+    m_frameInterpolation = false;
+    m_fpsLimit = qBound(1, s.value("graphics/fpsLimit", 120).toInt(), 1000);
+    m_msaaSamples = s.value("graphics/msaaSamples", 1).toInt() == 4 ? 4 : 1;
+    const int anisotropy = s.value("graphics/textureAnisotropy", 16).toInt();
+    m_textureAnisotropy = (anisotropy == 1 || anisotropy == 2 || anisotropy == 4 ||
+                           anisotropy == 8 || anisotropy == 16) ? anisotropy : 16;
+    m_postProcessing = s.value("graphics/postProcessing", true).toBool();
+    m_postPreset = s.value("graphics/postPreset", "balanced").toString();
+    if (m_postPreset != "balanced" && m_postPreset != "cinematic" &&
+        m_postPreset != "crisp" && m_postPreset != "custom")
+        m_postPreset = "balanced";
+    m_postSharpen = qBound(0.0, s.value("graphics/postSharpen", 0.28).toDouble(), 1.0);
+    m_postBloom = qBound(0.0, s.value("graphics/postBloom", 0.10).toDouble(), 1.0);
+    m_postVignette = qBound(0.0, s.value("graphics/postVignette", 0.06).toDouble(), 1.0);
+    m_postGrain = qBound(0.0, s.value("graphics/postGrain", 0.0).toDouble(), 0.25);
+    m_postTone = qBound(0.0, s.value("graphics/postTone", 0.15).toDouble(), 1.0);
+    m_postLocalContrast = qBound(0.0, s.value("graphics/postLocalContrast", 0.08).toDouble(), 1.0);
     m_controllers = s.value("input/controllers").toStringList();
     while (m_controllers.size() < 4)
         m_controllers.append(QString{});
@@ -889,6 +929,11 @@ void MainWindow::loadSettings()
     restoreCombo(m_profile, "profile", "native");
     restoreCombo(m_toolchain, "toolchain", "clang");
     restoreCombo(m_nativeAbi, "nativeAbi", "unrestricted");
+    restoreCombo(m_runtimeWorkers, "advanced/runtimeWorkers", "parallel");
+    // NativeOS is part of the validated low-CPU configuration (idle/spin
+    // parking, SDK services); a fresh install starts with it enabled.
+    m_nativeOsCheck->setChecked(s.value("advanced/nativeOS", true).toBool());
+    m_nativeHwCheck->setChecked(s.value("advanced/nativeHW", true).toBool());
     m_nativeAbi->setEnabled(m_backend->currentData().toString() == "llvm");
 }
 
@@ -903,13 +948,27 @@ void MainWindow::saveSettings() const
     s.setValue("profile", m_profile->currentData());
     s.setValue("toolchain", m_toolchain->currentData());
     s.setValue("nativeAbi", m_nativeAbi->currentData());
+    s.setValue("advanced/nativeOS", m_nativeOsCheck->isChecked());
+    s.setValue("advanced/nativeHW", m_nativeHwCheck->isChecked());
+    s.setValue("advanced/runtimeWorkers", m_runtimeWorkers->currentData());
 
     s.setValue("graphics/backend", m_graphicsBackend);
     s.setValue("graphics/resolution", m_resolution);
     s.setValue("graphics/aspectMode", m_aspectMode);
     s.setValue("graphics/fullscreen", m_fullscreen);
     s.setValue("graphics/showFps", m_showFps);
+    s.setValue("graphics/frameInterpolation", false);
     s.setValue("graphics/fpsLimit", m_fpsLimit);
+    s.setValue("graphics/msaaSamples", m_msaaSamples);
+    s.setValue("graphics/textureAnisotropy", m_textureAnisotropy);
+    s.setValue("graphics/postProcessing", m_postProcessing);
+    s.setValue("graphics/postPreset", m_postPreset);
+    s.setValue("graphics/postSharpen", m_postSharpen);
+    s.setValue("graphics/postBloom", m_postBloom);
+    s.setValue("graphics/postVignette", m_postVignette);
+    s.setValue("graphics/postGrain", m_postGrain);
+    s.setValue("graphics/postTone", m_postTone);
+    s.setValue("graphics/postLocalContrast", m_postLocalContrast);
     s.setValue("input/controllers", m_controllers);
 }
 
@@ -1244,6 +1303,9 @@ bool MainWindow::writeFrontendConfig(QString* error) const
         << "fullscreen=" << (m_fullscreen ? "true" : "false") << "\n"
         << "show_fps_in_title=" << (m_showFps ? "true" : "false") << "\n"
         << "fps_limit=" << m_fpsLimit << "\n"
+        << "frame_interpolation=false\n"
+        << "msaa_samples=" << m_msaaSamples << "\n"
+        << "texture_anisotropy=" << m_textureAnisotropy << "\n"
            "[Input]\n";
 
     const int controllerCount = qMin(4, static_cast<int>(m_controllers.size()));
@@ -1515,7 +1577,7 @@ void MainWindow::showGraphicsConfig()
     QDialog dialog(this);
     dialog.setWindowTitle("Graphics Settings");
     dialog.setModal(true);
-    dialog.resize(520, 360);
+    dialog.resize(600, 610);
 
     auto* outer = new QVBoxLayout(&dialog);
     auto* form = new QFormLayout();
@@ -1557,7 +1619,7 @@ void MainWindow::showGraphicsConfig()
     });
 
     auto* fpsLimit = new QSlider(Qt::Horizontal, &dialog);
-    fpsLimit->setRange(30, 360);
+    fpsLimit->setRange(1, 1000);
     fpsLimit->setSingleStep(1);
     fpsLimit->setPageStep(10);
     fpsLimit->setTickInterval(30);
@@ -1579,24 +1641,99 @@ void MainWindow::showGraphicsConfig()
     fullscreen->setChecked(m_fullscreen);
     auto* showFps = new QCheckBox("Show performance HUD (VPS / FPS / Speed)", &dialog);
     showFps->setChecked(m_showFps);
+    auto* msaa = new QComboBox(&dialog);
+    msaa->addItem("Off", 1);
+    msaa->addItem("4× MSAA", 4);
+    msaa->setCurrentIndex(msaa->findData(m_msaaSamples));
+    auto* anisotropy = new QComboBox(&dialog);
+    for (const int level : {1, 2, 4, 8, 16})
+        anisotropy->addItem(level == 1 ? "Off" : QString::number(level) + "×", level);
+    anisotropy->setCurrentIndex(anisotropy->findData(m_textureAnisotropy));
+
+    auto* postProcessing = new QCheckBox("Universal post-processing", &dialog);
+    postProcessing->setChecked(m_postProcessing);
+    auto* postPreset = new QComboBox(&dialog);
+    postPreset->addItem("Balanced — HPCOS Remaster", "balanced");
+    postPreset->addItem("Cinematic — MOH enhanced", "cinematic");
+    postPreset->addItem("Crisp / clean", "crisp");
+    postPreset->addItem("Custom", "custom");
+    postPreset->setCurrentIndex(comboIndexForData(postPreset, m_postPreset));
+
+    const auto makePostAmount = [&dialog](double value, double maximum = 1.0) {
+        auto* box = new QDoubleSpinBox(&dialog);
+        box->setDecimals(3);
+        box->setRange(0.0, maximum);
+        box->setSingleStep(0.01);
+        box->setValue(value);
+        return box;
+    };
+    auto* postSharpen = makePostAmount(m_postSharpen);
+    auto* postBloom = makePostAmount(m_postBloom);
+    auto* postVignette = makePostAmount(m_postVignette);
+    auto* postGrain = makePostAmount(m_postGrain, 0.25);
+    auto* postTone = makePostAmount(m_postTone);
+    auto* postLocalContrast = makePostAmount(m_postLocalContrast);
+    bool applyingPostPreset = false;
+    const auto applyPostPreset = [=, &applyingPostPreset](const QString& name) {
+        if (name == "custom")
+            return;
+        applyingPostPreset = true;
+        if (name == "cinematic") {
+            postSharpen->setValue(0.22); postBloom->setValue(0.18);
+            postVignette->setValue(0.10); postGrain->setValue(0.012);
+            postTone->setValue(0.32); postLocalContrast->setValue(0.12);
+        } else if (name == "crisp") {
+            postSharpen->setValue(0.42); postBloom->setValue(0.06);
+            postVignette->setValue(0.02); postGrain->setValue(0.0);
+            postTone->setValue(0.08); postLocalContrast->setValue(0.14);
+        } else {
+            postSharpen->setValue(0.28); postBloom->setValue(0.10);
+            postVignette->setValue(0.06); postGrain->setValue(0.0);
+            postTone->setValue(0.15); postLocalContrast->setValue(0.08);
+        }
+        applyingPostPreset = false;
+    };
+    connect(postPreset, &QComboBox::currentIndexChanged, &dialog, [=, &applyPostPreset](int) {
+        applyPostPreset(postPreset->currentData().toString());
+    });
+    const auto markPostCustom = [=, &applyingPostPreset](double) {
+        if (!applyingPostPreset)
+            postPreset->setCurrentIndex(postPreset->findData("custom"));
+    };
+    for (auto* amount : {postSharpen, postBloom, postVignette, postGrain, postTone, postLocalContrast})
+        connect(amount, qOverload<double>(&QDoubleSpinBox::valueChanged), &dialog, markPostCustom);
 
     form->addRow("Backend", backend);
     form->addRow("Internal resolution", resolution);
     form->addRow("Aspect ratio", aspect);
-    form->addRow("FPS limit", fpsRow);
+    form->addRow("Presentation cap (max FPS)", fpsRow);
+    form->addRow("Anti-aliasing", msaa);
+    form->addRow("Anisotropic filtering", anisotropy);
+    form->addRow(QString{}, postProcessing);
+    form->addRow("Post-processing preset", postPreset);
+    form->addRow("Sharpening", postSharpen);
+    form->addRow("Bloom", postBloom);
+    form->addRow("Vignette", postVignette);
+    form->addRow("Film grain", postGrain);
+    form->addRow("Filmic tone mapping", postTone);
+    form->addRow("Local contrast / light", postLocalContrast);
     form->addRow(QString{}, fullscreen);
     form->addRow(QString{}, showFps);
     outer->addLayout(form);
 
     auto* hint = mutedLabel(
         displaySessionDescription() +
-            "\nFPS limit controls host presentation/interpolation only. AOT CPU execution stays "
-            "uncapped while VI/timebase/DEC/DSP/AI remain on the realtime 1.0x hardware clock. "
-            "The HUD shows VPS, unique guest FPS, presented FPS, interpolated FPS and timer Speed. "
+            "\nThe presentation cap limits host output; it cannot make a game calculate extra frames. "
+            "AOT CPU execution stays uncapped while VI/timebase/DEC/DSP/AI remain on the "
+            "realtime 1.0x hardware clock. The HUD shows VPS, game-generated G-FPS, "
+            "presented FPS and timer Speed. "
             "4:3 preserves the original frame. Stretched to Window follows the window aspect live: "
             "the GX projection is compensated for both perspective 3D and orthographic 2D, so resizing "
             "the window adapts the image instead of simply fat-stretching it. "
-            "Backend and resolution changes apply on the next launch.",
+            "Universal post-processing runs after final XFB scanout for every title: Balanced uses the "
+            "HPCOS Remaster tuning, while Cinematic adds the stronger MOH-style filmic presentation. "
+            "Backend, resolution, anti-aliasing, anisotropic filtering and post-processing "
+            "apply on the next launch.",
         &dialog);
     hint->setWordWrap(true);
     outer->addWidget(hint);
@@ -1627,7 +1764,18 @@ void MainWindow::showGraphicsConfig()
     m_windowSystem = "auto";
     m_fullscreen = fullscreen->isChecked();
     m_showFps = showFps->isChecked();
+    m_frameInterpolation = false;
     m_fpsLimit = fpsLimit->value();
+    m_msaaSamples = msaa->currentData().toInt();
+    m_textureAnisotropy = anisotropy->currentData().toInt();
+    m_postProcessing = postProcessing->isChecked();
+    m_postPreset = postPreset->currentData().toString();
+    m_postSharpen = postSharpen->value();
+    m_postBloom = postBloom->value();
+    m_postVignette = postVignette->value();
+    m_postGrain = postGrain->value();
+    m_postTone = postTone->value();
+    m_postLocalContrast = postLocalContrast->value();
     if (g_perfHud)
         g_perfHud->setVisible(m_showFps && m_runtimeStarted);
     saveSettings();
@@ -1995,6 +2143,9 @@ BuildRequest MainWindow::requestFor(const QString& action) const
     request.toolchain = m_toolchain->currentData().toString();
     request.llvmDir = m_llvmDir->text().trimmed();
     request.nativeAbi = m_nativeAbi->currentData().toString();
+    request.nativeOs = m_nativeOsCheck->isChecked();
+    request.nativeHw = m_nativeHwCheck->isChecked();
+    request.runtimeWorkers = m_runtimeWorkers->currentData().toString();
     request.jobs = m_jobs->value();
     request.runArgs = m_runArgs->text().trimmed();
     request.userDir = frontendUserDir();
@@ -2002,6 +2153,17 @@ BuildRequest MainWindow::requestFor(const QString& action) const
     request.resolution = m_resolution;
     request.fullscreen = m_fullscreen;
     request.fpsLimit = m_fpsLimit;
+    request.frameInterpolation = false;
+    request.msaaSamples = m_msaaSamples;
+    request.textureAnisotropy = m_textureAnisotropy;
+    request.postProcessing = m_postProcessing;
+    request.postPreset = m_postPreset;
+    request.postSharpen = m_postSharpen;
+    request.postBloom = m_postBloom;
+    request.postVignette = m_postVignette;
+    request.postGrain = m_postGrain;
+    request.postTone = m_postTone;
+    request.postLocalContrast = m_postLocalContrast;
     request.uiScale = QString::number(effectiveDisplayScale(), 'f', 3);
     request.inputConfig = QDir(frontendUserDir()).filePath("input.ini");
     request.gameEnvironment = gameEnhancementEnvironment();
@@ -2226,6 +2388,10 @@ void MainWindow::changeEvent(QEvent* event)
 
 void MainWindow::showLoader(const QString& title, const QString& status, int progress)
 {
+    // Runtime output can still contain late build/progress markers. Once a
+    // normal run has entered the game view, never cover it with the loader.
+    if (m_runtimeStarted && m_activeAction == "run")
+        return;
     progress = qBound(0, progress, 100);
     if (!m_activeAction.isEmpty() && progress < m_lastProgress)
         progress = m_lastProgress;
@@ -2583,6 +2749,9 @@ void MainWindow::setBusy(bool busy)
     m_profile->setEnabled(true);
     m_toolchain->setEnabled(true);
     m_nativeAbi->setEnabled(m_backend->currentData().toString() == "llvm");
+    m_nativeOsCheck->setEnabled(true);
+    m_nativeHwCheck->setEnabled(true);
+    m_runtimeWorkers->setEnabled(true);
     m_llvmDir->setEnabled(true);
     m_jobs->setEnabled(true);
     m_runArgs->setEnabled(true);

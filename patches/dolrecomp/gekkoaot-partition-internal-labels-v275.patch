@@ -1,0 +1,146 @@
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -387,6 +387,64 @@
+     return 0;
+ }
+ 
++static int compare_u64(const void* left, const void* right) {
++    u64 a = *(const u64*)left;
++    u64 b = *(const u64*)right;
++    return a < b ? -1 : a > b;
++}
++
++static int partition_internal_labels_v275(void) {
++    const char* value = getenv("DOLRECOMP_PARTITION_INTERNAL_LABELS");
++    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
++}
++
++static int sorted_u32_contains(const u32* values, u32 count, u32 value) {
++    u32 low = 0, high = count;
++    while (low < high) {
++        u32 middle = low + (high - low) / 2u;
++        if (values[middle] < value)
++            low = middle + 1u;
++        else
++            high = middle;
++    }
++    return low < count && values[low] == value;
++}
++
++/* Last strong point at or below address (or the section base if none). */
++static u32 strong_region_start(const u32* strong, u32 count, u32 address,
++                               u32 section_base) {
++    u32 low = 0, high = count;
++    while (low < high) {
++        u32 middle = low + (high - low) / 2u;
++        if (strong[middle] <= address)
++            low = middle + 1u;
++        else
++            high = middle;
++    }
++    u32 start = low ? strong[low - 1u] : section_base;
++    return start < section_base ? section_base : start;
++}
++
++/* edges: sorted (target << 32 | source) of forward non-linking branches. */
++static int reached_from_region(const u64* edges, size_t count, u32 label,
++                               u32 region) {
++    size_t low = 0, high = count;
++    const u64 first = (u64)label << 32;
++    while (low < high) {
++        size_t middle = low + (high - low) / 2u;
++        if (edges[middle] < first)
++            low = middle + 1u;
++        else
++            high = middle;
++    }
++    for (size_t i = low; i < count && (u32)(edges[i] >> 32) == label; i++) {
++        u32 source = (u32)edges[i];
++        if (source >= region && source < label)
++            return 1;
++    }
++    return 0;
++}
++
+ static u32* collect_llvm_partition_points(const LoadedCodeSection* sections,
+                                           u32 section_count, u32 program_entry,
+                                           const DolRecompSymbolMap* symbols,
+@@ -418,11 +476,75 @@
+             if ((inst.op == PPC_OP_B || inst.op == PPC_OP_BC) && inst.lk &&
+                 llvm_code_address(sections, section_count, inst.branch_target))
+                 points[count++] = inst.branch_target;
+-            if (inst.op == PPC_OP_BCLR && !inst.lk && inst.bo == 20u &&
+-                llvm_code_address(sections, section_count, address + 4u))
+-                points[count++] = address + 4u;
+         }
+     }
++    /*
++     * GEKKOAOT_PARTITION_INTERNAL_LABELS_V275: the instruction after an
++     * unconditional blr used to start a new LLVM function unconditionally.
++     * Compiled PowerPC places early returns inside functions, so a loop or an
++     * if/else that continues after such a blr was split into several LLVM
++     * functions and every crossing became a host boundary.  The address after a
++     * blr remains a function start when it is a strong entry (program entry,
++     * symbol, bl target) or when no non-linking direct branch of the same
++     * strong region reaches it; otherwise it is an internal label and stays a
++     * region leader (it is a branch target, hence still an entry point).
++     */
++    u32 strong_count = count;
++    qsort(points, strong_count, sizeof(*points), compare_u32);
++    size_t edge_capacity = 0;
++    for (u32 i = 0; i < section_count; i++)
++        edge_capacity += sections[i].size / 4u;
++    u64* edges = (u64*)malloc((edge_capacity ? edge_capacity : 1u) * sizeof(*edges));
++    if (!edges) {
++        free(points);
++        return NULL;
++    }
++    size_t edge_count = 0;
++    for (u32 section_index = 0; section_index < section_count;
++         section_index++) {
++        const LoadedCodeSection* section = &sections[section_index];
++        for (u32 offset = 0; section->data && offset + 4u <= section->size;
++             offset += 4u) {
++            u32 address = section->address + offset;
++            PPCInst inst =
++                ppc_decode(read_be32(section->data + offset), address);
++            if ((inst.op == PPC_OP_B || inst.op == PPC_OP_BC) && !inst.lk &&
++                inst.branch_target > address &&
++                llvm_code_address(sections, section_count, inst.branch_target))
++                edges[edge_count++] = ((u64)inst.branch_target << 32) | address;
++        }
++    }
++    qsort(edges, edge_count, sizeof(*edges), compare_u64);
++    const int internal_labels = partition_internal_labels_v275();
++    u32 internal = 0;
++    for (u32 section_index = 0; section_index < section_count;
++         section_index++) {
++        const LoadedCodeSection* section = &sections[section_index];
++        for (u32 offset = 0; section->data && offset + 4u <= section->size;
++             offset += 4u) {
++            u32 address = section->address + offset;
++            PPCInst inst =
++                ppc_decode(read_be32(section->data + offset), address);
++            if (!(inst.op == PPC_OP_BCLR && !inst.lk && inst.bo == 20u &&
++                  llvm_code_address(sections, section_count, address + 4u)))
++                continue;
++            const u32 label = address + 4u;
++            if (internal_labels &&
++                !sorted_u32_contains(points, strong_count, label)) {
++                const u32 region = strong_region_start(points, strong_count,
++                                                       label, section->address);
++                if (reached_from_region(edges, edge_count, label, region)) {
++                    internal++;
++                    continue;
++                }
++            }
++            points[count++] = label;
++        }
++    }
++    free(edges);
++    if (internal_labels)
++        printf("GEKKOAOT_PARTITION_INTERNAL_LABELS_V275=1 strong=%u internal_labels=%u policy=after-blr-split-only-when-unreached-from-region\n",
++               strong_count, internal);
+     qsort(points, count, sizeof(*points), compare_u32);
+     u32 unique = 0;
+     for (u32 i = 0; i < count; i++) {

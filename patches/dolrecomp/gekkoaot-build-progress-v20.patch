@@ -1,0 +1,31 @@
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -750,17 +750,20 @@
+ }
+ 
+ static void report_llvm_progress(const LLVMChunkJob* jobs,
+-                                 const unsigned char* states, u32 count,
+-                                 u32* next_report) {
+-    while (*next_report < count && states[*next_report]) {
+-        const LLVMChunkJob* job = &jobs[*next_report];
+-        printf("[%u/%u] %s LLVM object %s\n", job->index, job->total,
+-               states[*next_report] == 2 ? "Reusing cached" : "Emitting",
+-               job->name);
+-        (*next_report)++;
++                                 unsigned char* states, u32 count,
++                                 u32* reported) {
++    // Report completed objects immediately. A slow earlier object must not
++    // hide later workers' progress or make the native build look hung.
++    for (u32 i = 0; i < count; i++) {
++        if (!states[i] || (states[i] & 0x80u))
++            continue;
++        const LLVMChunkJob* job = &jobs[i];
++        printf("[%u/%u] %s LLVM object %s\n", ++*reported, count,
++               states[i] == 2 ? "Reusing cached" : "Emitting", job->name);
++        states[i] |= 0x80u;
+     }
+     fflush(stdout);
+ }
+ 
+ static int run_llvm_chunk_jobs(const LLVMChunkJob* jobs, u32 count,
+                                u32 requested_jobs) {

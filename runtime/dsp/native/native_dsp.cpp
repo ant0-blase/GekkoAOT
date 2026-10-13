@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <limits>
 
 namespace GekkoAOT::DSP {
 namespace {
@@ -122,7 +123,7 @@ void NativeDSP::Reset() {
   ax_hle_.Reset();
   jaudio_hle_.Reset();
   audio_sink_.Reset();
-  std::fill(aram_.begin(), aram_.end(), 0);
+  aram_.Clear();
   iram_.fill(0);
   dram_.fill(0);
   cpu_mail_visible_ = 0;
@@ -143,6 +144,7 @@ void NativeDSP::Reset() {
   aram_dma_mmaddr_ = 0;
   aram_dma_araddr_ = 0;
   aram_dma_count_ = 0;
+  aram_dma_completion_cycles_ = 0;
   audio_dma_source_ = 0;
   audio_dma_blocks_length_ = 0;
   audio_dma_control_ = 0;
@@ -161,6 +163,10 @@ void NativeDSP::Reset() {
   sdk_bootstrap_completed_ = false;
   sdk_romless_task_ready_pending_ = false;
   sdk_romless_task_active_ = false;
+  sdk_romless_light_protocol_ = false;
+  sdk_romless_light_sync_pending_ = false;
+  sdk_romless_light_sync_words_.fill(0);
+  sdk_romless_light_frames_left_ = 0;
   sdk_romless_commands_ready_ = false;
   sdk_romless_command_words_expected_ = 0;
   sdk_romless_command_words_seen_ = 0;
@@ -181,8 +187,13 @@ void NativeDSP::Reset() {
   sdk_task_init_count_ = 0;
   last_cpu_mail_ = 0;
   cpu_mail_write_count_ = 0;
-  rom_loader_active_ = true;
-  rom_loader_ready_pending_ = true;
+  // A host/runtime reset is not itself a guest DSPReset command.  Starting the
+  // synthetic ROM-loader handshake here can publish 0x8071feed as soon as a
+  // title merely clears HALT while INIT is still asserted.  That leaves an
+  // unread DSP mail in front of the real SDK initialization path (SMB1/2).
+  // Enter the ROM loader only when the guest actually writes DSPReset below.
+  rom_loader_active_ = false;
+  rom_loader_ready_pending_ = false;
 }
 
 bool NativeDSP::Handles(std::uint32_t address) const {
@@ -231,6 +242,10 @@ void NativeDSP::ResetTaskEngine() {
   sdk_task_init_cycles_ = 0;
   sdk_romless_task_ready_pending_ = false;
   sdk_romless_task_active_ = false;
+  sdk_romless_light_protocol_ = false;
+  sdk_romless_light_sync_pending_ = false;
+  sdk_romless_light_sync_words_.fill(0);
+  sdk_romless_light_frames_left_ = 0;
   sdk_romless_commands_ready_ = false;
   sdk_romless_command_words_expected_ = 0;
   sdk_romless_command_words_seen_ = 0;
@@ -391,8 +406,13 @@ void NativeDSP::HandleSdkTaskLoaderMail(std::uint32_t mail) {
       if (TraceDsp())
         std::fprintf(stderr, "GEKKOAOT_DSP_TASK code=%08x bytes=%u entry=%04x ax=%u\n",
                      sdk_task_code_address_, sdk_task_code_size_, sdk_task_entry_, unsigned(ax_started));
+      const bool jaudio_started = !ax_started && jaudio_hle_.ProbeStandardTask(sdk_task_code_address_, sdk_task_code_size_);
       bool lle_started = false;
-      if (!ax_started) {
+      sdk_romless_light_protocol_ = false;
+      sdk_romless_light_sync_pending_ = false;
+      sdk_romless_light_frames_left_ = 0u;
+      sdk_romless_light_sync_words_.fill(0u);
+      if (!ax_started && !jaudio_started) {
         lle_started = core_.LoadTask(
             sdk_task_code_address_, sdk_task_imem_address_,
             static_cast<std::uint16_t>(std::min<std::uint32_t>(sdk_task_code_size_, 0xffffu)),
@@ -400,7 +420,7 @@ void NativeDSP::HandleSdkTaskLoaderMail(std::uint32_t mail) {
       } else {
         core_.SetRunning(false);
       }
-      if (ax_started || !lle_started) {
+      if (ax_started || jaudio_started || !lle_started) {
         sdk_task_init_cycles_ = kSdkTaskInitPpcCycles;
         // With neither AX HLE nor a runnable LLE core, the task cannot emit
         // its first task-owned mailbox. Still model the SDK-visible startup
@@ -408,8 +428,25 @@ void NativeDSP::HandleSdkTaskLoaderMail(std::uint32_t mail) {
         // non-interrupting ready mail for init callbacks such as JAudio's
         // DspHandShake. This fallback is never used when a real task backend
         // exists.
-        sdk_romless_task_ready_pending_ = !ax_started && !lle_started;
+        sdk_romless_task_ready_pending_ = !ax_started && !jaudio_started && !lle_started;
         sdk_romless_task_active_ = sdk_romless_task_ready_pending_;
+        // Early JAudio tasks publish 0x88881111 using two immediate DSP
+        // mailbox stores, then wait for directly polled commands. They do not
+        // use the SDK's DCD10000 interrupt/callback startup protocol. Recognize
+        // the actual uploaded instructions, independently of title/address.
+        if (sdk_romless_task_active_ && memory_) {
+          const auto probe_bytes = std::min<std::uint32_t>(sdk_task_code_size_, 512u);
+          for (std::uint32_t off = 0; off + 8u <= probe_bytes; off += 2u) {
+            std::uint32_t hi = 0, lo = 0;
+            if (memory_->Read32(sdk_task_code_address_ + off, &hi) &&
+                memory_->Read32(sdk_task_code_address_ + off + 4u, &lo) &&
+                hi == 0x16fc8888u && lo == 0x16fd1111u) {
+              sdk_romless_light_protocol_ = true;
+              sdk_romless_task_ready_pending_ = false;
+              break;
+            }
+          }
+        }
         sdk_romless_commands_ready_ = false;
         sdk_romless_command_words_expected_ = 0;
         sdk_romless_command_words_seen_ = 0;
@@ -440,10 +477,19 @@ void NativeDSP::FinishSdkTaskLaunch() {
   sdk_task_init_cycles_ = 0u;
   ++sdk_task_init_count_;
 
+  if (sdk_romless_light_protocol_) {
+    sdk_romless_commands_ready_ = true;
+    PostDspMailbox(0x88881111u, false);
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_DSP_JAUDIO_LIGHT=1 phase=ready mail=88881111 irq=0\n");
+    return;
+  }
+
   // SDK ucodes signal that their task entry has started with DSP_INIT
   // (0xDCD10000). DMB bit 31 is the mailbox-full flag, so PostDspMailbox stores
   // the 31-bit payload and exposes the full state through DMBH bit 15.
   PostDspMailbox(kSdkTaskInitMail, true);
+  if (jaudio_hle_.StandardTask()) jaudio_hle_.StartStandardTask();
 }
 
 std::uint8_t NativeDSP::ReadAram(std::uint32_t address) const {
@@ -498,6 +544,7 @@ bool NativeDSP::Read16(std::uint32_t offset, std::uint16_t* value) {
                    "GEKKOAOT_NATIVE_DSP_JAUDIO_ROMLESS_V61=1 phase=payload-after-dcd10004 mail=%08x irq=0 consumer=syncDSP\n",
                    payload);
     }
+    jaudio_hle_.AdvanceStandardMail();
     return true;
   }
   case kControl: *value = control_; return true;
@@ -524,6 +571,7 @@ bool NativeDSP::Read16(std::uint32_t offset, std::uint16_t* value) {
 }
 
 void NativeDSP::WriteControl(std::uint16_t value) {
+  const std::uint16_t control_before = control_;
   const bool init_was_set = (control_ & kDspInit) != 0;
   const bool halt_was_set = (control_ & kDspHalt) != 0;
 
@@ -577,6 +625,12 @@ void NativeDSP::WriteControl(std::uint16_t value) {
     if (halt_was_set && sdk_task_loader_stage_ >= 10u && core_.Available()) core_.SetRunning(true);
   }
   if ((control_ & kDspHalt) != 0u) core_.SetRunning(false);
+  if (TraceDsp()) {
+    static unsigned logged_control_writes = 0;
+    if (logged_control_writes++ < 64u)
+      std::fprintf(stderr, "GEKKOAOT_DSP_CONTROL_WRITE before=%04x value=%04x after=%04x pending=%u\n",
+                   control_before, value, control_, InterruptPending() ? 1u : 0u);
+  }
 }
 
 void NativeDSP::RunAramDma() {
@@ -584,34 +638,76 @@ void NativeDSP::RunAramDma() {
   const bool aram_to_main = (aram_dma_count_ & 0x80000000u) != 0u;
   if (count == 0u) return;
 
+  // Real GameCube ARAM DMA does not complete on the MMIO write that starts it.
+  // Dolphin uses the measured transfer time (246 PPC ticks per 32-byte block):
+  // the host copy is performed immediately, while DMAState remains asserted and
+  // the ARAM completion IRQ is delivered only after the transfer delay.
+  // GekkoAOT previously collapsed those guest-visible events into this write.
   control_ |= kDmaState;
+  const std::uint64_t blocks = std::max<std::uint64_t>(1u, count / 32u);
+  aram_dma_completion_cycles_ = blocks * 246u;
 
   std::uint32_t main_address = aram_dma_mmaddr_ & kAramAddressMask;
   std::uint32_t aram_address = aram_dma_araddr_ & kAramAddressMask;
   std::uint32_t remaining = count;
+  std::uint32_t hsp_null_bytes = 0u;
 
   while (remaining != 0u) {
     const std::uint32_t chunk = std::min<std::uint32_t>(remaining, 32u);
-    const std::uint32_t wrapped = aram_address & AramMask;
-    const std::uint32_t contiguous = std::min<std::uint32_t>(chunk, AramSize - wrapped);
+
+    // The AR DMA address bus is 26 bits wide, but the retail GameCube only
+    // has 16 MiB of onboard ARAM. Addresses in the remaining 48 MiB aperture
+    // are routed to the High Speed Port (HSP); they do NOT wrap modulo 16 MiB.
+    // With no HSP expansion installed, writes disappear and reads leave the
+    // MRAM destination untouched. Nintendo's ARInit actively probes this
+    // boundary to detect expansion memory. Wrapping here aliases 0x01000000,
+    // 0x02000000, ... onto base ARAM and makes retail software falsely detect
+    // extra memory (CoD Finest Hour then uses the aliased area as VM backing).
+    if (aram_address >= AramSize) {
+      std::uint8_t* main = memory_ ? memory_->Resolve(main_address, chunk) : nullptr;
+      if (!main) break;
+      (void)main; // Null HSP read/write is intentionally a no-op.
+      hsp_null_bytes += chunk;
+      main_address += chunk;
+      aram_address += chunk;
+      remaining -= chunk;
+      continue;
+    }
+
+    const std::uint32_t contiguous =
+        std::min<std::uint32_t>(chunk, AramSize - aram_address);
     std::uint8_t* main = memory_ ? memory_->Resolve(main_address, contiguous) : nullptr;
     if (!main) break;
 
     if (aram_to_main)
-      std::memcpy(main, aram_.data() + wrapped, contiguous);
+      std::memcpy(main, aram_.data() + aram_address, contiguous);
     else
-      std::memcpy(aram_.data() + wrapped, main, contiguous);
+      std::memcpy(aram_.data() + aram_address, main, contiguous);
 
     main_address += contiguous;
     aram_address += contiguous;
     remaining -= contiguous;
   }
 
+  if (hsp_null_bytes != 0u) {
+    static unsigned hsp_logs = 0u;
+    if (hsp_logs++ < 32u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_ARAM_HSP_NULL_V218=1 dir=%s bytes=%u "
+                   "policy=retail-16m-no-wrap action=null-device\n",
+                   aram_to_main ? "hsp-to-main" : "main-to-hsp", hsp_null_bytes);
+  }
+
   aram_dma_mmaddr_ = main_address;
   aram_dma_araddr_ = aram_address;
   aram_dma_count_ = (aram_to_main ? 0x80000000u : 0u) | remaining;
-  control_ &= static_cast<std::uint16_t>(~kDmaState);
-  GenerateInterrupt(kAram);
+
+  static unsigned aram_dma_logs = 0u;
+  if (aram_dma_logs++ < 64u)
+    std::fprintf(stderr,
+                 "GEKKOAOT_ARAM_DMA_TIMING_V194=1 dir=%s bytes=%u remaining=%u completion_cycles=%llu action=defer-busy-clear+irq\n",
+                 aram_to_main ? "aram-to-main" : "main-to-aram", count, remaining,
+                 static_cast<unsigned long long>(aram_dma_completion_cycles_));
 }
 
 void NativeDSP::StartAudioDma(std::uint16_t value) {
@@ -661,6 +757,8 @@ void NativeDSP::SubmitAudioBlock() {
       }
     }
   }
+  if (auxiliary_audio_source_)
+    auxiliary_audio_source_(auxiliary_audio_user_, pcm.data(), 8u, audio_sample_rate_hz_);
   audio_sink_.PushStereoS16(pcm.data(), 8u, audio_sample_rate_hz_);
   ++audio_blocks_submitted_;
 
@@ -748,6 +846,40 @@ bool NativeDSP::CoreWriteMain(std::uint32_t address, const std::uint8_t* src, st
   return true;
 }
 
+const std::uint8_t* NativeDSP::CoreResolveMain(std::uint32_t address, std::uint32_t size) const {
+  return memory_ && size != 0u ? memory_->Resolve(address, size) : nullptr;
+}
+
+std::uint8_t* NativeDSP::CoreResolveMain(std::uint32_t address, std::uint32_t size) {
+  return memory_ && size != 0u ? memory_->Resolve(address, size) : nullptr;
+}
+
+bool NativeDSP::CoreReadAram(std::uint32_t address, std::uint8_t* dst, std::uint32_t size) const {
+  if (!dst || size == 0u || aram_.empty()) return false;
+  std::uint32_t offset = address & AramMask;
+  std::uint32_t remaining = size;
+  while (remaining) {
+    const std::uint32_t contiguous = static_cast<std::uint32_t>(
+        std::min<std::size_t>(aram_.size() - offset, remaining));
+    std::memcpy(dst, aram_.data() + offset, contiguous);
+    dst += contiguous; remaining -= contiguous; offset = 0u;
+  }
+  return true;
+}
+
+bool NativeDSP::CoreWriteAram(std::uint32_t address, const std::uint8_t* src, std::uint32_t size) {
+  if (!src || size == 0u || aram_.empty()) return false;
+  std::uint32_t offset = address & AramMask;
+  std::uint32_t remaining = size;
+  while (remaining) {
+    const std::uint32_t contiguous = static_cast<std::uint32_t>(
+        std::min<std::size_t>(aram_.size() - offset, remaining));
+    std::memcpy(aram_.data() + offset, src, contiguous);
+    src += contiguous; remaining -= contiguous; offset = 0u;
+  }
+  return true;
+}
+
 void NativeDSP::RequestCoreInterrupt() { GenerateInterrupt(kDsp); }
 
 bool NativeDSP::Write16(std::uint32_t offset, std::uint16_t value) {
@@ -768,6 +900,12 @@ bool NativeDSP::Write16(std::uint32_t offset, std::uint16_t value) {
     // AX HLE consumes the same raw mailbox value the real DSP sees. Keep bit
     // 31 here: for 0xBABE/0xCDD1 messages that bit is both part of the visible
     // high word and the mailbox-full state on the MMIO side.
+    if (jaudio_hle_.HandleStandardMail(cpu_mail_pending_value_)) {
+      cpu_mail_pending_ = false;
+      cpu_mail_visible_ &= 0x7fffffffu;
+      jaudio_hle_.AdvanceStandardMail();
+      return true;
+    }
     const bool ax_consumed = ax_hle_.HandleCpuMail(cpu_mail_pending_value_);
     if (ax_consumed) cpu_mail_pending_ = false;
 
@@ -776,6 +914,23 @@ bool NativeDSP::Write16(std::uint32_t offset, std::uint16_t value) {
       const std::uint32_t raw_mail = cpu_mail_pending_value_;
       const std::uint16_t high = static_cast<std::uint16_t>(raw_mail >> 16u);
       const std::uint16_t low = static_cast<std::uint16_t>(raw_mail);
+
+      // The light protocol renders one 80-sample subframe per zero sync mail
+      // and signals completion through DSP_CONTROL, without posting a mailbox.
+      if (sdk_romless_light_protocol_ && sdk_romless_light_frames_left_ != 0u &&
+          (raw_mail & 0x7fffffffu) == 0u) {
+        auto words = sdk_romless_light_sync_words_;
+        words[0] = (words[0] & 0xff00ffffu) | 0x00010000u;
+        jaudio_hle_.HandlePacket(words.data(), words.size());
+        sdk_romless_light_sync_words_[1] += 80u * 2u;
+        sdk_romless_light_sync_words_[2] += 80u * 2u;
+        --sdk_romless_light_frames_left_;
+        sdk_romless_light_sync_pending_ = true;
+        sdk_romless_completion_cycles_ = kJAudioRomlessCompletionPpcCycles;
+        cpu_mail_pending_ = false;
+        cpu_mail_visible_ &= 0x7fffffffu;
+        return true;
+      }
 
       auto fixed_packet_words = [](std::uint16_t token) -> std::uint8_t {
         switch (token & 0xff00u) {
@@ -799,6 +954,8 @@ bool NativeDSP::Write16(std::uint32_t offset, std::uint16_t value) {
           sdk_romless_packet_count_prefixed_ = true;
         } else if (const std::uint8_t words = fixed_packet_words(high); words != 0u) {
           sdk_romless_command_words_expected_ = words;
+          if (sdk_romless_light_protocol_ && (high & 0xff00u) == 0x8c00u)
+            sdk_romless_command_words_expected_ = 3u;
           sdk_romless_command_words_seen_ = 1u;
           sdk_romless_work_token_ = high;
           sdk_romless_packet_count_prefixed_ = false;
@@ -820,8 +977,18 @@ bool NativeDSP::Write16(std::uint32_t offset, std::uint16_t value) {
       if (sdk_romless_command_words_expected_ != 0u &&
           sdk_romless_command_words_seen_ >= sdk_romless_command_words_expected_) {
         const auto token = sdk_romless_work_token_;
-        const bool handled = jaudio_hle_.HandlePacket(
-            sdk_romless_packet_words_.data(), sdk_romless_command_words_expected_);
+        const bool light_sync = sdk_romless_light_protocol_ &&
+                                (token & 0xff00u) == 0x8200u;
+        bool handled = false;
+        if (light_sync) {
+          std::copy_n(sdk_romless_packet_words_.begin(), 3u,
+                      sdk_romless_light_sync_words_.begin());
+          sdk_romless_light_frames_left_ = static_cast<std::uint8_t>(token);
+          handled = true;
+        } else {
+          handled = jaudio_hle_.HandlePacket(
+              sdk_romless_packet_words_.data(), sdk_romless_command_words_expected_);
+        }
         if (handled) cpu_mail_pending_ = false;
 
         // Count-prefixed JAudio uses the SDK task callback for setup work;
@@ -833,10 +1000,11 @@ bool NativeDSP::Write16(std::uint32_t offset, std::uint16_t value) {
           sdk_romless_completion_token_ = token;
           sdk_romless_completion_callback_mode_ = sdk_romless_packet_count_prefixed_;
           sdk_romless_completion_cycles_ = kJAudioRomlessCompletionPpcCycles;
-          std::fprintf(stderr,
-                       "GEKKOAOT_NATIVE_DSP_JAUDIO_V69=1 phase=schedule token=%04x mode=%s delay=%llu handled=%u\n",
-                       token, sdk_romless_completion_callback_mode_ ? "task-callback" : "direct",
-                       static_cast<unsigned long long>(sdk_romless_completion_cycles_), handled ? 1u : 0u);
+          if (TraceDsp())
+            std::fprintf(stderr,
+                         "GEKKOAOT_NATIVE_DSP_JAUDIO_V69=1 phase=schedule token=%04x mode=%s delay=%llu handled=%u\n",
+                         token, sdk_romless_completion_callback_mode_ ? "task-callback" : "direct",
+                         static_cast<unsigned long long>(sdk_romless_completion_cycles_), handled ? 1u : 0u);
         }
         sdk_romless_command_words_expected_ = 0u;
         sdk_romless_command_words_seen_ = 0u;
@@ -939,7 +1107,52 @@ bool NativeDSP::Write(std::uint32_t address, std::uint64_t value, std::uint8_t s
   return false;
 }
 
+std::uint64_t NativeDSP::CyclesUntilInterrupt() const {
+  constexpr std::uint64_t kNever = std::numeric_limits<std::uint64_t>::max();
+  constexpr std::uint64_t kCpuClockHz = 486000000ull;
+  if (InterruptPending()) return 0u;
+
+  std::uint64_t best = kNever;
+  const auto consider = [&](std::uint64_t cycles) {
+    if (cycles != 0u) best = std::min(best, cycles);
+  };
+
+  if ((control_ & kAidMask) != 0u) consider(aid_interrupt_cycles_);
+  // ARAM DMA completion is guest-visible even when its IRQ mask is clear: SDK
+  // code can poll DMAState. Do not let event-driven idle parking skip it.
+  consider(aram_dma_completion_cycles_);
+  // These protocol deadlines can publish DSP mail and/or an interrupt. Waking
+  // a little early when its mask is clear is preferable to hiding a mailbox
+  // transition behind the generic maintenance cap.
+  consider(sdk_bootstrap_cycles_);
+  consider(sdk_task_init_cycles_);
+  consider(sdk_romless_completion_cycles_);
+  consider(jaudio_hle_.CyclesUntilStandardMail());
+
+  if ((control_ & kAidMask) != 0u &&
+      (audio_dma_control_ & 0x8000u) != 0u &&
+      (audio_dma_control_ & 0x7fffu) != 0u && audio_sample_rate_hz_ != 0u) {
+    const std::uint64_t remaining_blocks = audio_dma_remaining_blocks_;
+    if (audio_dma_pending_blocks_ >= remaining_blocks && remaining_blocks != 0u) {
+      consider(1u);
+    } else if (remaining_blocks != 0u) {
+      const std::uint64_t blocks = remaining_blocks - audio_dma_pending_blocks_;
+      const std::uint64_t total_frames = blocks * 8ull;
+      const std::uint64_t frames = total_frames > audio_frames_into_block_
+          ? total_frames - audio_frames_into_block_
+          : 1u;
+      const std::uint64_t scaled = frames * kCpuClockHz;
+      const std::uint64_t phase = audio_sample_phase_;
+      const std::uint64_t need = scaled > phase ? scaled - phase : 1u;
+      consider(std::max<std::uint64_t>(
+          1u, (need + audio_sample_rate_hz_ - 1u) / audio_sample_rate_hz_));
+    }
+  }
+  return best;
+}
+
 void NativeDSP::AdvanceCycles(std::uint64_t cycles) {
+  jaudio_hle_.AdvanceStandardMail(cycles);
   if (cycles == 0u) return;
 
   // Native ROM-loader protocol progresses at the ordinary device boundary.
@@ -973,6 +1186,20 @@ void NativeDSP::AdvanceCycles(std::uint64_t cycles) {
     }
   }
 
+  if (aram_dma_completion_cycles_ != 0u) {
+    if (cycles >= aram_dma_completion_cycles_) {
+      aram_dma_completion_cycles_ = 0u;
+      control_ &= static_cast<std::uint16_t>(~kDmaState);
+      GenerateInterrupt(kAram);
+      static unsigned aram_done_logs = 0u;
+      if (aram_done_logs++ < 64u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_ARAM_DMA_TIMING_V194=1 phase=complete action=clear-busy+irq\n");
+    } else {
+      aram_dma_completion_cycles_ -= cycles;
+    }
+  }
+
   if (sdk_bootstrap_cycles_ != 0u) {
     if (cycles >= sdk_bootstrap_cycles_)
       FinishSdkBootstrap();
@@ -995,21 +1222,32 @@ void NativeDSP::AdvanceCycles(std::uint64_t cycles) {
         const auto token = sdk_romless_completion_token_;
         sdk_romless_completion_cycles_ = 0u;
         sdk_romless_completion_token_ = 0u;
-        const auto payload = kJAudioDspPrefix | token;
+        const auto light_ack = (token & 0xff00u) == 0x8200u
+            ? 0x62u : (2u * ((token >> 8u) & 0x7fu) + 0x62u);
+        const auto payload = sdk_romless_light_protocol_
+            ? (0x80000000u | light_ack)
+            : (kJAudioDspPrefix | token);
+        if (sdk_romless_light_sync_pending_) {
+          sdk_romless_light_sync_pending_ = false;
+          GenerateInterrupt(kDsp);
+          return;
+        }
         if (sdk_romless_completion_callback_mode_) {
           // Count-prefixed task protocol: task callback first, then the F355
           // work payload becomes visible when DCD10004 is consumed.
           sdk_romless_completion_payload_pending_ = payload;
           PostDspMailbox(kSdkTaskCallbackMail, true);
-          std::fprintf(stderr,
-                       "GEKKOAOT_NATIVE_DSP_JAUDIO_V69=1 phase=callback-irq token=%04x control=dcd10004 payload=%08x\n",
-                       token, payload);
+          if (TraceDsp())
+            std::fprintf(stderr,
+                         "GEKKOAOT_NATIVE_DSP_JAUDIO_V69=1 phase=callback-irq token=%04x control=dcd10004 payload=%08x\n",
+                         token, payload);
         } else {
           // Older direct JAudio waits synchronously for one task-owned reply.
           PostDspMailbox(payload, false);
-          std::fprintf(stderr,
-                       "GEKKOAOT_NATIVE_DSP_JAUDIO_V69=1 phase=direct-complete token=%04x payload=%08x\n",
-                       token, payload);
+          if (TraceDsp())
+            std::fprintf(stderr,
+                         "GEKKOAOT_NATIVE_DSP_JAUDIO_V69=1 phase=direct-complete token=%04x payload=%08x\n",
+                         token, payload);
         }
       } else {
         sdk_romless_completion_cycles_ = 1u;

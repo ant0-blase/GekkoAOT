@@ -33,6 +33,19 @@ int main() {
   { std::ofstream f(temp.path,std::ios::binary); f.write(reinterpret_cast<const char*>(image.data()),image.size()); }
   auto runtime=std::make_unique<HostRuntime>(); auto& r=*runtime;
   CHECK(r.AttachDiscImage(temp.path));
+  // Direct DOL boot must supply drive state that the IPL configures from the
+  // header, before a game's first DVDGetStreamStatus (E2) command.
+  std::vector<std::uint8_t> boot(image.begin(), image.begin()+0x20);
+  std::memcpy(boot.data(), "GTSE01", 6);
+  boot[8]=1; boot[9]=0;
+  const auto boot_sequence=r.DiscInterface().CommandSequence();
+  r.InitializeGameCube(boot);
+  CHECK(r.DiscInterface().AudioEnabled());
+  CHECK(r.DiscInterface().CommandSequence()==boot_sequence);
+  CHECK(!r.DiscInterface().InterruptPending());
+  boot[8]=0;
+  r.InitializeGameCube(boot);
+  CHECK(!r.DiscInterface().AudioEnabled());
 #ifdef GEKKOAOT_HAVE_NOD
   auto entry=HardwareTestAccess::Lookup(r,"/tex.BIN");
   CHECK(entry && entry->disc_offset==0x4000 && entry->size==257);

@@ -1,4 +1,27 @@
-*.patch text eol=lf
+# Empty context lines in unified patches contain a required leading space.
+*.patch text eol=lf whitespace=-blank-at-eol,-blank-at-eof
 *.diff text eol=lf
 .github/workflows/*.yml text eol=lf
 .github/workflows/*.yaml text eol=lf
+
+# Also protect source archives from accidentally tracked local state.
+.gekkoaot export-ignore
+debug export-ignore
+build export-ignore
+/build-*/** export-ignore
+bin export-ignore
+stage export-ignore
+package export-ignore
+dist export-ignore
+diagnostics export-ignore
+profiling export-ignore
+profiles export-ignore
+bench-results export-ignore
+*.profraw export-ignore
+*.profdata export-ignore
+perf.data* export-ignore
+*.perf.data* export-ignore
+*.perf.txt export-ignore
+*.log export-ignore
+*.bak export-ignore
+*.v*-backup-* export-ignore

@@ -1,0 +1,24 @@
+diff --git a/src/cpu/cpu.h b/src/cpu/cpu.h
+--- a/src/cpu/cpu.h
++++ b/src/cpu/cpu.h
+@@ -1,1 +1,1 @@
+-static inline u32 dolrecomp_mem_read32_fast(CPUState* cpu, u32 addr) {
++#if defined(_MSC_VER)
++#define DOLRECOMP_C_MEM32_INLINE static __forceinline
++#elif defined(__GNUC__) || defined(__clang__)
++#define DOLRECOMP_C_MEM32_INLINE static inline __attribute__((always_inline))
++#else
++#define DOLRECOMP_C_MEM32_INLINE static inline
++#endif
++
++DOLRECOMP_C_MEM32_INLINE u32 dolrecomp_mem_read32_fast(CPUState* cpu, u32 addr) {
+@@ -1,1 +1,1 @@
+-static inline void dolrecomp_mem_write32_fast(CPUState* cpu, u32 addr,
+-                                               u32 value) {
++DOLRECOMP_C_MEM32_INLINE void dolrecomp_mem_write32_fast(CPUState* cpu, u32 addr,
++                                                          u32 value) {
+@@ -1,1 +1,1 @@
+     mem_write32(cpu, addr, value);
+ }
++
++#undef DOLRECOMP_C_MEM32_INLINE

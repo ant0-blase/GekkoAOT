@@ -30,3 +30,24 @@ GekkoAOT-v*-Windows-*.zip
 GekkoAOT-v*-Windows-*.zip.sha256
 __pycache__/
 *.pyc
+
+# Local measurements and generated diagnostics never belong in a release.
+/.pytest_cache/
+/diagnostics/
+/profiling/
+/profiles/
+/bench-results/
+perf.data*
+*.perf.data*
+*.perf.txt
+gekkoaot-*hotspots.txt
+gekkoaot-*threads.txt
+gekkoaot-*threads.data*
+*.log
+*.bak
+*.orig
+*.rej
+*~
+*.v*-backup-*
+*.AppImage
+*.AppImage.sha256

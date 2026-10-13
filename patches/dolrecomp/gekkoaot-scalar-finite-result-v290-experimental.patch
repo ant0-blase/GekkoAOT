@@ -1,0 +1,77 @@
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -1614,18 +1614,61 @@
+     set_fprf(cpu, classify_f64(cpu->fpr[d]));
+ }
+ 
++// GEKKOAOT_SCALAR_FINITE_RESULT_V290: a finite add/sub/mul result proves
++// that no NaN/invalid-operation path can be required. Check the result once,
++// rather than repeatedly classifying both inputs, the product and the f32.
++// FPSCR and paired-single publication remain bit-identical to binary_single.
++#ifndef DOLRECOMP_SCALAR_FINITE_RESULT
++#define DOLRECOMP_SCALAR_FINITE_RESULT 0
++#endif
++#if DOLRECOMP_SCALAR_FINITE_RESULT
++static inline bool scalar_finite_result(CPUState* cpu, u8 d, f64 exact) {
++    if ((cpu->fpscr & 7u) != 0u ||
++        (f64_bits(exact) & 0x7FF0000000000000ull) == 0x7FF0000000000000ull)
++        return false;
++    f32 rounded = (f32)exact;
++    f64 wide = (f64)rounded;
++    u32 status = cpu->fpscr & ~(FPSCR_FI | FPSCR_FR | (0x1Fu << 12));
++    if (exact != wide) {
++        if (!(status & FPSCR_XX)) status |= 0x80000000u;
++        status |= FPSCR_XX;
++        status = (status & ~0x20000000u) |
++                 ((status & 0x01F80700u) ? 0x20000000u : 0u);
++        status = (status & ~0x40000000u) |
++                 ((((status >> 22) & status & 0xF8u) != 0) ? 0x40000000u : 0u);
++        status |= FPSCR_FI;
++        if (fabs(wide) > fabs(exact)) status |= FPSCR_FR;
++    }
++    status |= classify_f32(rounded) << 12;
++    cpu->fpr[d] = wide;
++    cpu->ps1[d] = wide;
++    cpu->fpscr = status;
++    return true;
++}
++#endif
++
+ void ppc_fadds(CPUState* cpu, u8 d, u8 a, u8 b) {
++#if DOLRECOMP_SCALAR_FINITE_RESULT
++    if (scalar_finite_result(cpu, d, cpu->fpr[a] + cpu->fpr[b])) return;
++#endif
+     binary_single(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_ADD);
+ }
+ 
+ void ppc_fsubs(CPUState* cpu, u8 d, u8 a, u8 b) {
++#if DOLRECOMP_SCALAR_FINITE_RESULT
++    if (scalar_finite_result(cpu, d, cpu->fpr[a] - cpu->fpr[b])) return;
++#endif
+     binary_single(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_SUB);
+ }
+ 
+ void ppc_fmuls(CPUState* cpu, u8 d, u8 a, u8 c) {
+     f64 left = cpu->fpr[a];
+     f64 architectural_multiplier = cpu->fpr[c];
+-
++#if DOLRECOMP_SCALAR_FINITE_RESULT
++    f64 multiplier = force_25_bit(architectural_multiplier);
++    if (scalar_finite_result(cpu, d, left * multiplier)) return;
++    binary_single(cpu, d, left, multiplier, FP_MUL);
++#else
+     if ((cpu->fpscr & 7u) == 0u &&
+         gekkoaot_scalar_normal_or_zero_f64(left) &&
+         gekkoaot_scalar_normal_or_zero_f64(architectural_multiplier)) {
+@@ -1640,9 +1683,8 @@
+             }
+         }
+     }
+-
+-    binary_single(cpu, d, left, force_25_bit(architectural_multiplier),
+-                  FP_MUL);
++    binary_single(cpu, d, left, force_25_bit(architectural_multiplier), FP_MUL);
++#endif
+ }
+ 
+ void ppc_fdivs(CPUState* cpu, u8 d, u8 a, u8 b) {

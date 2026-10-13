@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <array>
+#include <cstring>
 #include <iostream>
 
 #define CHECK(expr) do { if (!(expr)) { std::cerr << __LINE__ << ": " #expr "\n"; std::exit(1); } } while (false)
@@ -24,12 +26,27 @@ struct Media {
   unsigned calls = 0;
   int result = 1;
   std::uint64_t last_sequence = 0;
+  unsigned audio_reads = 0;
+  std::uint64_t last_audio_offset = 0;
 
   static NativeDI::CommandResponse Execute(void* opaque, const NativeDI::CommandRequest& request) {
     auto& self = *static_cast<Media*>(opaque);
     ++self.calls;
     self.last_sequence = request.sequence;
     return {self.result, request.immediate, request.dma_length, 0u};
+  }
+
+  static bool ReadAudio(void* opaque, std::uint64_t offset, void* destination,
+                        std::uint32_t size) {
+    auto& self = *static_cast<Media*>(opaque);
+    if (size != 32u || (offset != 0x100u && offset != 0x120u)) return false;
+    ++self.audio_reads;
+    self.last_audio_offset = offset;
+    std::array<std::uint8_t, 32> block{};
+    block.fill(offset == 0x100u ? 0x21u : 0x43u);
+    block[0] = block[1] = 0u;
+    std::memcpy(destination, block.data(), block.size());
+    return true;
   }
 };
 
@@ -115,6 +132,50 @@ int main() {
   CHECK(Read(di, kDmaAddress) == 0x5000u);
   CHECK(di.CompletePendingFor(media.last_sequence, true, 0u, 0x20u));
   CHECK(Read(di, kDmaAddress) == 0x5020u);
+
+  // Native DOL boot inherits IPL audio-buffer state. A status query on an
+  // enabled but idle stream returns zero and TCINT, rather than poisoning the
+  // SDK DVD queue with InvalidCommand. Installing boot state emits no IRQ.
+  di.Reset(true);
+  const auto boot_sequence = di.CommandSequence();
+  di.ConfigureAudioBuffer(true, 0);
+  CHECK(di.AudioEnabled());
+  CHECK(di.CommandSequence() == boot_sequence);
+  CHECK(Read(di, kStatus) == 0);
+  Write(di, kStatus, 8);
+  Write(di, kCommand0, 0xe2000000);
+  Write(di, kDmaControl, 1);
+  CHECK(Read(di, kImmediate) == 0);
+  CHECK((Read(di, kStatus) & 16) != 0);
+  CHECK((Read(di, kStatus) & 4) == 0);
+  CHECK(di.LastError() == 0);
+  Write(di, kStatus, 24);
+  Write(di, kCommand0, 0xe4000000); // SDK explicitly disables audio.
+  Write(di, kDmaControl, 1);
+  CHECK(!di.AudioEnabled());
+
+  // Two 28-sample stereo DTK blocks from the disc must reach PCM at the
+  // configured stream rate and volume, then repeat at the track boundary.
+  di.Reset(true);
+  di.SetDeviceHooks({&media, &Media::Execute, &Media::ReadAudio});
+  di.ConfigureAudioBuffer(true, 0u);
+  Write(di, kCommand0, 0xe1000000u);
+  Write(di, kCommand1, 0x100u / 4u);
+  Write(di, kCommand2, 64u);
+  Write(di, kDmaControl, 1u);
+  CHECK(di.AudioStreaming());
+  std::array<std::int16_t, 16> audio{};
+  di.MixAudio(audio.data(), 8u, 32028u, 32028u, 0xffffu);
+  CHECK(audio[0] == 4096 && audio[1] == 8192);
+  CHECK(media.audio_reads == 1u && media.last_audio_offset == 0x100u);
+  CHECK(di.AudioPosition() == 0x120u);
+  for (unsigned i = 0; i < 4u; ++i)
+    di.MixAudio(audio.data(), 8u, 32028u, 32028u, 0u);
+  CHECK(media.audio_reads >= 2u);
+  CHECK(di.AudioStreaming());
+  Write(di, kCommand0, 0xe1010000u);
+  Write(di, kDmaControl, 1u);
+  CHECK(!di.AudioStreaming());
 
   std::cout << "DI absent-media, async cancel/restart, and reset tests passed\n";
 }

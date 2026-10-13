@@ -245,6 +245,11 @@ class Service {
     bool valid = false;
   };
   std::vector<FpShadow> fp_shadows_;
+  // AOT's ppc_fp_available gate already runs the SDK lazy-FPU exception.
+  // Keep one physical register bank until that gate transfers ownership.
+  // The eager shadow policy is retained only for older modules which lacked
+  // the gate, and can be selected independently for regression comparisons.
+  bool eager_fpu_contexts_ = false;
   std::unordered_map<std::uint32_t, std::deque<std::uint32_t>> wait_queues_;
   std::unordered_map<std::uint32_t, PendingSend> pending_sends_;
   std::unordered_map<std::uint32_t, PendingReceive> pending_receives_;
@@ -256,6 +261,11 @@ class Service {
   std::array<std::uint64_t, kEntrypointPageWords> entrypoint_pages_{};
   std::unordered_map<std::uint32_t, Alarm> alarms_;
   AlarmReturn alarm_return_{};
+  // v182: alarms are sparse but Poll() runs at every host boundary.  Keep a
+  // tiny summary updated on alarm mutations so an alarm scheduled far in the
+  // future does not force an unordered_map walk for every guest function.
+  std::size_t active_alarm_count_ = 0;
+  std::uint64_t next_alarm_fire_ = std::numeric_limits<std::uint64_t>::max();
   std::uint32_t current_thread_ = 0;
   std::uint32_t scheduler_disable_ = 0;
   std::uint64_t switches_ = 0;
@@ -310,12 +320,27 @@ class Service {
   }
 
   static std::uint8_t* Ptr(CPUState* state, std::uint32_t address, std::uint32_t size) {
-    if (!state || !state->external_pointer || size == 0) return nullptr;
+    if (!state || size == 0u) return nullptr;
+    // NativeOS spends most of its time touching ABI-visible OSThread, OSContext,
+    // queues and alarms in MEM1.  CPUState already exports the contiguous host
+    // RAM backing, so do not route those accesses through external_pointer and
+    // AddressSpace::Resolve on every 16/32-bit field. Cached/uncached aliases
+    // collapse to the same physical aperture exactly like AddressSpace.
+    const std::uint32_t physical =
+        (address & 0x80000000u) != 0u ? (address & 0x3fffffffu) : address;
+    if (state->ram && physical < state->ram_size && size <= state->ram_size - physical)
+      return state->ram + physical;
+    constexpr std::uint32_t kMem2Base = 0x10000000u;
+    if (state->exram && physical >= kMem2Base) {
+      const std::uint32_t offset = physical - kMem2Base;
+      if (offset < state->exram_size && size <= state->exram_size - offset)
+        return state->exram + offset;
+    }
+    if (!state->external_pointer) return nullptr;
     return static_cast<std::uint8_t*>(state->external_pointer(state, address, size));
   }
   static const std::uint8_t* Ptr(const CPUState* state, std::uint32_t address, std::uint32_t size) {
-    if (!state || !state->external_pointer || size == 0) return nullptr;
-    return static_cast<const std::uint8_t*>(state->external_pointer(const_cast<CPUState*>(state), address, size));
+    return Ptr(const_cast<CPUState*>(state), address, size);
   }
   static bool Read16(CPUState* state, std::uint32_t address, std::uint16_t* out) {
     const auto* p = Ptr(state, address, 2); if (!p || !out) return false; *out = ReadBE16(p); return true;
@@ -424,6 +449,17 @@ class Service {
     return true;
   }
 
+  void SaveContextFpu(CPUState* state, std::uint32_t context) {
+    const auto* in = Ptr(state, context, kCtxSize);
+    // Restores prefer an SDK payload once FPSAVED is set. Keep that payload
+    // coherent with the eager native ownership transfer, otherwise a later
+    // IRQ or thread return reloads registers from an older save.
+    if (in && (ReadBE16(in + kCtxState) & 1u) != 0u)
+      SaveFpuPayload(state, context, false);
+    else
+      SaveFpShadow(state, context);
+  }
+
   bool RestoreContextFpu(CPUState* state, std::uint32_t context) {
     const auto* in = Ptr(state, context, kCtxSize);
     if (!in) return false;
@@ -477,11 +513,10 @@ class Service {
     // CPUState on every cooperative switch. The SDK only saves the nonvolatile
     // integer registers, GQR1-GQR7 and control state; r3 in the *saved* context
     // becomes 1 so a later OSLoadContext resumes through the non-zero path.
-    // Floating/paired-single registers are lazy in the SDK. GekkoAOT keeps a
-    // host shadow per OSContext so AOT code remains correct even though it does
-    // not currently take a hardware FP-unavailable exception on every thread
-    // ownership transition. This removes two 32-double endian copies from the
-    // ordinary scheduler hot path without weakening guest-visible semantics.
+    // Floating/paired-single registers belong to the physical FPU bank, not
+    // necessarily this OSContext. The AOT FP-availability gate and the SDK
+    // exception handler save/load them only when ownership actually changes.
+    // Do not overwrite a lazy saved payload with a different owner's bank.
     for (unsigned i = 13; i < 32; ++i) WriteBE32(out + i * 4, state->gpr[i]);
     WriteBE32(out + 1 * 4, state->gpr[1]);
     WriteBE32(out + 2 * 4, state->gpr[2]);
@@ -499,7 +534,7 @@ class Service {
     WriteBE32(out + kCtxSrr0, resume_pc);
     WriteBE32(out + kCtxSrr1, state->msr);
     for (unsigned i = 1; i < 8; ++i) WriteBE32(out + kCtxGqr + i * 4, state->gqr[i]);
-    SaveFpShadow(state, context);
+    if (eager_fpu_contexts_) SaveContextFpu(state, context);
     return true;
   }
 
@@ -550,18 +585,18 @@ class Service {
     state->ctr = ReadBE32(in + kCtxCtr);
     state->xer = ReadBE32(in + kCtxXer);
 
-    // If the guest explicitly marked an FPU payload valid, it is authoritative.
-    // Otherwise restore the host shadow captured by the native scheduler. This
-    // mirrors the SDK's lazy-FPU ownership without forcing 512+ bytes of guest
-    // endian traffic on every thread switch.
-    if ((context_state & 1u) != 0) {
+    // OSLoadContext restores integers/control/GQRs only. FPSAVED authorizes the
+    // separate FPU load helper, not an eager load here. Changing this bank while
+    // 0x800000D8 still names its old owner corrupts that owner's next lazy save.
+    // Retain the former shadow behavior solely under the legacy policy.
+    if (eager_fpu_contexts_ && (context_state & 1u) != 0) {
       for (unsigned i = 0; i < 32; ++i)
         state->fpr[i] = BitsDouble(ReadBE64(in + kCtxFpr + i * 8));
       state->fpscr = ReadBE32(in + kCtxFpscr);
       for (unsigned i = 0; i < 32; ++i)
         state->ps1[i] = BitsDouble(ReadBE64(in + kCtxPsf + i * 8));
       SaveFpShadow(state, context);
-    } else {
+    } else if (eager_fpu_contexts_) {
       RestoreFpShadow(state, context);
     }
 
@@ -582,12 +617,19 @@ class Service {
     state->gpr[4] = ReadBE32(in + 4 * 4);
     state->gpr[3] = ReadBE32(in + 3 * 4);
 
-    static unsigned load_logs = 0u;
-    if (load_logs++ < 32u)
+    static std::uint64_t load_logs = 0u;
+    ++load_logs;
+    static const bool trace_loads = [] {
+      const char* value = std::getenv("GEKKOAOT_TRACE_OS_HLE");
+      return value && *value == '1';
+    }();
+    if (load_logs <= 32u || (trace_loads && (load_logs & (load_logs - 1u)) == 0u))
       std::fprintf(stderr,
-                   "GEKKOAOT_NATIVE_OS_LOAD_CONTEXT_V64=1 ctx=%08x pc=%08x exc=%u fp=%u ras=%u\n",
+                   "GEKKOAOT_NATIVE_OS_LOAD_CONTEXT_V64=1 count=%llu ctx=%08x pc=%08x exc=%u fp=%u ras=%u msr=%08x r3=%08x\n",
+                   static_cast<unsigned long long>(load_logs),
                    context, state->pc, exception_saved ? 1u : 0u,
-                   (context_state & 1u) ? 1u : 0u, ras_rewound ? 1u : 0u);
+                   (context_state & 1u) ? 1u : 0u, ras_rewound ? 1u : 0u,
+                   state->msr, state->gpr[3]);
     return state->pc != 0;
   }
 
@@ -607,18 +649,16 @@ class Service {
     std::uint32_t previous = 0;
     if (!Read32(state, kCurrentContext, &previous)) return false;
 
-    // Native-AOT equivalent of the SDK's lazy FP-unavailable ownership
-    // boundary.  On hardware OSSetCurrentContext merely clears MSR[FP] and a
-    // later FP instruction traps, at which point the old owner's FPR/PS state
-    // is saved and the new context is loaded.  Recompiled host FP instructions
-    // cannot generate that Gekko trap, so perform the transfer eagerly at the
-    // same OSContext boundary.  Do NOT change 0x800000D8 here: guest-visible
-    // FPU ownership retains the retail lazy semantics; this is only the native
-    // register-file isolation required to make those semantics observable.
-    if (previous != 0u && previous != context)
-      SaveFpShadow(state, previous);
+    // Current LLVM and Portable-C modules check MSR[FP] before FP execution and
+    // raise the SDK FP-unavailable exception. OSSetCurrentContext must leave the
+    // physical FPR/PS/FPSCR bank unchanged until that exception transfers it.
+    // An eager transfer followed by the SDK lazy save copies the new context's
+    // values over the previous owner's payload (HPCOS then builds NaN matrices).
+    if (eager_fpu_contexts_ && previous != 0u && previous != context)
+      SaveContextFpu(state, previous);
 
-    if (previous != context && !RestoreContextFpu(state, context)) return false;
+    if (eager_fpu_contexts_ && previous != context &&
+        !RestoreContextFpu(state, context)) return false;
 
     std::uint32_t owner = 0, saved_msr = 0;
     if (!Read32(state, kFpuContext, &owner) ||
@@ -640,7 +680,7 @@ class Service {
     state->msr |= kMsrRI;
 
     static unsigned fp_barrier_logs = 0u;
-    if (previous != context && fp_barrier_logs++ < 32u)
+    if (eager_fpu_contexts_ && previous != context && fp_barrier_logs++ < 32u)
       std::fprintf(stderr,
                    "GEKKOAOT_NATIVE_OS_FP_CONTEXT_BARRIER_V144=1 old=%08x new=%08x owner=%08x saved=%u shadow=%u\n",
                    previous, context, owner,
@@ -1515,12 +1555,12 @@ class Service {
     const std::uint32_t mq = state->gpr[3], message = state->gpr[4];
     const bool block = state->gpr[5] != 0;
     auto* header = Ptr(state, mq, 32); if (!header) return false;
-    if (MessageDeliverPendingReceiver(state, mq, message)) { ReturnU32(state, 1); MaybePreempt(state); return true; }
     const std::uint32_t array = ReadBE32(header + 16);
     const std::int32_t count = static_cast<std::int32_t>(ReadBE32(header + 20));
     std::int32_t first = static_cast<std::int32_t>(ReadBE32(header + 24));
     std::int32_t used = static_cast<std::int32_t>(ReadBE32(header + 28));
-    if (count <= 0 || !Ptr(state, array, static_cast<std::uint32_t>(count) * 4)) return false;
+    if (count < 0 || (count > 0 && !Ptr(state, array, static_cast<std::uint32_t>(count) * 4))) return false;
+    if (count > 0 && MessageDeliverPendingReceiver(state, mq, message)) { ReturnU32(state, 1); MaybePreempt(state); return true; }
     if (used < count) {
       if (jam) { first = (first + count - 1) % count; Write32(state, array + static_cast<std::uint32_t>(first) * 4, message); }
       else { const auto index = (first + used) % count; Write32(state, array + static_cast<std::uint32_t>(index) * 4, message); }
@@ -1543,7 +1583,7 @@ class Service {
     const std::int32_t count = static_cast<std::int32_t>(ReadBE32(header + 20));
     std::int32_t first = static_cast<std::int32_t>(ReadBE32(header + 24));
     std::int32_t used = static_cast<std::int32_t>(ReadBE32(header + 28));
-    if (count <= 0 || !Ptr(state, array, static_cast<std::uint32_t>(count) * 4)) return false;
+    if (count < 0 || (count > 0 && !Ptr(state, array, static_cast<std::uint32_t>(count) * 4))) return false;
     if (used > 0) {
       std::uint32_t message = 0; if (!Read32(state, array + static_cast<std::uint32_t>(first) * 4, &message)) return false;
       if (output && !Write32(state, output, message)) return false;
@@ -1562,6 +1602,18 @@ class Service {
     return (static_cast<std::uint64_t>(state->gpr[hi]) << 32) | state->gpr[hi + 1];
   }
 
+  void RecomputeAlarmSummary() {
+    std::size_t active = 0;
+    std::uint64_t next = std::numeric_limits<std::uint64_t>::max();
+    for (const auto& [_, alarm] : alarms_) {
+      if (!alarm.active) continue;
+      ++active;
+      next = std::min(next, alarm.fire);
+    }
+    active_alarm_count_ = active;
+    next_alarm_fire_ = next;
+  }
+
   bool SetAlarmCommon(CPUState* state, bool absolute, bool periodic) {
     const std::uint32_t address = state->gpr[3];
     if (!Ptr(state, address, 40)) return false;
@@ -1575,6 +1627,7 @@ class Service {
     }
     if (!alarm.handler) return false;
     alarms_[address] = alarm;
+    RecomputeAlarmSummary();
     Write32(state, address, alarm.handler); Write32(state, address + 4, 0);
     Write64(state, address + 8, alarm.fire); Write32(state, address + 16, 0); Write32(state, address + 20, 0);
     Write64(state, address + 24, alarm.period); Write64(state, address + 32, alarm.start);
@@ -1595,7 +1648,16 @@ public:
   void Reset() {
     known_threads_.clear(); ready_.clear(); ready_priorities_.clear(); wait_queues_.clear(); pending_sends_.clear();
     pending_receives_.clear(); pending_cond_.clear(); entrypoints_.fill(0); alarms_.clear();
+    active_alarm_count_ = 0;
+    next_alarm_fire_ = std::numeric_limits<std::uint64_t>::max();
     fp_shadows_.clear();
+    const char* eager = std::getenv("GEKKOAOT_NATIVE_OS_EAGER_FPU");
+    eager_fpu_contexts_ = eager && *eager && std::string_view(eager) != "0" &&
+        std::string_view(eager) != "false" && std::string_view(eager) != "off";
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_OS_FPU_V309=1 eager=%u default=lazy "
+                 "ownership=sdk-fp-unavailable register-bank=physical\n",
+                 eager_fpu_contexts_ ? 1u : 0u);
     if (known_threads_.capacity() < 32) known_threads_.reserve(32);
     if (ready_.capacity() < 32) ready_.reserve(32);
     if (ready_priorities_.capacity() < 32) ready_priorities_.reserve(32);
@@ -1793,10 +1855,16 @@ public:
     }
   }
 
+  std::uint64_t TimebaseTicksUntilNextAlarm(const CPUState* state) const {
+    if (!state) return std::numeric_limits<std::uint64_t>::max();
+    if (active_alarm_count_ == 0u)
+      return std::numeric_limits<std::uint64_t>::max();
+    if (next_alarm_fire_ <= state->timebase) return 0u;
+    return next_alarm_fire_ - state->timebase;
+  }
+
   bool NeedsGlobalPoll() const {
-    if (alarm_return_.valid) return true;
-    for (const auto& [_, alarm] : alarms_) if (alarm.active) return true;
-    return false;
+    return alarm_return_.valid || active_alarm_count_ != 0u;
   }
   bool HandlesAddress(std::uint32_t address) const {
     return alarm_return_.valid && alarm_return_.address == address;
@@ -1811,12 +1879,17 @@ public:
     // GEKKOAOT_NATIVE_OS_POLL_FAST_V20: Dispatch() reaches Poll at every HLE
     // boundary. Most games have no live OS alarm; reject that overwhelmingly
     // common case before touching the alarm map.
-    if (!alarm_return_.valid && alarms_.empty()) return false;
+    if (!alarm_return_.valid && active_alarm_count_ == 0u) return false;
     if (alarm_return_.valid && alarm_return_.address == address &&
         alarm_return_.stack_pointer == state->gpr[1]) {
       *state = alarm_return_.state; alarm_return_ = {}; return false;
     }
     if (alarm_return_.valid || (state->msr & kMsrEE) == 0) return false;
+    // Future alarms need no map walk until the architectural timebase reaches
+    // the earliest active deadline.  The summary is recomputed whenever an
+    // alarm is armed, cancelled, erased or fires.
+    if (active_alarm_count_ == 0u || next_alarm_fire_ > state->timebase)
+      return false;
     Alarm* selected = nullptr;
     for (auto& [_, alarm] : alarms_) {
       if (!alarm.active || alarm.fire > state->timebase) continue;
@@ -1832,6 +1905,7 @@ public:
     } else {
       selected->active = false;
     }
+    RecomputeAlarmSummary();
     state->gpr[3] = alarm_address;
     std::uint32_t context = 0; Read32(state, kCurrentContext, &context); state->gpr[4] = context;
     state->lr = address; state->pc = handler; ++alarm_callbacks_;
@@ -1885,9 +1959,23 @@ public:
       const auto exit_thread = Entrypoint(Kind::ExitThread);
       const std::uint32_t aligned = stack & ~7u;
       if (!exit_thread || stack < stack_size || aligned < 8 ||
-          !Ptr(state, aligned - 8, 8) || !Ptr(state, stack - stack_size, 4)) return false;
+          !Ptr(state, aligned - 8, 8) || !Ptr(state, stack - stack_size, 4)) {
+        std::fprintf(stderr,
+                     "GEKKOAOT_NATIVE_OS_CREATE_THREAD_FAILURE reason=invalid-stack-or-exit "
+                     "thread=%08x func=%08x param=%08x stack=%08x size=%08x "
+                     "priority=%d attr=%04x exit=%08x aligned=%08x\n",
+                     thread, func, param, stack, stack_size, priority, attr,
+                     exit_thread, aligned);
+        return false;
+      }
       const auto sp = aligned - 8;
-      if (!InitializeContext(state, thread, func, sp)) return false;
+      if (!InitializeContext(state, thread, func, sp)) {
+        std::fprintf(stderr,
+                     "GEKKOAOT_NATIVE_OS_CREATE_THREAD_FAILURE reason=context "
+                     "thread=%08x func=%08x sp=%08x\n",
+                     thread, func, sp);
+        return false;
+      }
       Write32(state, sp, 0); Write32(state, sp + 4, 0);
       Write32(state, thread + 12, param);
       Write32(state, thread + kCtxLr, exit_thread);
@@ -1957,8 +2045,20 @@ public:
       const auto old = static_cast<std::int32_t>(raw); Write32(state, thread + kThreadSuspend, static_cast<std::uint32_t>(old + 1)); RemoveReady(thread);
       state->gpr[3] = static_cast<std::uint32_t>(old);
       if (thread == current_thread_ && old == 0) {
-        if (!SaveContext(state, thread, state->lr)) return false;
+        // Retail OSSuspendThread(current): RUNNING -> READY, RunQueueHint, then
+        // __OSReschedule(). Interrupt handlers run with the scheduler disabled
+        // (__OSDispatchInterrupt), so SelectThread declines and the switch
+        // happens when the dispatcher re-enables it. Saving the handler's
+        // continuation over the interrupt frame here (GX FIFO high-watermark
+        // handler, Call of Duty) resumed the thread inside the handler with
+        // MSR[EE]=0 and spun forever.
         Write16(state, thread + kThreadState, kThreadReady);
+        if (static_cast<std::int32_t>(scheduler_disable_) > 0) {
+          reschedule_pending_ = true;
+          state->pc = state->lr;
+          return true;
+        }
+        if (!SaveSchedulerContinuation(state, thread, state->lr)) return false;
         return SwitchOrIdle(state);
       }
       state->pc = state->lr;
@@ -2149,19 +2249,37 @@ public:
       ReturnVoid(state); MaybePreempt(state); return true;
     }
     case Kind::InitMessageQueue: {
-      const auto mq = state->gpr[3], array = state->gpr[4]; const auto count = state->gpr[5]; auto* p = Ptr(state, mq, 32); if (!p || !count || count > UINT32_MAX / 4 || !Ptr(state, array, count * 4)) return false;
+      const auto mq = state->gpr[3], array = state->gpr[4]; const auto count = state->gpr[5]; auto* p = Ptr(state, mq, 32); if (!p || count > UINT32_MAX / 4 || (count != 0 && !Ptr(state, array, count * 4))) return false;
       std::fill_n(p, 32, 0); WriteBE32(p + 16, array); WriteBE32(p + 20, count); ReturnVoid(state); return true;
     }
     case Kind::SendMessage: return HandleMessageSend(state, false);
     case Kind::JamMessage: return HandleMessageSend(state, true);
     case Kind::ReceiveMessage: return HandleMessageReceive(state);
-    case Kind::InitAlarm: { alarms_.clear(); ReturnVoid(state); return true; }
-    case Kind::CreateAlarm: { const auto a = state->gpr[3]; auto* p = Ptr(state, a, 40); if (!p) return false; std::fill_n(p, 40, 0); alarms_.erase(a); ReturnVoid(state); return true; }
+    case Kind::InitAlarm: {
+      alarms_.clear(); active_alarm_count_ = 0;
+      next_alarm_fire_ = std::numeric_limits<std::uint64_t>::max();
+      ReturnVoid(state); return true;
+    }
+    case Kind::CreateAlarm: {
+      const auto a = state->gpr[3]; auto* p = Ptr(state, a, 40); if (!p) return false;
+      std::fill_n(p, 40, 0);
+      if (alarms_.erase(a) != 0u) RecomputeAlarmSummary();
+      ReturnVoid(state); return true;
+    }
     case Kind::SetAlarm: return SetAlarmCommon(state, false, false);
     case Kind::SetAbsAlarm: return SetAlarmCommon(state, true, false);
     case Kind::SetPeriodicAlarm: return SetAlarmCommon(state, true, true);
-    case Kind::CancelAlarm: { const auto a = state->gpr[3]; if (auto it = alarms_.find(a); it != alarms_.end()) it->second.active = false; ReturnVoid(state); return true; }
-    case Kind::CheckAlarmQueue: { bool active = false; for (const auto& [_, a] : alarms_) active |= a.active; ReturnU32(state, active ? 1u : 0u); return true; }
+    case Kind::CancelAlarm: {
+      const auto a = state->gpr[3];
+      if (auto it = alarms_.find(a); it != alarms_.end() && it->second.active) {
+        it->second.active = false;
+        RecomputeAlarmSummary();
+      }
+      ReturnVoid(state); return true;
+    }
+    case Kind::CheckAlarmQueue: {
+      ReturnU32(state, active_alarm_count_ != 0u ? 1u : 0u); return true;
+    }
     case Kind::DisableInterrupts: { const bool old = (state->msr & kMsrEE) != 0; state->msr &= ~kMsrEE; ReturnU32(state, old ? 1u : 0u); return true; }
     case Kind::EnableInterrupts: { const bool old = (state->msr & kMsrEE) != 0; state->msr |= kMsrEE; ReturnU32(state, old ? 1u : 0u); return true; }
     case Kind::RestoreInterrupts: { const bool old = (state->msr & kMsrEE) != 0; if (state->gpr[3]) state->msr |= kMsrEE; else state->msr &= ~kMsrEE; ReturnU32(state, old ? 1u : 0u); return true; }

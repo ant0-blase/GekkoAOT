@@ -1,0 +1,654 @@
+diff --git a/src/backend/llvm/floating_point.cpp b/src/backend/llvm/floating_point.cpp
+index ad4c59e..0dffd18 100644
+--- a/src/backend/llvm/floating_point.cpp
++++ b/src/backend/llvm/floating_point.cpp
+@@ -5,8 +5,11 @@
+ #include <llvm/IR/Constants.h>
+ #include <llvm/IR/Function.h>
+ #include <llvm/IR/Intrinsics.h>
++#include <llvm/IR/MDBuilder.h>
+ #include <llvm/IR/Module.h>
+
++#include <utility>
++
+ namespace dolllvm {
+
+ using namespace llvm;
+@@ -24,23 +27,195 @@ void FunctionEmitter::emitExactFloat(u64 descriptor) {
+   auto ps1Slot = [](u32 reg) {
+     return static_cast<DolIRStateSlot>(DOLIR_STATE_PS1_0 + reg);
+   };
++
++  // Preserve input provenance before a destination aliases one of the sources.
++  const bool aExactSingle = fp_exact_single_[a];
++  const bool bExactSingle = fp_exact_single_[b];
++  const bool cExactSingle = fp_exact_single_[c];
++
+   Type *ptr = PointerType::getUnqual(context_);
++  Type *i32 = Type::getInt32Ty(context_);
++  Type *i64 = Type::getInt64Ty(context_);
++  Type *f32 = Type::getFloatTy(context_);
+   Type *f64 = Type::getDoubleTy(context_);
+-  syncState(DOLIR_STATE_FPSCR);
++
++  auto rawFPSCR = [&]() -> Value * {
++    // Do not materialize a pending paired-single FPRF here. Scalar arithmetic
++    // overwrites FPRF anyway, while the low control/exception bits are already
++    // current in the architectural slot.
++    return builder_.CreateLoad(i32, state_[DOLIR_STATE_FPSCR], "fpscr.direct");
++  };
++  auto defaultControls = [&](Value *fpscr) {
++    return builder_.CreateICmpEQ(
++        builder_.CreateAnd(fpscr, builder_.getInt32(7)), builder_.getInt32(0),
++        "fp.default-controls");
++  };
++  auto finiteF32 = [&](Value *value) {
++    Value *bits = builder_.CreateBitCast(value, i32);
++    return builder_.CreateICmpNE(
++        builder_.CreateAnd(bits, builder_.getInt32(0x7F800000u)),
++        builder_.getInt32(0x7F800000u), "fp.f32.finite");
++  };
++  auto finiteF64 = [&](Value *value) {
++    Value *bits = builder_.CreateBitCast(value, i64);
++    return builder_.CreateICmpNE(
++        builder_.CreateAnd(bits, builder_.getInt64(0x7FF0000000000000ull)),
++        builder_.getInt64(0x7FF0000000000000ull), "fp.f64.finite");
++  };
++  auto classifyF32 = [&](Value *value) {
++    Value *bits = builder_.CreateBitCast(value, i32);
++    Value *sign = builder_.CreateICmpNE(
++        builder_.CreateAnd(bits, builder_.getInt32(0x80000000u)),
++        builder_.getInt32(0));
++    Value *exponent =
++        builder_.CreateAnd(bits, builder_.getInt32(0x7F800000u));
++    Value *fraction =
++        builder_.CreateAnd(bits, builder_.getInt32(0x007FFFFFu));
++    Value *expZero = builder_.CreateICmpEQ(exponent, builder_.getInt32(0));
++    Value *expMax = builder_.CreateICmpEQ(
++        exponent, builder_.getInt32(0x7F800000u));
++    Value *fracZero = builder_.CreateICmpEQ(fraction, builder_.getInt32(0));
++    Value *normal = builder_.CreateSelect(
++        sign, builder_.getInt32(0x08u), builder_.getInt32(0x04u));
++    Value *zero = builder_.CreateSelect(
++        sign, builder_.getInt32(0x12u), builder_.getInt32(0x02u));
++    Value *subnormal = builder_.CreateSelect(
++        sign, builder_.getInt32(0x18u), builder_.getInt32(0x14u));
++    Value *infinity = builder_.CreateSelect(
++        sign, builder_.getInt32(0x09u), builder_.getInt32(0x05u));
++    Value *zeroOrSubnormal = builder_.CreateSelect(fracZero, zero, subnormal);
++    Value *infinityOrNaN = builder_.CreateSelect(
++        fracZero, infinity, builder_.getInt32(0x11u));
++    return builder_.CreateSelect(
++        expZero, zeroOrSubnormal,
++        builder_.CreateSelect(expMax, infinityOrNaN, normal), "fp.fprf");
++  };
++  auto setFPRFF32 = [&](Value *fpscr, Value *value) {
++    Value *classification = classifyF32(value);
++    fpscr = builder_.CreateAnd(fpscr, builder_.getInt32(~(0x1Fu << 12)));
++    return builder_.CreateOr(
++        fpscr, builder_.CreateShl(classification, builder_.getInt32(12)));
++  };
++  auto classifyF64 = [&](Value *value) {
++    Value *bits = builder_.CreateBitCast(value, i64);
++    Value *sign = builder_.CreateICmpNE(
++        builder_.CreateAnd(bits, builder_.getInt64(0x8000000000000000ull)),
++        builder_.getInt64(0));
++    Value *exponent =
++        builder_.CreateAnd(bits, builder_.getInt64(0x7FF0000000000000ull));
++    Value *fraction =
++        builder_.CreateAnd(bits, builder_.getInt64(0x000FFFFFFFFFFFFFull));
++    Value *expZero = builder_.CreateICmpEQ(exponent, builder_.getInt64(0));
++    Value *expMax = builder_.CreateICmpEQ(
++        exponent, builder_.getInt64(0x7FF0000000000000ull));
++    Value *fracZero = builder_.CreateICmpEQ(fraction, builder_.getInt64(0));
++    Value *normal = builder_.CreateSelect(
++        sign, builder_.getInt32(0x08u), builder_.getInt32(0x04u));
++    Value *zero = builder_.CreateSelect(
++        sign, builder_.getInt32(0x12u), builder_.getInt32(0x02u));
++    Value *subnormal = builder_.CreateSelect(
++        sign, builder_.getInt32(0x18u), builder_.getInt32(0x14u));
++    Value *infinity = builder_.CreateSelect(
++        sign, builder_.getInt32(0x09u), builder_.getInt32(0x05u));
++    Value *zeroOrSubnormal = builder_.CreateSelect(fracZero, zero, subnormal);
++    Value *infinityOrNaN = builder_.CreateSelect(
++        fracZero, infinity, builder_.getInt32(0x11u));
++    return builder_.CreateSelect(
++        expZero, zeroOrSubnormal,
++        builder_.CreateSelect(expMax, infinityOrNaN, normal), "fp.fprf64");
++  };
++  auto setFPRFF64 = [&](Value *fpscr, Value *value) {
++    Value *classification = classifyF64(value);
++    fpscr = builder_.CreateAnd(fpscr, builder_.getInt32(~(0x1Fu << 12)));
++    return builder_.CreateOr(
++        fpscr, builder_.CreateShl(classification, builder_.getInt32(12)));
++  };
++  auto setSingleRoundFlags = [&](Value *fpscr, Value *exact,
++                                 Value *rounded) {
++    Value *rounded64 = builder_.CreateFPExt(rounded, f64);
++    Value *inexact = builder_.CreateFCmpONE(exact, rounded64, "fp.inexact");
++    Value *base = builder_.CreateAnd(
++        fpscr, builder_.getInt32(~(0x00020000u | 0x00040000u)));
++
++    Value *hadXX = builder_.CreateICmpNE(
++        builder_.CreateAnd(base, builder_.getInt32(0x02000000u)),
++        builder_.getInt32(0));
++    Value *exception =
++        builder_.CreateOr(base, builder_.getInt32(0x02000000u));
++    Value *withFX =
++        builder_.CreateOr(exception, builder_.getInt32(0x80000000u));
++    exception = builder_.CreateSelect(hadXX, exception, withFX);
++
++    Value *hasVX = builder_.CreateICmpNE(
++        builder_.CreateAnd(exception, builder_.getInt32(0x01F80700u)),
++        builder_.getInt32(0));
++    exception = builder_.CreateOr(
++        builder_.CreateAnd(exception, builder_.getInt32(~0x20000000u)),
++        builder_.CreateSelect(hasVX, builder_.getInt32(0x20000000u),
++                              builder_.getInt32(0)));
++    Value *enabledException = builder_.CreateAnd(
++        builder_.CreateAnd(
++            builder_.CreateLShr(exception, builder_.getInt32(22)), exception),
++        builder_.getInt32(0xF8u));
++    Value *hasFEX =
++        builder_.CreateICmpNE(enabledException, builder_.getInt32(0));
++    exception = builder_.CreateOr(
++        builder_.CreateAnd(exception, builder_.getInt32(~0x40000000u)),
++        builder_.CreateSelect(hasFEX, builder_.getInt32(0x40000000u),
++                              builder_.getInt32(0)));
++    exception =
++        builder_.CreateOr(exception, builder_.getInt32(0x00020000u));
++
++    Value *exactBits = builder_.CreateAnd(
++        builder_.CreateBitCast(exact, i64),
++        builder_.getInt64(0x7FFFFFFFFFFFFFFFull));
++    Value *roundedBits = builder_.CreateAnd(
++        builder_.CreateBitCast(rounded64, i64),
++        builder_.getInt64(0x7FFFFFFFFFFFFFFFull));
++    Value *roundsAway =
++        builder_.CreateICmpUGT(roundedBits, exactBits, "fp.round-away");
++    exception = builder_.CreateOr(
++        exception,
++        builder_.CreateSelect(roundsAway, builder_.getInt32(0x00040000u),
++                              builder_.getInt32(0)));
++    return builder_.CreateSelect(inexact, exception, base, "fp.round-flags");
++  };
++  auto directBinary = [&](DolIRExactFloat current, Value *left,
++                          Value *right) {
++    unsigned intrinsic = Intrinsic::experimental_constrained_fadd;
++    switch (current) {
++    case DOLIR_EXACT_FSUBS:
++      intrinsic = Intrinsic::experimental_constrained_fsub;
++      break;
++    case DOLIR_EXACT_FMULS:
++      intrinsic = Intrinsic::experimental_constrained_fmul;
++      break;
++    case DOLIR_EXACT_FDIVS:
++      intrinsic = Intrinsic::experimental_constrained_fdiv;
++      break;
++    default:
++      break;
++    }
++    // Match the exact helper: one architectural f64 operation followed by one
++    // single-precision rounding. v30 accidentally did both a host f64 and f32
++    // arithmetic operation, which duplicated work in the hot path.
++    Value *exact = constrainedPairBinary(intrinsic, left, right);
++    Value *rounded = builder_.CreateConstrainedFPCast(
++        Intrinsic::experimental_constrained_fptrunc, exact, f32, nullptr,
++        "fp.direct.round", nullptr, RoundingMode::Dynamic, fp::ebIgnore);
++    return std::pair<Value *, Value *>(exact, rounded);
++  };
+
+   if (op == DOLIR_EXACT_FCMPU || op == DOLIR_EXACT_FCMPO) {
+     auto crSlot = static_cast<DolIRStateSlot>(DOLIR_STATE_CR0 + crfd);
++    Value *left = stateValue(fprSlot(a));
++    Value *right = stateValue(fprSlot(b));
++    Value *safe = builder_.CreateAnd(finiteF64(left), finiteF64(right));
++    BasicBlock *fast = BasicBlock::Create(context_, "fcmp_direct", function_);
++    BasicBlock *slow = BasicBlock::Create(context_, "fcmp_exact", function_);
++    BasicBlock *join = BasicBlock::Create(context_, "fcmp_join", function_);
++    builder_.CreateCondBr(safe, fast, slow,
++                          MDBuilder(context_).createBranchWeights(4096, 1));
++
++    builder_.SetInsertPoint(fast);
++    Value *less = builder_.CreateFCmpOLT(left, right);
++    Value *greater = builder_.CreateFCmpOGT(left, right);
++    Value *compare = builder_.CreateSelect(
++        less, builder_.getInt32(8),
++        builder_.CreateSelect(greater, builder_.getInt32(4),
++                              builder_.getInt32(2)));
++    Value *fpscr = stateValue(DOLIR_STATE_FPSCR);
++    fpscr = builder_.CreateOr(
++        builder_.CreateAnd(fpscr, builder_.getInt32(~(0xFu << 12))),
++        builder_.CreateShl(compare, builder_.getInt32(12)));
++    builder_.CreateStore(fpscr, state_[DOLIR_STATE_FPSCR]);
++    builder_.CreateStore(compare, state_[crSlot]);
++    builder_.CreateBr(join);
++
++    builder_.SetInsertPoint(slow);
++    syncState(DOLIR_STATE_FPSCR);
+     syncState(crSlot);
+     auto callee = module_.getOrInsertFunction(
+         "ppc_fcmp", FunctionType::get(Type::getVoidTy(context_),
+                                       {ptr, Type::getInt8Ty(context_), f64, f64,
+                                        Type::getInt1Ty(context_)},
+                                       false));
+-    builder_.CreateCall(callee, {ctx_, builder_.getInt8(crfd),
+-                                 stateValue(fprSlot(a)), stateValue(fprSlot(b)),
++    builder_.CreateCall(callee, {ctx_, builder_.getInt8(crfd), left, right,
+                                  builder_.getInt1(op == DOLIR_EXACT_FCMPO)});
+     reloadState(crSlot);
+     reloadState(DOLIR_STATE_FPSCR);
++    builder_.CreateBr(join);
++
++    builder_.SetInsertPoint(join);
++    known_state_[crSlot] = nullptr;
++    known_state_[DOLIR_STATE_FPSCR] = nullptr;
++    pending_fprf_ = nullptr;
+     return;
+   }
+
+@@ -53,69 +228,116 @@ void FunctionEmitter::emitExactFloat(u64 descriptor) {
+   if (op >= DOLIR_EXACT_FADDS && op <= DOLIR_EXACT_FRSP) {
+     const char *name = nullptr;
+     switch (op) {
+-    case DOLIR_EXACT_FADDS:
+-      name = "ppc_fadds";
+-      break;
+-    case DOLIR_EXACT_FSUBS:
+-      name = "ppc_fsubs";
+-      break;
+-    case DOLIR_EXACT_FMULS:
+-      name = "ppc_fmuls";
+-      break;
+-    case DOLIR_EXACT_FDIVS:
+-      name = "ppc_fdivs";
+-      break;
+-    case DOLIR_EXACT_FADD:
+-      name = "ppc_fadd";
+-      break;
+-    case DOLIR_EXACT_FSUB:
+-      name = "ppc_fsub";
+-      break;
+-    case DOLIR_EXACT_FMUL:
+-      name = "ppc_fmul";
+-      break;
+-    case DOLIR_EXACT_FDIV:
+-      name = "ppc_fdiv";
+-      break;
+-    case DOLIR_EXACT_FRSP:
+-      name = "ppc_frsp";
+-      break;
+-    default:
+-      break;
++    case DOLIR_EXACT_FADDS: name = "ppc_fadds"; break;
++    case DOLIR_EXACT_FSUBS: name = "ppc_fsubs"; break;
++    case DOLIR_EXACT_FMULS: name = "ppc_fmuls"; break;
++    case DOLIR_EXACT_FDIVS: name = "ppc_fdivs"; break;
++    case DOLIR_EXACT_FADD: name = "ppc_fadd"; break;
++    case DOLIR_EXACT_FSUB: name = "ppc_fsub"; break;
++    case DOLIR_EXACT_FMUL: name = "ppc_fmul"; break;
++    case DOLIR_EXACT_FDIV: name = "ppc_fdiv"; break;
++    case DOLIR_EXACT_FRSP: name = "ppc_frsp"; break;
++    default: break;
+     }
+-    syncState(destination);
+-    bool single = op <= DOLIR_EXACT_FDIVS || op == DOLIR_EXACT_FRSP;
+-    if (single)
+-      syncState(ps1Slot(d));
+-    syncState(fprSlot(op == DOLIR_EXACT_FRSP ? b : a));
+-    if (op != DOLIR_EXACT_FRSP)
+-      syncState(
+-          fprSlot(op == DOLIR_EXACT_FMULS || op == DOLIR_EXACT_FMUL ? c : b));
+-    if (op == DOLIR_EXACT_FRSP) {
+-      auto callee = module_.getOrInsertFunction(
+-          name, FunctionType::get(
+-                    Type::getVoidTy(context_),
+-                    {ptr, Type::getInt8Ty(context_), Type::getInt8Ty(context_)},
+-                    false));
+-      builder_.CreateCall(callee,
+-                          {ctx_, builder_.getInt8(d), builder_.getInt8(b)});
++
++    bool singleBinary = op >= DOLIR_EXACT_FADDS && op <= DOLIR_EXACT_FDIVS;
++    u32 rhsReg = op == DOLIR_EXACT_FMULS || op == DOLIR_EXACT_FMUL ? c : b;
++    bool lhsExact = aExactSingle;
++    bool rhsExact = op == DOLIR_EXACT_FMULS ? cExactSingle : bExactSingle;
++    bool directSingle = singleBinary && lhsExact && rhsExact;
++    bool directRound = op == DOLIR_EXACT_FRSP && bExactSingle;
++
++    auto emitLegacy = [&]() {
++      syncState(DOLIR_STATE_FPSCR);
++      syncState(destination);
++      bool single = op <= DOLIR_EXACT_FDIVS || op == DOLIR_EXACT_FRSP;
++      if (single)
++        syncState(ps1Slot(d));
++      syncState(fprSlot(op == DOLIR_EXACT_FRSP ? b : a));
++      if (op != DOLIR_EXACT_FRSP)
++        syncState(fprSlot(rhsReg));
++      if (op == DOLIR_EXACT_FRSP) {
++        auto callee = module_.getOrInsertFunction(
++            name, FunctionType::get(Type::getVoidTy(context_),
++                                    {ptr, Type::getInt8Ty(context_),
++                                     Type::getInt8Ty(context_)},
++                                    false));
++        builder_.CreateCall(callee,
++                            {ctx_, builder_.getInt8(d), builder_.getInt8(b)});
++      } else {
++        auto callee = module_.getOrInsertFunction(
++            name, FunctionType::get(Type::getVoidTy(context_),
++                                    {ptr, Type::getInt8Ty(context_),
++                                     Type::getInt8Ty(context_),
++                                     Type::getInt8Ty(context_)},
++                                    false));
++        builder_.CreateCall(callee,
++                            {ctx_, builder_.getInt8(d), builder_.getInt8(a),
++                             builder_.getInt8(rhsReg)});
++      }
++      reloadState(destination);
++      if (single)
++        reloadState(ps1Slot(d));
++      reloadState(DOLIR_STATE_FPSCR);
++    };
++
++    if (directSingle || directRound) {
++      Value *fpscr = rawFPSCR();
++      Value *safe = defaultControls(fpscr);
++      Value *left = stateValue(fprSlot(op == DOLIR_EXACT_FRSP ? b : a));
++      Value *left32 = builder_.CreateFPTrunc(left, f32);
++      safe = builder_.CreateAnd(safe, finiteF32(left32));
++      Value *right = nullptr;
++      Value *right32 = nullptr;
++      if (directSingle) {
++        right = stateValue(fprSlot(rhsReg));
++        right32 = builder_.CreateFPTrunc(right, f32);
++        safe = builder_.CreateAnd(safe, finiteF32(right32));
++        if (op == DOLIR_EXACT_FDIVS) {
++          Value *nonzero = builder_.CreateFCmpONE(
++              right32, ConstantFP::get(f32, 0.0), "fp.divisor.nonzero");
++          safe = builder_.CreateAnd(safe, nonzero);
++        }
++      }
++
++      BasicBlock *fast = BasicBlock::Create(context_, "fp_direct", function_);
++      BasicBlock *slow = BasicBlock::Create(context_, "fp_exact", function_);
++      BasicBlock *join = BasicBlock::Create(context_, "fp_join", function_);
++      builder_.CreateCondBr(safe, fast, slow,
++                            MDBuilder(context_).createBranchWeights(4096, 1));
++
++      builder_.SetInsertPoint(fast);
++      Value *rounded = left32;
++      Value *fastFPSCR = fpscr;
++      if (directSingle) {
++        auto result = directBinary(op, left, right);
++        rounded = result.second;
++        fastFPSCR = setSingleRoundFlags(fastFPSCR, result.first, rounded);
++      } else {
++        fastFPSCR = builder_.CreateAnd(
++            fastFPSCR,
++            builder_.getInt32(~(0x00020000u | 0x00040000u)));
++      }
++      fastFPSCR = setFPRFF32(fastFPSCR, rounded);
++      Value *wide = builder_.CreateFPExt(rounded, f64);
++      builder_.CreateStore(wide, state_[destination]);
++      builder_.CreateStore(wide, state_[ps1Slot(d)]);
++      builder_.CreateStore(fastFPSCR, state_[DOLIR_STATE_FPSCR]);
++      builder_.CreateBr(join);
++
++      builder_.SetInsertPoint(slow);
++      emitLegacy();
++      builder_.CreateBr(join);
++      builder_.SetInsertPoint(join);
++      known_state_[destination] = nullptr;
++      known_state_[ps1Slot(d)] = nullptr;
++      known_state_[DOLIR_STATE_FPSCR] = nullptr;
++      pending_fprf_ = nullptr;
+     } else {
+-      auto callee = module_.getOrInsertFunction(
+-          name, FunctionType::get(Type::getVoidTy(context_),
+-                                  {ptr, Type::getInt8Ty(context_),
+-                                   Type::getInt8Ty(context_),
+-                                   Type::getInt8Ty(context_)},
+-                                  false));
+-      builder_.CreateCall(
+-          callee,
+-          {ctx_, builder_.getInt8(d), builder_.getInt8(a),
+-           builder_.getInt8(
+-               op == DOLIR_EXACT_FMULS || op == DOLIR_EXACT_FMUL ? c : b)});
++      emitLegacy();
+     }
+-    reloadState(destination);
+-    if (single)
+-      reloadState(ps1Slot(d));
+   } else if (op == DOLIR_EXACT_FCTIW || op == DOLIR_EXACT_FCTIWZ) {
++    syncState(DOLIR_STATE_FPSCR);
+     AllocaInst *output = temporary(Type::getInt64Ty(context_), "fctiw.result");
+     builder_.CreateStore(
+         builder_.CreateBitCast(old, Type::getInt64Ty(context_)), output);
+@@ -130,7 +352,9 @@ void FunctionEmitter::emitExactFloat(u64 descriptor) {
+         builder_.CreateLoad(Type::getInt64Ty(context_), output), f64);
+     builder_.CreateStore(builder_.CreateSelect(success, converted, old),
+                          state_[destination]);
++    reloadState(DOLIR_STATE_FPSCR);
+   } else if (op == DOLIR_EXACT_FRES || op == DOLIR_EXACT_FRSQRTE) {
++    syncState(DOLIR_STATE_FPSCR);
+     AllocaInst *output = temporary(f64, "estimate.result");
+     builder_.CreateStore(old, output);
+     const char *name = op == DOLIR_EXACT_FRES ? "ppc_fres" : "ppc_frsqrte";
+@@ -148,37 +372,92 @@ void FunctionEmitter::emitExactFloat(u64 descriptor) {
+       builder_.CreateStore(builder_.CreateSelect(success, estimate, oldPs1),
+                            state_[ps1]);
+     }
++    reloadState(DOLIR_STATE_FPSCR);
+   } else {
+     bool single = op >= DOLIR_EXACT_FMADDS && op <= DOLIR_EXACT_FNMSUBS;
+     bool subtract = op == DOLIR_EXACT_FMSUB || op == DOLIR_EXACT_FNMSUB ||
+                     op == DOLIR_EXACT_FMSUBS || op == DOLIR_EXACT_FNMSUBS;
+     bool negative = op == DOLIR_EXACT_FNMADD || op == DOLIR_EXACT_FNMSUB ||
+                     op == DOLIR_EXACT_FNMADDS || op == DOLIR_EXACT_FNMSUBS;
+-    AllocaInst *output = temporary(f64, "fma.result");
+-    builder_.CreateStore(old, output);
+-    auto callee = module_.getOrInsertFunction(
+-        "ppc_fma",
+-        FunctionType::get(Type::getInt1Ty(context_),
+-                          {ptr, f64, f64, f64, Type::getInt1Ty(context_),
+-                           Type::getInt1Ty(context_), Type::getInt1Ty(context_),
+-                           ptr},
+-                          false));
+-    Value *success = builder_.CreateCall(
+-        callee,
+-        {ctx_, stateValue(fprSlot(a)), stateValue(fprSlot(c)),
+-         stateValue(fprSlot(b)), builder_.getInt1(single),
+-         builder_.getInt1(subtract), builder_.getInt1(negative), output});
+-    Value *fused = builder_.CreateLoad(f64, output);
+-    builder_.CreateStore(builder_.CreateSelect(success, fused, old),
+-                         state_[destination]);
+-    if (single) {
+-      DolIRStateSlot ps1 = ps1Slot(d);
+-      Value *oldPs1 = stateValue(ps1);
+-      builder_.CreateStore(builder_.CreateSelect(success, fused, oldPs1),
+-                           state_[ps1]);
++    bool exactSingleInputs =
++        single && aExactSingle && bExactSingle && cExactSingle;
++
++    auto emitLegacyFMA = [&]() {
++      syncState(DOLIR_STATE_FPSCR);
++      AllocaInst *output = temporary(f64, "fma.result");
++      builder_.CreateStore(old, output);
++      auto callee = module_.getOrInsertFunction(
++          "ppc_fma",
++          FunctionType::get(
++              Type::getInt1Ty(context_),
++              {ptr, f64, f64, f64, Type::getInt1Ty(context_),
++               Type::getInt1Ty(context_), Type::getInt1Ty(context_), ptr},
++              false));
++      Value *success = builder_.CreateCall(
++          callee,
++          {ctx_, stateValue(fprSlot(a)), stateValue(fprSlot(c)),
++           stateValue(fprSlot(b)), builder_.getInt1(single),
++           builder_.getInt1(subtract), builder_.getInt1(negative), output});
++      Value *fused = builder_.CreateLoad(f64, output);
++      builder_.CreateStore(builder_.CreateSelect(success, fused, old),
++                           state_[destination]);
++      if (single) {
++        DolIRStateSlot ps1 = ps1Slot(d);
++        Value *oldPs1 = stateValue(ps1);
++        builder_.CreateStore(builder_.CreateSelect(success, fused, oldPs1),
++                             state_[ps1]);
++      }
++      reloadState(DOLIR_STATE_FPSCR);
++    };
++
++    if (exactSingleInputs) {
++      Value *fpscr = rawFPSCR();
++      Value *left = builder_.CreateFPTrunc(stateValue(fprSlot(a)), f32);
++      Value *multiplier =
++          builder_.CreateFPTrunc(stateValue(fprSlot(c)), f32);
++      Value *architecturalAddend =
++          builder_.CreateFPTrunc(stateValue(fprSlot(b)), f32);
++      Value *safe = defaultControls(fpscr);
++      safe = builder_.CreateAnd(safe, finiteF32(left));
++      safe = builder_.CreateAnd(safe, finiteF32(multiplier));
++      safe = builder_.CreateAnd(safe, finiteF32(architecturalAddend));
++
++      BasicBlock *fast = BasicBlock::Create(context_, "fma_direct", function_);
++      BasicBlock *slow = BasicBlock::Create(context_, "fma_exact", function_);
++      BasicBlock *join = BasicBlock::Create(context_, "fma_join", function_);
++      builder_.CreateCondBr(safe, fast, slow,
++                            MDBuilder(context_).createBranchWeights(4096, 1));
++
++      builder_.SetInsertPoint(fast);
++      Value *addend = subtract
++                          ? builder_.CreateFNeg(architecturalAddend)
++                          : architecturalAddend;
++      // f32 FMA is the architectural single fused operation directly. Using
++      // host f32 avoids the double-rounding correction needed by the legacy
++      // helper's f64-fma-then-f32 implementation.
++      Value *rounded = constrainedPairFMA(left, multiplier, addend);
++      if (negative)
++        rounded = builder_.CreateFNeg(rounded);
++      Value *fastFPSCR = setFPRFF32(fpscr, rounded);
++      Value *wide = builder_.CreateFPExt(rounded, f64);
++      builder_.CreateStore(wide, state_[destination]);
++      builder_.CreateStore(wide, state_[ps1Slot(d)]);
++      builder_.CreateStore(fastFPSCR, state_[DOLIR_STATE_FPSCR]);
++      builder_.CreateBr(join);
++
++      builder_.SetInsertPoint(slow);
++      emitLegacyFMA();
++      builder_.CreateBr(join);
++      builder_.SetInsertPoint(join);
++      known_state_[destination] = nullptr;
++      known_state_[ps1Slot(d)] = nullptr;
++      known_state_[DOLIR_STATE_FPSCR] = nullptr;
++      pending_fprf_ = nullptr;
++    } else if (!single) {
++      // v186: scalar double FMA fast path. The exact helper only needs its
++      // NaN/Inf/invalid machinery for non-finite operands. Finite f64 inputs
++      // stay entirely in LLVM and use the same dynamic host rounding mode.
++      Value *fpscr = rawFPSCR();
++      Value *left = stateValue(fprSlot(a));
++      Value *multiplier = stateValue(fprSlot(c));
++      Value *architecturalAddend = stateValue(fprSlot(b));
++      Value *safe = finiteF64(left);
++      safe = builder_.CreateAnd(safe, finiteF64(multiplier));
++      safe = builder_.CreateAnd(safe, finiteF64(architecturalAddend));
++
++      BasicBlock *fast =
++          BasicBlock::Create(context_, "fma_f64_direct", function_);
++      BasicBlock *slow =
++          BasicBlock::Create(context_, "fma_f64_exact", function_);
++      BasicBlock *join =
++          BasicBlock::Create(context_, "fma_f64_join", function_);
++      builder_.CreateCondBr(safe, fast, slow,
++                            MDBuilder(context_).createBranchWeights(16384, 1));
++
++      builder_.SetInsertPoint(fast);
++      Value *addend = subtract
++                          ? builder_.CreateFNeg(architecturalAddend)
++                          : architecturalAddend;
++      Value *fused = constrainedPairFMA(left, multiplier, addend);
++      if (negative)
++        fused = builder_.CreateFNeg(fused);
++      Value *fastFPSCR = setFPRFF64(fpscr, fused);
++      builder_.CreateStore(fused, state_[destination]);
++      builder_.CreateStore(fastFPSCR, state_[DOLIR_STATE_FPSCR]);
++      builder_.CreateBr(join);
++
++      builder_.SetInsertPoint(slow);
++      emitLegacyFMA();
++      builder_.CreateBr(join);
++
++      builder_.SetInsertPoint(join);
++      known_state_[destination] = nullptr;
++      known_state_[DOLIR_STATE_FPSCR] = nullptr;
++      pending_fprf_ = nullptr;
++    } else {
++      emitLegacyFMA();
+     }
+   }
+-  reloadState(DOLIR_STATE_FPSCR);
++
+   bool singleResult = (op >= DOLIR_EXACT_FADDS && op <= DOLIR_EXACT_FDIVS) ||
+                       op == DOLIR_EXACT_FRSP ||
+                       (op >= DOLIR_EXACT_FMADDS && op <= DOLIR_EXACT_FNMSUBS);
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+index eb6b9d8..56869b4 100644
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -5,2 +5,4 @@
+ #include <llvm/ADT/SmallVector.h>
+ #include <llvm/IR/Constants.h>
++#include <llvm/IR/Instructions.h>
++#include <llvm/IR/Intrinsics.h>
+@@ -48,17 +50,50 @@ void FunctionEmitter::invalidateFPRepresentations() {
+ }
+
+ void FunctionEmitter::noteStateWrite(DolIRStateSlot slot, Value *value) {
++  // Universal exact-f32 provenance used by direct scalar lowering. lfs is an
++  // f32->f64 extension; fmr/fneg/fabs/fnabs preserve that property. This is a
++  // compile-time fact only: no game address or symbol is special-cased.
++  auto exactSingleValue = [&](Value *candidate) {
++    for (u32 depth = 0; candidate && depth < 6; depth++) {
++      if (auto *extend = dyn_cast<FPExtInst>(candidate))
++        return extend->getSrcTy()->isFloatTy() &&
++               extend->getDestTy()->isDoubleTy();
++      if (auto *load = dyn_cast<LoadInst>(candidate)) {
++        Value *pointer = load->getPointerOperand();
++        for (u32 source = 0; source < 32; source++) {
++          if (pointer == state_[DOLIR_STATE_FPR0 + source])
++            return fp_exact_single_[source];
++        }
++        return false;
++      }
++      if (auto *call = dyn_cast<CallInst>(candidate)) {
++        if (call->getIntrinsicID() == Intrinsic::fabs) {
++          candidate = call->getArgOperand(0);
++          continue;
++        }
++      }
++      if (auto *instruction = dyn_cast<Instruction>(candidate)) {
++        if (instruction->getOpcode() == Instruction::FNeg) {
++          candidate = instruction->getOperand(0);
++          continue;
++        }
++      }
++      return false;
++    }
++    return false;
++  };
++  const bool exactSingle = exactSingleValue(value);
+   known_state_[slot] = dyn_cast<ConstantInt>(value);
+   if (slot >= DOLIR_STATE_FPR0 && slot <= DOLIR_STATE_FPR31) {
+     u32 reg = slot - DOLIR_STATE_FPR0;
+     fp_rep_[reg] = FPRepresentation::Raw;
+-    fp_exact_single_[reg] = false;
++    fp_exact_single_[reg] = exactSingle;
+     fp_denormal_safe_[reg] = false;
+     fp_value_class_[reg] = FPValueClass::Unknown;
+   } else if (slot >= DOLIR_STATE_PS1_0 && slot <= DOLIR_STATE_PS1_31) {
+     u32 reg = slot - DOLIR_STATE_PS1_0;
+     fp_rep_[reg] = FPRepresentation::Raw;
+-    fp_exact_single_[reg] = false;
++    fp_exact_single_[reg] = fp_exact_single_[reg] && exactSingle;
+     fp_denormal_safe_[reg] = false;
+     fp_value_class_[reg] = FPValueClass::Unknown;
+   } else if (slot == DOLIR_STATE_FPSCR) {

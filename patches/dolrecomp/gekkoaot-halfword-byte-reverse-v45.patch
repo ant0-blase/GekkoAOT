@@ -1,0 +1,36 @@
+diff --git a/src/ir/dolir_builder.c b/src/ir/dolir_builder.c
+index 5603315..1dab905 100644
+--- a/src/ir/dolir_builder.c
++++ b/src/ir/dolir_builder.c
+@@ -680,13 +680,27 @@ static bool lower_memory(Builder* b) {
+         DolIRValue address = effective_address(b, indexed, update);
+         if (load) {
+             DolIRValue value = guest_load(b, address, width, sign);
+-            if (reverse)
+-                value = unary(b, DOLIR_OP_BSWAP, DOLIR_TYPE_I32, value);
++            if (reverse) {
++                if (width == 2) {
++                    value = unary(b, DOLIR_OP_TRUNC, DOLIR_TYPE_I16, value);
++                    value = unary(b, DOLIR_OP_BSWAP, DOLIR_TYPE_I16, value);
++                    value = unary(b, DOLIR_OP_ZEXT, DOLIR_TYPE_I32, value);
++                } else {
++                    value = unary(b, DOLIR_OP_BSWAP, DOLIR_TYPE_I32, value);
++                }
++            }
+             set_gpr(b, i->rD, value);
+         } else {
+             DolIRValue value = gpr(b, i->rS);
+-            if (reverse)
+-                value = unary(b, DOLIR_OP_BSWAP, DOLIR_TYPE_I32, value);
++            if (reverse) {
++                if (width == 2) {
++                    value = unary(b, DOLIR_OP_TRUNC, DOLIR_TYPE_I16, value);
++                    value = unary(b, DOLIR_OP_BSWAP, DOLIR_TYPE_I16, value);
++                    value = unary(b, DOLIR_OP_ZEXT, DOLIR_TYPE_I32, value);
++                } else {
++                    value = unary(b, DOLIR_OP_BSWAP, DOLIR_TYPE_I32, value);
++                }
++            }
+             guest_store(b, address, value, width);
+         }
+         if (update)

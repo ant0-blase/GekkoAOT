@@ -314,6 +314,65 @@ void NativeVI::UpdateInterruptTargets(std::uint64_t phase_begin,
   }
 }
 
+std::uint64_t NativeVI::CyclesUntilNextInterrupt() const {
+  constexpr std::uint64_t kNever = std::numeric_limits<std::uint64_t>::max();
+  if ((regs_[kControl / 2u] & kControlEnable) == 0u) return kNever;
+  if (InterruptPending()) return 0u;
+
+  const std::uint64_t ticks = std::max<std::uint32_t>(TicksPerHalfLine(), 1u);
+  const std::uint64_t hlw = std::max<std::uint32_t>(HorizontalLineWidth(), 1u);
+  const std::uint64_t frame_halflines = std::max<std::uint32_t>(HalfLinesPerFrame(), 1u);
+  const std::uint64_t frame_cycles = frame_halflines * ticks;
+  const std::uint64_t current =
+      static_cast<std::uint64_t>(half_line_count_) * ticks + cycles_into_half_line_;
+
+  std::uint64_t best = kNever;
+  for (std::uint32_t irq : InterruptOffsets) {
+    const std::uint32_t reg = Pair32(irq);
+    if ((reg & kInterruptMaskBit) == 0u) continue;
+    if ((reg & kInterruptStatusBit) != 0u) return 0u;
+
+    const std::uint32_t hct = reg & 0x07ffu;
+    const std::uint32_t vct = (reg >> 16) & 0x07ffu;
+    if (vct == 0u || hct == 0u || hct > 2u * hlw) continue;
+
+    const std::uint64_t target_halfline =
+        2ull * static_cast<std::uint64_t>(vct - 1u) +
+        (hct > hlw ? 1ull : 0ull);
+    if (target_halfline >= frame_halflines) continue;
+
+    const std::uint64_t first_sample = hct > hlw ? hlw + 1ull : 1ull;
+    const std::uint64_t sample_offset = static_cast<std::uint64_t>(hct) - first_sample;
+    const std::uint64_t phase = (sample_offset * ticks + hlw - 1ull) / hlw;
+    const std::uint64_t target = target_halfline * ticks + phase;
+
+    std::uint64_t delta = target >= current
+        ? target - current
+        : frame_cycles - current + target;
+    // A not-yet-latched comparator exactly at the current beam position needs
+    // one hardware tick to pass through UpdateInterruptTargets().
+    if (delta == 0u) delta = 1u;
+    best = std::min(best, delta);
+  }
+  return best;
+}
+
+std::uint64_t NativeVI::CyclesUntilNextFrameBoundary() const {
+  constexpr std::uint64_t kNever = std::numeric_limits<std::uint64_t>::max();
+  if ((regs_[kControl / 2u] & kControlEnable) == 0u) return kNever;
+
+  const std::uint64_t ticks = std::max<std::uint32_t>(TicksPerHalfLine(), 1u);
+  const std::uint64_t frame_halflines =
+      std::max<std::uint32_t>(HalfLinesPerFrame(), 1u);
+  const std::uint64_t frame_cycles = frame_halflines * ticks;
+  const std::uint64_t current =
+      static_cast<std::uint64_t>(half_line_count_) * ticks +
+      cycles_into_half_line_;
+  if (current >= frame_cycles) return 1u;
+  const std::uint64_t remaining = frame_cycles - current;
+  return remaining == 0u ? 1u : remaining;
+}
+
 void NativeVI::AdvanceCycles(std::uint64_t cycles) {
   if ((regs_[kControl / 2u] & kControlEnable) == 0u) return;
 

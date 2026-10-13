@@ -1,0 +1,57 @@
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -109,8 +109,13 @@
+   if (read && width == 2u && !(physical & 1u)) {
+     if (physical >= 0x0c000000u && physical < 0x0c001000u)
+       symbol = "gekkoaot_cp_read16";
++    else if (physical >= 0x0c001000u && physical <= 0x0c00100eu)
++      symbol = "gekkoaot_stable_mmio_read";
+     else if (physical >= 0x0c002000u && physical <= 0x0c002074u)
+       symbol = "gekkoaot_vi_read16";
++  } else if (read && width == 4u &&
++             (physical == 0x0c003000u || physical == 0x0c003004u)) {
++    symbol = "gekkoaot_stable_mmio_read";
+   } else if (!read) {
+     if (width == 4u && !(physical & 3u) &&
+         physical >= 0x0c003000u && physical < 0x0c004000u)
+--- a/src/backend/llvm/memory_service.cpp
++++ b/src/backend/llvm/memory_service.cpp
+@@ -67,6 +67,38 @@
+     builder_.SetInsertPoint(resume);
+     reloadCallCounters();
+     return builder_.CreateExtractValue(result, 0);
++  }
++
++  // GEKKOAOT_STABLE_MMIO_V280: the optional service reads scalar mirrors
++  // only when there is no producer work or unpublished PE event. It touches
++  // the read epoch, never guest registers/control state. A refusal is effect
++  // free and enters the original fully materialized memory service.
++  if (nativeSymbol && (!std::strcmp(nativeSymbol, "gekkoaot_cp_read16") ||
++                       !std::strcmp(nativeSymbol, "gekkoaot_stable_mmio_read"))) {
++    Type *pointer = PointerType::getUnqual(context_);
++    auto tryType = FunctionType::get(Type::getInt64Ty(context_),
++        {pointer, Type::getInt32Ty(context_), Type::getInt8Ty(context_)}, false);
++    Value *packed = builder_.CreateCall(module_.getOrInsertFunction(
++        "gekkoaot_try_stable_mmio_read", tryType),
++        {ctx_, address, builder_.getInt8(width)});
++    BasicBlock *direct = BasicBlock::Create(context_, "stable_mmio_read", function_);
++    BasicBlock *fallback = BasicBlock::Create(context_, "stable_mmio_fallback", function_);
++    BasicBlock *join = BasicBlock::Create(context_, "stable_mmio_join", function_);
++    builder_.CreateCondBr(builder_.CreateICmpNE(builder_.CreateLShr(packed, 63),
++                                              builder_.getInt64(0)), direct, fallback);
++    builder_.SetInsertPoint(direct);
++    Value *value = builder_.CreateAnd(packed, builder_.getInt64(0xffffffffull));
++    builder_.CreateBr(join);
++    BasicBlock *directEnd = builder_.GetInsertBlock();
++    builder_.SetInsertPoint(fallback);
++    Value *generic = externalRead(address, width, nullptr);
++    builder_.CreateBr(join);
++    BasicBlock *fallbackEnd = builder_.GetInsertBlock();
++    builder_.SetInsertPoint(join);
++    PHINode *result = builder_.CreatePHI(Type::getInt64Ty(context_), 2);
++    result->addIncoming(value, directEnd);
++    result->addIncoming(generic, fallbackEnd);
++    return result;
+   }
+ 
+   Type *pointer = PointerType::getUnqual(context_);

@@ -37,10 +37,20 @@ public:
   bool Write(std::uint32_t address, std::uint64_t value, std::uint8_t size);
   void AdvanceCycles(std::uint64_t cycles);
   void SetAudioSampleRateHz(std::uint32_t hz) { audio_sample_rate_hz_ = hz ? hz : 32028u; }
+  using AuxiliaryAudioSource = void (*)(void*, std::int16_t*, std::size_t,
+                                        std::uint32_t);
+  void SetAuxiliaryAudioSource(AuxiliaryAudioSource source, void* user) {
+    auxiliary_audio_source_ = source;
+    auxiliary_audio_user_ = user;
+  }
 
   // PI sees one DSP interrupt source. The DSP_CONTROL cause bits and their
   // adjacent mask bits decide whether that source is asserted.
   bool InterruptPending() const;
+  // Earliest known time-driven DSP/AID event that may wake the PPC. The
+  // runtime still applies a bounded maintenance deadline for opaque DSP-core
+  // work, so max() here is safe for event-driven idle parking.
+  std::uint64_t CyclesUntilInterrupt() const;
 
   // Native-core boundary. The MMIO layer accepts CPU mail independently of
   // whatever native ucode/core implementation is attached later.
@@ -49,8 +59,8 @@ public:
 
   std::uint8_t ReadAram(std::uint32_t address) const;
   void WriteAram(std::uint32_t address, std::uint8_t value);
-  const std::vector<std::uint8_t>& Aram() const { return aram_; }
-  std::vector<std::uint8_t>& Aram() { return aram_; }
+  std::span<const std::uint8_t> Aram() const { return aram_; }
+  std::span<std::uint8_t> Aram() { return aram_; }
 
   std::uint16_t Control() const { return control_; }
   std::uint32_t CpuMailbox() const { return cpu_mail_visible_; }
@@ -86,6 +96,14 @@ public:
   // interrupt operations, not Dolphin Core callbacks.
   bool CoreReadMain(std::uint32_t address, std::uint8_t* dst, std::uint32_t size) const;
   bool CoreWriteMain(std::uint32_t address, const std::uint8_t* src, std::uint32_t size);
+  // Native audio hot paths may borrow a contiguous MEM1/MEM2 span for the
+  // duration of one synchronous DSP work item. This has the same address
+  // semantics as CoreReadMain/CoreWriteMain, but avoids thousands of tiny
+  // Resolve+memcpy calls when walking JAudio VPBs.
+  const std::uint8_t* CoreResolveMain(std::uint32_t address, std::uint32_t size) const;
+  std::uint8_t* CoreResolveMain(std::uint32_t address, std::uint32_t size);
+  bool CoreReadAram(std::uint32_t address, std::uint8_t* dst, std::uint32_t size) const;
+  bool CoreWriteAram(std::uint32_t address, const std::uint8_t* src, std::uint32_t size);
   void RequestCoreInterrupt();
   void FlushAudioSink() { audio_sink_.Flush(); }
 
@@ -115,7 +133,9 @@ private:
   NativeAXHLE ax_hle_;
   NativeJAudioHLE jaudio_hle_;
   NativeAudioSink audio_sink_;
-  std::vector<std::uint8_t> aram_;
+  AuxiliaryAudioSource auxiliary_audio_source_ = nullptr;
+  void* auxiliary_audio_user_ = nullptr;
+  Native::GuestRam aram_;
   std::array<std::uint16_t, IramWords> iram_{};
   std::array<std::uint16_t, DramWords> dram_{};
 
@@ -134,6 +154,10 @@ private:
   std::uint32_t aram_dma_mmaddr_ = 0;
   std::uint32_t aram_dma_araddr_ = 0;
   std::uint32_t aram_dma_count_ = 0;
+  // ARAM data becomes visible immediately in our host model, matching Dolphin's
+  // practical implementation, but the hardware DMA busy bit and completion IRQ
+  // remain delayed. Retail code can observe that completion boundary.
+  std::uint64_t aram_dma_completion_cycles_ = 0;
 
   std::uint32_t audio_dma_source_ = 0;
   std::uint16_t audio_dma_blocks_length_ = 0;
@@ -161,8 +185,8 @@ private:
   bool sdk_bootstrap_completed_ = false;
   // RESET enters the ROM task loader. DSPInit 1->0 instead uploads the
   // audio-system initialization program from MEM1; these are distinct boots.
-  bool rom_loader_active_ = true;
-  bool rom_loader_ready_pending_ = true;
+  bool rom_loader_active_ = false;
+  bool rom_loader_ready_pending_ = false;
 
   std::uint8_t sdk_task_loader_stage_ = 0;
   std::uint32_t sdk_task_code_address_ = 0;
@@ -182,6 +206,10 @@ private:
   // Keep a tiny protocol state machine so callback-driven setup can complete
   // without game/address-specific hooks.
   bool sdk_romless_task_active_ = false;
+  bool sdk_romless_light_protocol_ = false;
+  bool sdk_romless_light_sync_pending_ = false;
+  std::array<std::uint32_t, 3> sdk_romless_light_sync_words_{};
+  std::uint8_t sdk_romless_light_frames_left_ = 0;
   bool sdk_romless_commands_ready_ = false;
   std::uint8_t sdk_romless_command_words_expected_ = 0;
   std::uint8_t sdk_romless_command_words_seen_ = 0;

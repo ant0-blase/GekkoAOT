@@ -1,0 +1,40 @@
+diff --git a/src/backend/llvm/passes.cpp b/src/backend/llvm/passes.cpp
+--- a/src/backend/llvm/passes.cpp
++++ b/src/backend/llvm/passes.cpp
+@@ -110,1 +110,25 @@
++// CrossGameDB supplies normalized PPC matches, never executable replacements.
++// Unlike adaptiveHot(), this does not alter state residency or guest lowering.
++static u32 markCrossGameHotFunctions(Module &module) {
++  const char *path = std::getenv("DOLRECOMP_CROSSGAME_HOT_FUNCTIONS");
++  if (!path || !*path) return 0;
++  std::ifstream input(path);
++  std::string symbol;
++  u32 marked = 0;
++  while (std::getline(input, symbol)) {
++    if (!symbol.empty() && symbol.back() == '\r') symbol.pop_back();
++    if (symbol.size() != 20 || symbol.compare(0, 5, "func_") != 0 ||
++        symbol.compare(13, 7, "_budget") != 0 ||
++        symbol.find_first_not_of("0123456789abcdefABCDEF", 5) != 13)
++      continue;
++    if (Function *function = module.getFunction(symbol)) {
++      if (!function->hasFnAttribute(Attribute::Hot)) {
++        function->addFnAttr(Attribute::Hot);
++        ++marked;
++      }
++    }
++  }
++  return marked;
++}
++
+ static OptimizationLevel optimizationLevel(int level) {
+@@ -125,3 +151,10 @@
+   if (options.profile_use_path && options.profile_use_path[0])
+     markAdaptiveHotFunctions(module);
++  // Instrumented builds and profile-use builds ignore these hints. This
++  // prevents a database update between collection/use from changing CFG hashes
++  // and lets measured per-title counters decide every PGO hot/cold decision.
++  if (!pgo) {
++    const auto marked = markCrossGameHotFunctions(module);
++    if (marked) diagnostics << "CrossGameDB optimizer hot hints=" << marked << "\n";
++  }
+   ModulePassManager pipeline = builder.buildPerModuleDefaultPipeline(

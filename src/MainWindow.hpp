@@ -99,7 +99,18 @@ private:
     QString m_aspectMode = "4:3";
     bool m_fullscreen = false;
     bool m_showFps = true;
+    bool m_frameInterpolation = false;
     int m_fpsLimit = 120;
+    int m_msaaSamples = 1;
+    int m_textureAnisotropy = 16;
+    bool m_postProcessing = true;
+    QString m_postPreset = "balanced";
+    double m_postSharpen = 0.28;
+    double m_postBloom = 0.10;
+    double m_postVignette = 0.06;
+    double m_postGrain = 0.0;
+    double m_postTone = 0.15;
+    double m_postLocalContrast = 0.08;
     QStringList m_controllers;
 
     QWidget* m_viewFrame = nullptr;
@@ -124,6 +135,9 @@ private:
     QComboBox* m_profile = nullptr;
     QComboBox* m_toolchain = nullptr;
     QComboBox* m_nativeAbi = nullptr;
+    QCheckBox* m_nativeOsCheck = nullptr;
+    QCheckBox* m_nativeHwCheck = nullptr;
+    QComboBox* m_runtimeWorkers = nullptr;
     QLineEdit* m_llvmDir = nullptr;
     QPushButton* m_llvmBrowse = nullptr;
     QSpinBox* m_jobs = nullptr;

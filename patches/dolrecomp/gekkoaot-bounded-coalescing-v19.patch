@@ -1,0 +1,50 @@
+--- a/src/backend/llvm/passes.cpp
++++ b/src/backend/llvm/passes.cpp
+@@ -14,14 +14,27 @@
+ #include <string>
+ #include <unordered_set>
+ 
+-static void configureGekkoAOTLlvmOptions(const DolLLVMOptions &options) {
+-  if (!options.profile_generate_path || !options.profile_generate_path[0])
+-    return;
++static void configureGekkoAOTLlvmOptions(const DolLLVMOptions &) {
+ 
+   static std::once_flag once;
+   std::call_once(once, [] {
+-    const char *argv[] = {"dolrecomp"};
+-    llvm::cl::ParseCommandLineOptions(1, argv, "", nullptr,
++    // Native resume entries create large live ranges. Bound repeated expensive
++    // joins while retaining the normal allocator and O3 IR optimizations.
++    // LLVM already uses these thresholds to cap coalescing compile time.
++    const auto limit = [](const char *name, unsigned fallback) {
++      const char *text = std::getenv(name);
++      if (!text || !*text) return fallback;
++      char *end = nullptr;
++      const auto value = std::strtoul(text, &end, 10);
++      return end && !*end && value >= 1 && value <= 4096
++                 ? static_cast<unsigned>(value) : fallback;
++    };
++    const std::string size = "-large-interval-size-threshold=" +
++        std::to_string(limit("DOLRECOMP_LLVM_COALESCE_SIZE", 100));
++    const std::string frequency = "-large-interval-freq-threshold=" +
++        std::to_string(limit("DOLRECOMP_LLVM_COALESCE_LIMIT", 32));
++    const char *argv[] = {"dolrecomp", size.c_str(), frequency.c_str()};
++    llvm::cl::ParseCommandLineOptions(3, argv, "", nullptr,
+                                       "DOLRECOMP_LLVM_OPTIONS");
+   });
+ }
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -289,6 +289,12 @@
+     if (!codegen_level || !codegen_level[0])
+         codegen_level = "2";
+     hash = hash_bytes(hash, codegen_level, strlen(codegen_level));
++    const char* coalesce_size = getenv("DOLRECOMP_LLVM_COALESCE_SIZE");
++    const char* coalesce_limit = getenv("DOLRECOMP_LLVM_COALESCE_LIMIT");
++    if (!coalesce_size || !*coalesce_size) coalesce_size = "100";
++    if (!coalesce_limit || !*coalesce_limit) coalesce_limit = "32";
++    hash = hash_bytes(hash, coalesce_size, strlen(coalesce_size));
++    hash = hash_bytes(hash, coalesce_limit, strlen(coalesce_limit));
+     const char* write_journal = getenv("DOLRECOMP_LLVM_WRITE_JOURNAL");
+     if (!write_journal)
+         write_journal = "0";

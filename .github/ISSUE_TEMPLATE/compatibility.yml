@@ -27,7 +27,7 @@ body:
     attributes:
       label: GekkoAOT revision
       description: Commit SHA or release tag.
-      placeholder: v0.0.1 or abcdef12
+      placeholder: v0.0.7 or abcdef12
     validations:
       required: true
   - type: dropdown

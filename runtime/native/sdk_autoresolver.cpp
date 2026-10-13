@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "sdk/dvd_fst_service.h"
+#include "sdk/gx_normal_service.h"
+#include "sdk/gx_array_service.h"
 #include "native/sdk_autoresolver.h"
 
 #include "native/runtime.h"
 #include "sdk/os_primitives.h"
+#include "sdk/debug_corpus_signatures_v33.h"
+#include "sdk/sdk_service_corpus_v1.h"
 #include "sdk/sdk_groundtruth_v1.h"
 
 #include <algorithm>
@@ -77,7 +82,44 @@ std::optional<SimpleHleKind> SimpleKindForName(std::string_view name) {
   if (name == "memset" || name == "__memset") return SimpleHleKind::Memset;
   if (name == "memcmp") return SimpleHleKind::Memcmp;
   if (name == "bzero") return SimpleHleKind::Bzero;
+  if (name == "strlen") return SimpleHleKind::Strlen;
+  if (name == "strcmp") return SimpleHleKind::Strcmp;
+  if (name == "strncmp") return SimpleHleKind::Strncmp;
+  if (name == "strcpy") return SimpleHleKind::Strcpy;
+  if (name == "strncpy") return SimpleHleKind::Strncpy;
+  if (name == "strcat") return SimpleHleKind::Strcat;
+  if (name == "strchr") return SimpleHleKind::Strchr;
+  if (name == "strrchr") return SimpleHleKind::Strrchr;
+  if (name == "memchr") return SimpleHleKind::Memchr;
+  if (name == "strstr") return SimpleHleKind::Strstr;
+  if (name == "strncat") return SimpleHleKind::Strncat;
+  if (name == "strnlen") return SimpleHleKind::Strnlen;
+  if (name == "strcspn") return SimpleHleKind::Strcspn;
+  if (name == "strpbrk") return SimpleHleKind::Strpbrk;
+  if (name == "DCFlushRange") return SimpleHleKind::DcFlushRange;
+  if (name == "DCFlushRangeNoSync") return SimpleHleKind::DcFlushRangeNoSync;
+  if (name == "DCStoreRange") return SimpleHleKind::DcStoreRange;
+  if (name == "DCStoreRangeNoSync") return SimpleHleKind::DcStoreRangeNoSync;
+  if (name == "DCInvalidateRange") return SimpleHleKind::DcInvalidateRange;
+  if (name == "DCZeroRange") return SimpleHleKind::DcZeroRange;
+  if (name == "DCTouchRange") return SimpleHleKind::DcTouchRange;
+  if (name == "ICInvalidateRange") return SimpleHleKind::IcInvalidateRange;
+  if (name == "GXLoadPosMtxImm") return SimpleHleKind::GxLoadPosMtxImm;
+  if (name == "GXLoadTexMtxImm") return SimpleHleKind::GxLoadTexMtxImm;
+  if (name == "GXLoadNrmMtxImm") return SimpleHleKind::GxLoadNrmMtxImm;
+  if (name == "GXLoadNrmMtxImm3x3") return SimpleHleKind::GxLoadNrmMtxImm3x3;
+  if (name == "DVDFastOpen") return SimpleHleKind::DvdFastOpen;
+  if (name == "GXSetArray") return SimpleHleKind::GxSetArray;
+  // Stable name decoding also loads manifests when a runtime switch is off.
+  if (name == "PADRead") return SimpleHleKind::PadRead;
   return std::nullopt;
+}
+
+bool IsGxMatrixKind(SimpleHleKind kind) {
+  return kind == SimpleHleKind::GxLoadPosMtxImm ||
+         kind == SimpleHleKind::GxLoadTexMtxImm ||
+         kind == SimpleHleKind::GxLoadNrmMtxImm ||
+         kind == SimpleHleKind::GxLoadNrmMtxImm3x3;
 }
 
 const char* SimpleKindName(SimpleHleKind kind) {
@@ -89,8 +131,70 @@ const char* SimpleKindName(SimpleHleKind kind) {
   case SimpleHleKind::Memset: return "memset";
   case SimpleHleKind::Memcmp: return "memcmp";
   case SimpleHleKind::Bzero: return "bzero";
+  case SimpleHleKind::Strlen: return "strlen";
+  case SimpleHleKind::Strcmp: return "strcmp";
+  case SimpleHleKind::Strncmp: return "strncmp";
+  case SimpleHleKind::Strcpy: return "strcpy";
+  case SimpleHleKind::Strncpy: return "strncpy";
+  case SimpleHleKind::Strcat: return "strcat";
+  case SimpleHleKind::Strchr: return "strchr";
+  case SimpleHleKind::Strrchr: return "strrchr";
+  case SimpleHleKind::Memchr: return "memchr";
+  case SimpleHleKind::Strstr: return "strstr";
+  case SimpleHleKind::Strncat: return "strncat";
+  case SimpleHleKind::Strnlen: return "strnlen";
+  case SimpleHleKind::Strcspn: return "strcspn";
+  case SimpleHleKind::Strpbrk: return "strpbrk";
+  case SimpleHleKind::DcFlushRange: return "DCFlushRange";
+  case SimpleHleKind::DcFlushRangeNoSync: return "DCFlushRangeNoSync";
+  case SimpleHleKind::DcStoreRange: return "DCStoreRange";
+  case SimpleHleKind::DcStoreRangeNoSync: return "DCStoreRangeNoSync";
+  case SimpleHleKind::DcInvalidateRange: return "DCInvalidateRange";
+  case SimpleHleKind::DcZeroRange: return "DCZeroRange";
+  case SimpleHleKind::DcTouchRange: return "DCTouchRange";
+  case SimpleHleKind::IcInvalidateRange: return "ICInvalidateRange";
+  case SimpleHleKind::GxLoadPosMtxImm: return "GXLoadPosMtxImm";
+  case SimpleHleKind::GxLoadTexMtxImm: return "GXLoadTexMtxImm";
+  case SimpleHleKind::PadRead: return "PADRead";
+  case SimpleHleKind::DvdFastOpen: return "DVDFastOpen";
+  case SimpleHleKind::GxSetArray: return "GXSetArray";
+  case SimpleHleKind::GxLoadNrmMtxImm: return "GXLoadNrmMtxImm";
+  case SimpleHleKind::GxLoadNrmMtxImm3x3: return "GXLoadNrmMtxImm3x3";
+  case SimpleHleKind::Count: break;
   }
   return "?";
+}
+
+
+struct DebugCorpusHashV33 {
+  std::uint64_t h1 = 0xcbf29ce484222325ull;
+  std::uint64_t h2 = 0x9e3779b97f4a7c15ull;
+};
+
+DebugCorpusHashV33 HashDebugCorpusShapeV33(const GekkoAOTSdk::StructuralShape& shape) {
+  DebugCorpusHashV33 out;
+  for (const std::uint32_t value : shape.skeleton) {
+    out.h1 ^= value;
+    out.h1 *= 0x100000001b3ull;
+    out.h2 ^= value + 0x9e3779b9ull + (out.h2 << 6u) + (out.h2 >> 2u);
+    out.h2 *= 0xbf58476d1ce4e5b9ull;
+  }
+  return out;
+}
+
+bool MatchesDebugCorpusV33(const std::uint8_t* code,
+                           const GekkoAOTSdk::DebugCorpusSignatureV33& sig) {
+  if (!code || sig.size < 4u || (sig.size & 3u)) return false;
+  const auto shape = GekkoAOTSdk::BuildStructuralShape(code, sig.size);
+  if (shape.size != sig.size || shape.skeleton.size() < 3u ||
+      shape.direct_calls != sig.direct_calls || shape.branches != sig.branches ||
+      shape.returns != sig.returns || shape.stack_frame != sig.stack_frame)
+    return false;
+  if (shape.skeleton[0] != sig.prefix[0] || shape.skeleton[1] != sig.prefix[1] ||
+      shape.skeleton[2] != sig.prefix[2])
+    return false;
+  const auto hash = HashDebugCorpusShapeV33(shape);
+  return hash.h1 == sig.h1 && hash.h2 == sig.h2;
 }
 
 constexpr std::uint32_t kStaticDirectOsBase = 0xfffd0000u;
@@ -99,8 +203,11 @@ constexpr std::uint32_t kStaticDirectSimpleBase = 0xfffc0000u;
 std::uint32_t StaticDirectToken(std::string_view name) {
   if (const auto kind = OsKindForName(name))
     return kStaticDirectOsBase | static_cast<std::uint8_t>(*kind);
-  if (const auto kind = SimpleKindForName(name))
+  if (const auto kind = SimpleKindForName(name)) {
+    if (IsGxMatrixKind(*kind) && !EnvEnabled("GEKKOAOT_GX_MATRIX_HLE", true))
+      return 0u;
     return kStaticDirectSimpleBase | static_cast<std::uint8_t>(*kind);
+  }
   return 0u;
 }
 
@@ -548,6 +655,12 @@ void RepairSemanticOsIdentities(Resolver& resolver) {
 
 } // namespace
 
+const char* SimpleServiceName(unsigned kind) {
+  return kind < static_cast<unsigned>(SimpleHleKind::Count)
+             ? SimpleKindName(static_cast<SimpleHleKind>(kind))
+             : "?";
+}
+
 NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
                                            const std::filesystem::path& manifest_output) {
   std::vector<std::pair<std::uint32_t, std::string>> manifest_hooks;
@@ -649,6 +762,167 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
       resolver.MarkAmbiguous(pc);
       ++stats.ambiguous_functions;
     }
+  }
+
+
+  // v33: user-supplied debug ELFs exposed several SDK/MSL leaves that are not
+  // present in the old ground-truth corpus (notably ICInvalidateRange,
+  // DC*RangeNoSync and common string helpers).  Admit only exact structural
+  // fingerprints at already-proven direct call targets.  Fingerprints contain
+  // normalized instruction metadata/hashes only; no proprietary code bytes.
+  for (const auto pc : direct_targets) {
+    if (discovered.contains(pc)) continue;
+    const auto* range = ContainingRange(ranges, pc);
+    if (!range || pc + 12u > range->end) continue;
+    std::set<std::string_view> names;
+    std::uint32_t selected_size = 0xffffffffu;
+    for (const auto& sig : GekkoAOTSdk::kDebugCorpusSignaturesV33) {
+      if (pc + sig.size > range->end) continue;
+      const auto* prefix_code = runtime.Memory().Resolve(pc, 12u);
+      if (!prefix_code) break;
+      if (GekkoAOTSdk::StructuralInstructionSkeleton(
+              GekkoAOTSdk::StructuralReadBE32(prefix_code + 0u)) != sig.prefix[0] ||
+          GekkoAOTSdk::StructuralInstructionSkeleton(
+              GekkoAOTSdk::StructuralReadBE32(prefix_code + 4u)) != sig.prefix[1] ||
+          GekkoAOTSdk::StructuralInstructionSkeleton(
+              GekkoAOTSdk::StructuralReadBE32(prefix_code + 8u)) != sig.prefix[2])
+        continue;
+      const auto* code = runtime.Memory().Resolve(pc, sig.size);
+      if (!code || !MatchesDebugCorpusV33(code, sig)) continue;
+      names.insert(sig.name);
+      selected_size = std::min(selected_size, sig.size);
+    }
+    if (names.size() != 1u || selected_size == 0xffffffffu) {
+      if (names.size() > 1u) ++stats.ambiguous_functions;
+      continue;
+    }
+    const auto* code = runtime.Memory().Resolve(pc, selected_size);
+    if (!code) continue;
+    resolver.AddFunction(pc, selected_size, 0, 0, code, {});
+    resolver.Seed(pc, std::string(*names.begin()), 0.9995,
+                  "debug-elf-corpus-exact-v34");
+    discovered.insert(pc);
+    ++stats.exact_functions;
+  }
+
+  // v300 SDK service corpus: exact structural fingerprints of every SDK
+  // subsystem (GX, GD, DVD, CARD, PAD/SI, VI, AI, AR/ARQ, DSP, AX/MIX, THP,
+  // MTX, MSL...) regenerated by tools/sdk_service_corpus.py from the user's
+  // symbolized debug ELFs; a fingerprint shared by two names anywhere in the
+  // corpus (game code included) was dropped at generation. Same admission as
+  // v33: proven `bl` targets, then contiguous library neighbours. NativeOS
+  // identities stay governed by the semantic proofs above, so OS names are
+  // recorded in the service map only and never seeded from here.
+  std::vector<std::pair<std::uint32_t, const GekkoAOTSdk::DebugCorpusSignatureV33*>> service_map;
+  if (EnvEnabled("GEKKOAOT_SDK_SERVICE_CORPUS", true)) {
+    std::map<std::array<std::uint32_t, 3>, std::vector<const GekkoAOTSdk::DebugCorpusSignatureV33*>> by_prefix;
+    for (const auto& sig : GekkoAOTSdk::kSdkServiceCorpusV1) by_prefix[sig.prefix].push_back(&sig);
+    const auto identify = [&](std::uint32_t pc) -> const GekkoAOTSdk::DebugCorpusSignatureV33* {
+      const auto* range = ContainingRange(ranges, pc);
+      if (!range || pc + 12u > range->end) return nullptr;
+      const auto* head = runtime.Memory().Resolve(pc, 12u);
+      if (!head) return nullptr;
+      const std::array<std::uint32_t, 3> prefix{
+          GekkoAOTSdk::StructuralInstructionSkeleton(GekkoAOTSdk::StructuralReadBE32(head)),
+          GekkoAOTSdk::StructuralInstructionSkeleton(GekkoAOTSdk::StructuralReadBE32(head + 4u)),
+          GekkoAOTSdk::StructuralInstructionSkeleton(GekkoAOTSdk::StructuralReadBE32(head + 8u))};
+      const auto it = by_prefix.find(prefix);
+      if (it == by_prefix.end()) return nullptr;
+      std::set<std::string_view> names;
+      const GekkoAOTSdk::DebugCorpusSignatureV33* best = nullptr;
+      for (const auto* sig : it->second) {
+        if (pc + sig->size > range->end) continue;
+        const auto* code = runtime.Memory().Resolve(pc, sig->size);
+        if (!code || !MatchesDebugCorpusV33(code, *sig)) continue;
+        names.insert(sig->name);
+        if (!best || sig->size < best->size) best = sig;
+      }
+      return names.size() == 1u ? best : nullptr;
+    };
+    std::map<std::uint32_t, const GekkoAOTSdk::DebugCorpusSignatureV33*> found;
+    for (const auto pc : direct_targets)
+      if (const auto* sig = identify(pc)) found.emplace(pc, sig);
+    std::vector<std::uint32_t> frontier;
+    for (const auto& entry : found) frontier.push_back(entry.first);
+    while (!frontier.empty()) {
+      const auto pc = frontier.back();
+      frontier.pop_back();
+      const auto next = pc + found.at(pc)->size;
+      for (std::uint32_t pad = 0; pad <= 28u; pad += 4u) {
+        if (found.contains(next + pad)) break;
+        if (const auto* sig = identify(next + pad)) {
+          found.emplace(next + pad, sig);
+          frontier.push_back(next + pad);
+          break;
+        }
+      }
+    }
+    // Only seed identities that select an existing native helper whose guest
+    // memory access is valid for every address class, including the paged
+    // VM aperture (strings are read through the per-page DTLB view; cache
+    // publication only notifies the renderer). Everything else is recorded in
+    // the service map without influencing the corpus/graph resolver.
+    const auto vm_safe_simple = [](std::string_view name) {
+      const auto kind = SimpleKindForName(name);
+      if (!kind) return false;
+      switch (*kind) {
+      case SimpleHleKind::Strlen: case SimpleHleKind::Strcmp: case SimpleHleKind::Strchr:
+      case SimpleHleKind::Strrchr: case SimpleHleKind::Strstr: case SimpleHleKind::Strcspn:
+      case SimpleHleKind::Strpbrk: case SimpleHleKind::Strcpy: case SimpleHleKind::Strcat:
+      case SimpleHleKind::Strncmp: case SimpleHleKind::Strncpy: case SimpleHleKind::Strncat:
+      case SimpleHleKind::Strnlen:
+      case SimpleHleKind::Memcpy: case SimpleHleKind::Memmove: case SimpleHleKind::Memset:
+      case SimpleHleKind::Memcmp: case SimpleHleKind::Memchr: case SimpleHleKind::Bzero:
+      case SimpleHleKind::DcZeroRange: case SimpleHleKind::DcFlushRange:
+      case SimpleHleKind::PadRead:
+      case SimpleHleKind::DvdFastOpen:
+      case SimpleHleKind::GxSetArray:
+      case SimpleHleKind::GxLoadNrmMtxImm:
+      case SimpleHleKind::GxLoadNrmMtxImm3x3:
+      case SimpleHleKind::DcFlushRangeNoSync: case SimpleHleKind::DcStoreRange:
+      case SimpleHleKind::DcStoreRangeNoSync: case SimpleHleKind::DcInvalidateRange:
+      case SimpleHleKind::DcTouchRange: case SimpleHleKind::IcInvalidateRange:
+        return true;
+      default:
+        return false;
+      }
+    };
+    std::size_t seeded = 0;
+    for (const auto& [pc, sig] : found) {
+      service_map.emplace_back(pc, sig);
+      if (discovered.contains(pc) || !vm_safe_simple(sig->name)) continue;
+      const auto* code = runtime.Memory().Resolve(pc, sig->size);
+      if (!code) continue;
+      if (std::string_view(sig->name)=="DVDFastOpen" &&
+          !GekkoAOTSdk::ProveDvdFastOpen(code,sig->size)) continue;
+      if (std::string_view(sig->name)=="GXSetArray" &&
+          !GekkoAOTSdk::ProveGxSetArray(code,sig->size)) continue;
+      if ((std::string_view(sig->name)=="GXLoadNrmMtxImm" ||
+           std::string_view(sig->name)=="GXLoadNrmMtxImm3x3") &&
+          !GekkoAOTSdk::ProveGxNormalMatrix(code,sig->size,pc,
+             std::string_view(sig->name)=="GXLoadNrmMtxImm3x3",
+             [&](std::uint32_t addr,std::size_t bytes){return runtime.Memory().Resolve(addr,bytes);})) continue;
+      resolver.AddFunction(pc, sig->size, 0, 0, code, {});
+      resolver.Seed(pc, std::string(sig->name), 0.9995, "sdk-service-corpus-v300");
+      discovered.insert(pc);
+      ++seeded;
+    }
+    static constexpr std::array<std::string_view, 24> kFamilies{
+        "GX", "GD", "DVD", "CARD", "PAD", "SI", "VI", "AI", "ARQ", "AR", "DSP", "AX", "MIX",
+        "THP", "OS", "EXI", "DB", "PSMTX", "PSVEC", "C_", "DC", "IC", "LC", "GBA"};
+    std::map<std::string_view, std::size_t> families;
+    for (const auto& [pc, sig] : service_map) {
+      std::string_view name = sig->name;
+      if (name.starts_with("__")) name.remove_prefix(2);
+      std::string_view family = "MSL";
+      for (const auto prefix : kFamilies)
+        if (name.starts_with(prefix)) { family = prefix; break; }
+      ++families[family];
+    }
+    std::cerr << "GEKKOAOT_SDK_SERVICE_MAP_V300=1 identified=" << service_map.size()
+              << " seeded=" << seeded << " corpus=" << GekkoAOTSdk::kSdkServiceCorpusV1.size();
+    for (const auto& [family, count] : families) std::cerr << ' ' << family << '=' << count;
+    std::cerr << '\n';
   }
 
   // Some SDK entrypoints are intentionally referenced indirectly (thread exit
@@ -921,6 +1195,22 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
   }
 
   for (const auto& [kind, address] : simple_candidates) {
+    if(kind==SimpleHleKind::GxSetArray &&
+       (!EnvEnabled("GEKKOAOT_NATIVE_GX_ARRAY_SERVICE",true) ||
+        !GekkoAOTSdk::ProveGxSetArray(runtime.Memory().Resolve(address,140u),140u))) continue;
+    if (kind==SimpleHleKind::PadRead && !EnvEnabled("GEKKOAOT_NATIVE_PAD",true)) continue;
+    const bool normal = kind==SimpleHleKind::GxLoadNrmMtxImm ||
+                        kind==SimpleHleKind::GxLoadNrmMtxImm3x3;
+    if (normal && (!EnvEnabled("GEKKOAOT_NATIVE_GX_NORMAL_MATRIX",true) ||
+        !GekkoAOTSdk::ProveGxNormalMatrix(runtime.Memory().Resolve(address,80u),80u,address,
+            kind==SimpleHleKind::GxLoadNrmMtxImm3x3,
+            [&](std::uint32_t pc,std::size_t bytes){return runtime.Memory().Resolve(pc,bytes);})))
+      continue;
+    if (kind==SimpleHleKind::DvdFastOpen &&
+        (!EnvEnabled("GEKKOAOT_NATIVE_DVD_FST",true) ||
+         !GekkoAOTSdk::ProveDvdFastOpen(runtime.Memory().Resolve(address,116u),116u))) continue;
+    if (IsGxMatrixKind(kind) && !EnvEnabled("GEKKOAOT_GX_MATRIX_HLE", true))
+      continue;
     runtime.RegisterSimpleHle(kind, address);
     manifest_hooks.emplace_back(address, SimpleKindName(kind));
     ++stats.simple_hooks;
@@ -1029,6 +1319,17 @@ NativeSdkAutoStats AutoRegisterNativeSdk(HostRuntime& runtime,
     std::cerr << " safe-interrupt-hooks=" << stats.os_hooks << "\n";
   }
 
+  if (!manifest_output.empty() && !service_map.empty()) {
+    // v300: per-game SDK service map (recognition only; hooks stay in the
+    // manifest). Local state, never part of the repository.
+    std::ofstream map_out(manifest_output.parent_path() / "sdk-service-map-v300.txt", std::ios::trunc);
+    if (map_out) {
+      map_out << "# GEKKOAOT_SDK_SERVICE_MAP_V300 address size name\n";
+      for (const auto& [pc, sig] : service_map)
+        map_out << "0x" << std::hex << std::setw(8) << std::setfill('0') << pc << std::dec
+                << ' ' << sig->size << ' ' << sig->name << '\n';
+    }
+  }
   if (!manifest_output.empty()) {
     std::sort(manifest_hooks.begin(), manifest_hooks.end());
     manifest_hooks.erase(std::unique(manifest_hooks.begin(), manifest_hooks.end()),
@@ -1111,6 +1412,8 @@ bool RegisterNativeSdkManifest(HostRuntime& runtime,
     if (const auto kind = OsKindForName(name)) {
       runtime.RegisterOsHook(*kind, address);
     } else if (const auto kind = SimpleKindForName(name)) {
+      if (IsGxMatrixKind(*kind) && !EnvEnabled("GEKKOAOT_GX_MATRIX_HLE", true))
+        continue;
       runtime.RegisterSimpleHle(*kind, address);
     } else {
       std::cerr << "GEKKOAOT_NATIVE_SDK_MANIFEST_V2=0 reason=unknown-hook name="

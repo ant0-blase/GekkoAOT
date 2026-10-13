@@ -1,0 +1,17 @@
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -1512,6 +1512,13 @@
+                             options->fast_semantics);
+     fprintf(header, "\n#define GEKKOAOT_AOT_RESTARTABLE_MEMORY 1\n");
+     }
++    // Only codegen with the relocation manifest can promise live architectural
++    // GPR pointers. The host uses this explicit marker to avoid legacy repair.
++    const char* rel_translate = getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
++    const char* rel_pointer_manifest = getenv("DOLRECOMP_REL_POINTER_MANIFEST");
++    if (rel_translate && rel_translate[0] && rel_translate[0] != '0' &&
++        rel_pointer_manifest && rel_pointer_manifest[0])
++        fprintf(header, "\n#define GEKKOAOT_AOT_REL_LIVE_GPRS 1\n");
+     emit_footer(header);
+     fprintf(manifest, "\n// %u native objects\n", file_count);
+     fclose(header);

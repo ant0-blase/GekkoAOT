@@ -1,0 +1,12 @@
+diff --git a/src/cpu/cpu.c b/src/cpu/cpu.c
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -881,2 +881,8 @@ void ppc_tlbie(CPUState* cpu, u32 ea, u32 cia) {
+     cpu->tlb_invalidate_count++;
++
++    /* GekkoAOT's host runtime owns the architectural DTLB. Forward every
++     * tlbie instead of reducing a sequence to tlb_last_index: retail pagers
++     * use 64 consecutive invalidations to flush both ways of all 64 sets. */
++    if (cpu->cache_control)
++        cpu->cache_control(cpu, 4u, ea, cia);
+ }

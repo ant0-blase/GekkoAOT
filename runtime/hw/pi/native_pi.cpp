@@ -18,13 +18,17 @@ constexpr std::uint32_t kUnknown = 0x28u;
 constexpr std::uint32_t kFlipperRevision = 0x2cu;
 constexpr std::uint32_t kFlipperBusStrength = 0x30u;
 constexpr std::uint32_t kFlipperRevisionC = 0x246500b1u;
-constexpr std::uint32_t kGcPhysicalFifoMask = 0x03ffffe0u;
+// PI stores aligned FIFO register values, including the 64 MiB end sentinel
+// used by GXRedirectWriteGatherPipe. Masking that sentinel to zero makes a
+// redirected RAM upload look like an unconfigured FIFO.
+constexpr std::uint32_t kGcPhysicalFifoMask = 0xffffffe0u;
 }
 
 void NativePI::Reset() {
   interrupt_mask_ = 0;
   // Real GameCube boot state: reset button is unpressed and VI starts asserted.
   interrupt_cause_ = ResetButtonState | Video;
+  RefreshInterruptPending();
   fifo_cpu_base_ = 0;
   fifo_cpu_end_ = 0;
   fifo_cpu_write_pointer_ = 0;
@@ -88,6 +92,7 @@ bool NativePI::Write32(std::uint32_t offset, std::uint32_t value) {
     // PI interrupt cause is write-one-to-clear.
     const std::uint32_t before = interrupt_cause_;
     interrupt_cause_ &= ~value;
+    RefreshInterruptPending();
     if ((value & Video) != 0u || ((before ^ interrupt_cause_) & Video) != 0u) {
       static unsigned cause_write_logs = 0u;
       if (cause_write_logs++ < 64u)
@@ -100,6 +105,7 @@ bool NativePI::Write32(std::uint32_t offset, std::uint32_t value) {
   case kInterruptMask: {
     const std::uint32_t before = interrupt_mask_;
     interrupt_mask_ = value;
+    RefreshInterruptPending();
     if (before != value) {
       static unsigned mask_logs = 0u;
       if (mask_logs++ < 96u)
@@ -168,6 +174,7 @@ void NativePI::SetInterrupt(std::uint32_t cause, bool set) {
     interrupt_cause_ |= cause;
   else
     interrupt_cause_ &= ~cause;
+  RefreshInterruptPending();
 
   if (cause == Video) {
     static unsigned video_logs = 0u;

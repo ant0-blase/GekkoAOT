@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "hw/exi/native_exi.h"
+#include <cstdio>
+#include <cstdlib>
 
 namespace GekkoAOT::HW::EXI {
 namespace {
@@ -71,6 +73,13 @@ std::uint32_t NativeEXI::Read32(std::uint32_t channel, std::uint32_t reg_offset)
   }
 }
 
+// Register accesses are polled in tight loops (CoD Finest Hour: millions/s);
+// read the diagnostic switch once instead of scanning environ every access.
+static bool ExiTraceEnabled() {
+  static const bool enabled = std::getenv("GEKKOAOT_NATIVE_HW_EXI_TRACE") != nullptr;
+  return enabled;
+}
+
 bool NativeEXI::ReadRegister(std::uint32_t address, std::uint8_t size,
                              std::uint64_t* value) const {
   if (!value || (size != 1u && size != 2u && size != 4u)) return false;
@@ -81,6 +90,10 @@ bool NativeEXI::ReadRegister(std::uint32_t address, std::uint8_t size,
   if (aligned > kImmediateData || byte_offset + size > 4u) return false;
   if ((size == 4u && byte_offset != 0u) || (size == 2u && (byte_offset & 1u))) return false;
   *value = SliceBigEndian(Read32(channel, aligned), byte_offset, size);
+  static unsigned trace_count = 0;
+  if (ExiTraceEnabled() && trace_count++ < 1024u)
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_HW_EXI_TRACE reg-read ch=%u off=%02x size=%u value=%08llx\n",
+                 channel, reg_offset, size, static_cast<unsigned long long>(*value));
   return true;
 }
 
@@ -98,6 +111,10 @@ bool NativeEXI::Write32(std::uint32_t channel, std::uint32_t reg_offset,
       next = (next & ~kExtIntMask) | (value & kExtIntMask);
     if (channel == 0u)
       next = (next & ~kRomDisable) | (value & kRomDisable);
+    if (hooks_.select && ((old ^ next) & kChipSelectMask) &&
+        hooks_.select(hooks_.user, channel,
+                      static_cast<std::uint8_t>((next & kChipSelectMask) >> 7)))
+      next |= kExiInt;
     if (value & kExiInt) next &= ~kExiInt;
     if (value & kTcInt) next &= ~kTcInt;
     if (channel < 2u && (value & kExtInt)) next &= ~kExtInt;
@@ -133,6 +150,10 @@ bool NativeEXI::WriteRegister(std::uint32_t address, std::uint64_t value,
   const std::uint32_t byte_offset = reg_offset & 3u;
   if (aligned > kImmediateData || byte_offset + size > 4u) return false;
   if ((size == 4u && byte_offset != 0u) || (size == 2u && (byte_offset & 1u))) return false;
+  static unsigned trace_count = 0;
+  if (ExiTraceEnabled() && trace_count++ < 1024u)
+    std::fprintf(stderr, "GEKKOAOT_NATIVE_HW_EXI_TRACE reg-write ch=%u off=%02x size=%u value=%08llx\n",
+                 channel, reg_offset, size, static_cast<unsigned long long>(value));
   std::uint32_t merged = MergeBigEndian(Read32(channel, aligned), byte_offset, size, value);
   if (aligned == kStatus && size != 4u) {
     // A partial store must not write back interrupt causes read from other

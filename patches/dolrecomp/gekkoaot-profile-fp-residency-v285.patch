@@ -1,0 +1,20 @@
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -63,8 +63,15 @@
+   // with mem2reg. Runtime/side-exit boundaries already materialize dirty state,
+   // so keeping it in SSA between boundaries is semantically equivalent while
+   // exposing cross-instruction value propagation to LLVM.
+-  if (adaptiveHot())
+-    return false;
++  if (adaptiveHot()) {
++    // GEKKOAOT_NATIVE_HOT_RESIDENCY_V285: large resumable chunks need bounded
++    // integer state. Keeping only FP/paired-single values resident avoids the
++    // full-state phi/code-size explosion while retaining boundary publication.
++    const char* mode = std::getenv("DOLRECOMP_NATIVE_HOT_RESIDENCY");
++    const bool fpOnly = mode && std::string(mode) == "fp";
++    if (!fpOnly || (slot >= DOLIR_STATE_FPR0 && slot <= DOLIR_STATE_FPR31) ||
++        (slot >= DOLIR_STATE_PS1_0 && slot <= DOLIR_STATE_PS1_31)) return false;
++  }
+   return !((slot >= DOLIR_STATE_CR0 && slot <= DOLIR_STATE_CR7) ||
+            (slot >= DOLIR_STATE_XER_CA && slot <= DOLIR_STATE_XER_SO) ||
+            slot == DOLIR_STATE_XER);

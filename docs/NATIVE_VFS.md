@@ -1,13 +1,11 @@
-# Native VFS / DVD path
+# Native VFS and DVD services
 
-GekkoAOT v0.0.2 owns the GameCube disc path used by the standalone runtime.
+GekkoAOT owns its disc and filesystem path. `gekkoaot-native-disc` uses encounter/nod to read supported GameCube images and containers; the controller caches system metadata, executable images and extracted files below `<state>/cache/discs/`.
 
-- `gekkoaot-native-disc` uses **encounter/nod** to read supported GameCube disc/container formats.
-- The GUI/controller caches `boot.bin`, `bi2.bin`, `main.dol`, `fst.bin` and executable metadata below `<state>/cache/discs/`.
-- `gekkoaot-native-run` receives the original disc image with `--disc-image` plus the extracted system files needed by the current runtime path.
-- There is no Python VFS patch stage.
-- GekkoAOT does not rewrite C/C++ sources while a game is running. Versioned DolRecomp/Aurora patches are intentionally applied earlier, during the toolchain-build stage.
+Extraction preserves the FST directory hierarchy. This matters for games with executable RELs nested inside directories or resource containers. Older incompatible extraction caches are migrated using an explicit extraction-policy key.
 
-For a source checkout, `<state>` is normally `./.gekkoaot`. Installed builds use the platform user cache directory unless `GEKKOAOT_STATE_DIR` is set.
+NativeVFS normalizes paths and performs FST lookup against host files or the mounted nod partition. Recognized DVD/FST SDK leaves can use direct native lookup/read services. Unknown SDK variants and custom DI protocols keep their existing compiled or register-facing paths.
 
-The intended normal user path is **Open Game → Play** in the GUI. Compatibility remains pre-alpha and title-dependent; disc access succeeding does not imply that the selected title is playable.
+DI reads retain asynchronous DMA visibility, completion interrupts, cancellation and transfer ordering. Host I/O completion alone is not permission to publish a guest transfer before its required boundary.
+
+The controller keeps mutable caches outside installed resources. Use `GEKKOAOT_STATE_DIR` to select the state root; use launcher user directories for memory cards and input configuration. Extracted commercial assets and saves are not distributed with the project.

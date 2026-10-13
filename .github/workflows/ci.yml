@@ -70,18 +70,19 @@ jobs:
         shell: bash
         run: |
           python tools/release_notes.py --version "$(tr -d '\r\n' < version.txt)" --check
+          python tools/check_release_tree.py
+          python tests/hardware/test_release_tree.py
           python - <<'PY'
           import json
           from pathlib import Path
           paths = (sorted(Path('game-packs').rglob('*.json')) +
-                   sorted(Path('crossgame-db').rglob('*.json')) +
-                   [Path('release-please-config.json'), Path('.release-please-manifest.json')])
+                   sorted(Path('crossgame-db').rglob('*.json')))
           for path in paths:
               with path.open(encoding='utf-8') as handle:
                   json.load(handle)
               print(f'validated {path}')
           PY
-          python -m py_compile tools/adaptive_pgo.py tools/crossgame_db.py tools/release_notes.py tools/stage_portable_toolchain.py
+          python -m py_compile tools/adaptive_pgo.py tools/crossgame_db.py tools/release_notes.py tools/stage_portable_toolchain.py tools/check_release_tree.py
           ! grep -RniE 'run-native-gx-v4[12]|native_gx_v4[12]' --exclude-dir=.git .
 
       - name: Configure Linux
@@ -112,6 +113,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: cmake --build build --config Release --parallel 2
+
+      - name: Run regression tests
+        run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Install Linux staging tree
         if: runner.os == 'Linux'
@@ -168,6 +172,9 @@ jobs:
               throw "Missing deployed Windows runtime file: $path"
             }
           }
+
+      - name: Validate staged release contents
+        run: python tools/check_release_tree.py --package stage
 
       - name: Smoke-test installed Linux controller
         if: runner.os == 'Linux'

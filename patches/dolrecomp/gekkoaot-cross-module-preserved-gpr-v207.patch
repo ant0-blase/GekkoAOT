@@ -1,0 +1,170 @@
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -463,6 +463,21 @@ static int append_llvm_abi_edge(DolLLVMCallEdge** edges, u32* count,
+     return 1;
+ }
+ 
++static int rel_crossmodule_live_v208_enabled(void) {
++    const char* value = getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
++    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
++}
++
++static void rel_crossmodule_live_v208_add_inputs(
++    DolLLVMFunctionRange* range, const u64* defined_before) {
++    for (u32 reg = 14u; reg < 32u; reg++) {
++        const u32 slot = (u32)DOLIR_STATE_GPR0 + reg;
++        const u64 bit = 1ull << (slot & 63u);
++        if (!(defined_before[slot >> 6u] & bit))
++            range->input_state[slot >> 6u] |= bit;
++    }
++}
++
+ static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
+                                       u32 section_count,
+                                       DolLLVMFunctionRange* ranges,
+@@ -471,6 +486,8 @@ static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
+     DolLLVMCallEdge* edges = NULL;
+     u32 edge_count = 0;
+     u32 edge_capacity = 0;
++    const int rel_crossmodule_live = rel_crossmodule_live_v208_enabled();
++    u32 rel_external_edges = 0;
+     for (u32 range_index = 0; range_index < range_count; range_index++) {
+         const LoadedCodeSection* section = NULL;
+     for (u32 s = 0; s < section_count; s++) {
+@@ -527,22 +544,32 @@ static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
+                 for (u32 slot = 0; slot < targets; slot++) {
+                     const DolLLVMFunctionRange* target = llvm_range_for(
+                         ranges, range_count, term->target_addresses[slot]);
+-                    if (target && target->start != ranges[range_index].start &&
+-                    !append_llvm_abi_edge(&edges, &edge_count, &edge_capacity,
+-                            ranges[range_index].start,
+-                                          term->target_addresses[slot],
+-                                          live_after, defined_before)) {
+-                        dolir_module_free(&module);
+-                        goto fail;
++                    if (target && target->start != ranges[range_index].start) {
++                        if (!append_llvm_abi_edge(
++                                &edges, &edge_count, &edge_capacity,
++                                ranges[range_index].start,
++                                term->target_addresses[slot],
++                                live_after, defined_before)) {
++                            dolir_module_free(&module);
++                            goto fail;
++                        }
++                    } else if (!target && rel_crossmodule_live &&
++                               term->target_addresses[slot] != 0u) {
++                        rel_crossmodule_live_v208_add_inputs(
++                            &ranges[range_index], defined_before);
++                        rel_external_edges++;
+                     }
+                 }
+             }
+             dolir_module_free(&module);
+         }
++    if (rel_crossmodule_live && rel_external_edges)
++        printf("DOLRECOMP_REL_CROSSMODULE_LIVE_V208=1 external_edges=%u preserved_gpr=r14-r31 policy=undefined-before-only+native-abi-propagation\n",
++               rel_external_edges);
+     if (runtime == DOLLLVM_RUNTIME_MODERNGEKKO)
+         dolllvm_enable_native_services(ranges, range_count);
+     if (!dolllvm_propagate_function_abis(ranges, range_count, edges,
+                                          edge_count))
+         goto fail;
+     free(edges);
+     return 1;
+diff --git a/src/backend/llvm/llvm_backend.h b/src/backend/llvm/llvm_backend.h
+--- a/src/backend/llvm/llvm_backend.h
++++ b/src/backend/llvm/llvm_backend.h
+@@ -13,6 +13,7 @@ typedef enum {
+   DOLLLVM_ABI_BLOCK_HELPER = 1u << 2,
+   DOLLLVM_ABI_BLOCK_MEMORY_SERVICE = 1u << 3,
+   DOLLLVM_ABI_BLOCK_RFI = 1u << 4,
++  DOLLLVM_ABI_BLOCK_REL_COMPUTED_CTR = 1u << 5,
+ } DolLLVMFunctionABIBlocker;
+ 
+ #define DOLLLVM_NATIVE_ABI_VERSION 4u
+diff --git a/src/backend/llvm/abi_liveness.cpp b/src/backend/llvm/abi_liveness.cpp
+--- a/src/backend/llvm/abi_liveness.cpp
++++ b/src/backend/llvm/abi_liveness.cpp
+@@ -5,5 +5,6 @@
+ #include <algorithm>
+ #include <array>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <vector>
+@@ -34,6 +35,12 @@ bool nativeHelper(const DolIRInstruction &instruction) {
+   return false;
+ }
+ 
++bool relCrossModuleLiveV208() {
++  const char *value = std::getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
++  return value && value[0] &&
++         !(value[0] == '0' && value[1] == '\0');
++}
++
+ u32 nativeABIFlags(const DolIRFunction &function, u32 *blockers) {
+   bool memory = false;
+   *blockers = 0;
+@@ -58,9 +65,13 @@ u32 nativeABIFlags(const DolIRFunction &function, u32 *blockers) {
+     const bool computedCtrBranch =
+         block.terminator.kind == DOLIR_TERM_INDIRECT &&
+         (raw >> 26) == 19u && ((raw >> 1) & 0x3ffu) == 528u;
+-    if (!block.cycle_cost || block.terminator.kind == DOLIR_TERM_FALLBACK ||
+-        computedCtrBranch)
++    if (!block.cycle_cost || block.terminator.kind == DOLIR_TERM_FALLBACK)
+       *blockers |= DOLLLVM_ABI_BLOCK_CONTROL;
++    if (computedCtrBranch) {
++      *blockers |= DOLLLVM_ABI_BLOCK_CONTROL;
++      if (relCrossModuleLiveV208())
++        *blockers |= DOLLLVM_ABI_BLOCK_REL_COMPUTED_CTR;
++    }
+     if (block.terminator.kind == DOLIR_TERM_SYSTEM_CALL)
+       *blockers |= DOLLLVM_ABI_BLOCK_EXCEPTION;
+     if (block.terminator.kind == DOLIR_TERM_RFI)
+@@ -183,6 +194,17 @@ extern "C" bool dolllvm_analyze_function_abi(const DolIRFunction *function,
+     range->semantic_output_state[word] = 0;
+   }
+   range->abi_flags = nativeABIFlags(*function, &range->abi_blockers);
++  if (range->abi_blockers & DOLLLVM_ABI_BLOCK_REL_COMPUTED_CTR) {
++    for (u32 reg = 14u; reg < 32u; reg++) {
++      const auto slot =
++          static_cast<DolIRStateSlot>(DOLIR_STATE_GPR0 + reg);
++      const u32 raw = static_cast<u32>(slot);
++      const u64 bit = 1ull << (raw & 63u);
++      const u32 word = raw >> 6u;
++      if (!(range->must_def_state[word] & bit))
++        range->input_state[word] |= bit;
++    }
++  }
+   return true;
+ }
+ 
+diff --git a/src/backend/llvm/abi_policy.cpp b/src/backend/llvm/abi_policy.cpp
+--- a/src/backend/llvm/abi_policy.cpp
++++ b/src/backend/llvm/abi_policy.cpp
+@@ -77,14 +77,21 @@ extern "C" bool dolllvm_propagate_function_abis(DolLLVMFunctionRange *ranges,
+   }
+   for (u32 edgeIndex = 0; edgeIndex < edgeCount; edgeIndex++) {
+     auto caller = starts.find(edges[edgeIndex].caller_start);
+     const u32 callee = containing(edges[edgeIndex].callee_address);
+-    if (caller == starts.end() || callee == rangeCount ||
+-        !(ranges[callee].abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE))
++    if (caller == starts.end() || callee == rangeCount)
+       continue;
++    const bool nativeCallee =
++        (ranges[callee].abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE) != 0;
++    const bool relComputedCtrBoundary =
++        (ranges[callee].abi_blockers &
++         DOLLLVM_ABI_BLOCK_REL_COMPUTED_CTR) != 0;
++    if (!nativeCallee && !relComputedCtrBoundary)
++      continue;
+     const u32 relation = static_cast<u32>(relations.size());
+     relations.push_back({caller->second, callee, &edges[edgeIndex]});
+     callers[callee].push_back(relation);
+-    if (ranges[caller->second].abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE) {
++    if (nativeCallee &&
++        (ranges[caller->second].abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE)) {
+       callees[caller->second].push_back(relation);
+       ranges[caller->second].native_call_targets++;
+     }

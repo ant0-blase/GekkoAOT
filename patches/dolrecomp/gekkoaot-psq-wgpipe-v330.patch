@@ -1,0 +1,91 @@
+--- a/src/backend/llvm/psq.cpp
++++ b/src/backend/llvm/psq.cpp
+@@ -138,6 +138,88 @@
+     encode(6, 1, -128, 127);
+     encode(7, 2, -32768, 32767);
+     builder_.SetInsertPoint(lanes);
++
++    // GEKKOAOT_PSQ_WGPIPE_V330: dynamic-GQR vertex stores into the GX
++    // write-gather pipe (CoD: ~13% of the AOT thread in ppc_psq_store ->
++    // mem_write16 -> external_write). Pack the quantized pair big-endian, as
++    // the two sequential lane writes would enter the FIFO, and offer it to
++    // the native gather in one call. A rejection (pending exception, gather
++    // full, CPU FIFO not on the GPU) runs the exact lane path below.
++    // Opt-in: only the main module links the native gather shim; secondary
++    // AOT modules do not export gekkoaot_try_wgpipe_write.
++    static const bool wgpipe = [] {
++      const char *setting = std::getenv("DOLRECOMP_PSQ_WGPIPE");
++      return setting && setting[0] == '1';
++    }();
++    if (wgpipe && !modern_runtime_) {
++      BasicBlock *exact =
++          BasicBlock::Create(context_, "psq_store_exact", function_);
++      BasicBlock *gather =
++          BasicBlock::Create(context_, "psq_store_wgpipe", function_);
++      // Whole 8-byte span inside the 32-byte aperture; shorter pairs near the
++      // aperture end keep the exact path.
++      Value *aperture = builder_.CreateAnd(
++          builder_.CreateICmpEQ(
++              builder_.CreateAnd(address, builder_.getInt32(0x3fffffe0u)),
++              builder_.getInt32(0x0c008000u)),
++          builder_.CreateICmpULE(
++              builder_.CreateAnd(address, builder_.getInt32(0x1fu)),
++              builder_.getInt32(0x18u)));
++      builder_.CreateCondBr(aperture, gather, exact);
++      builder_.SetInsertPoint(gather);
++      SwitchInst *gatherSwitch = builder_.CreateSwitch(typeValue, exact, 5);
++      auto tryWrite = module_.getOrInsertFunction(
++          "gekkoaot_try_wgpipe_write",
++          FunctionType::get(builder_.getInt32Ty(),
++                            {ptr, builder_.getInt32Ty(), builder_.getInt64Ty(),
++                             builder_.getInt8Ty(), builder_.getInt32Ty()},
++                            false));
++      auto offer = [&](u32 type, u32 width, int minValue, int maxValue) {
++        BasicBlock *block =
++            BasicBlock::Create(context_, "psq_store_wgpipe_type", function_);
++        gatherSwitch->addCase(builder_.getInt32(type), block);
++        builder_.SetInsertPoint(block);
++        const bool unquantized = type == 0;
++        Value *pair = fp_rep_[reg] == FPRepresentation::PairF32 &&
++                              (unquantized || fp_denormal_safe_[reg])
++                          ? pairF32(reg)
++                          : pairF64(reg);
++        const u64 mask = width == 4 ? 0xffffffffull : (1ull << (width * 8)) - 1;
++        auto laneBits = [&](u32 lane) {
++          Value *value = builder_.CreateExtractElement(pair, uint64_t{lane});
++          Value *bits = unquantized
++                            ? truncatePSQFloat(builder_, value)
++                            : quantizePSQFloat(builder_, value, scale,
++                                               minValue, maxValue);
++          return builder_.CreateAnd(
++              builder_.CreateZExt(bits, builder_.getInt64Ty()),
++              builder_.getInt64(mask));
++        };
++        Value *packed = laneBits(0);
++        clearReservation(address);
++        if (!w) {
++          packed = builder_.CreateOr(
++              builder_.CreateShl(packed, builder_.getInt64(width * 8)),
++              laneBits(1));
++          clearReservation(builder_.CreateAdd(address, builder_.getInt32(width)));
++        }
++        Value *accepted = builder_.CreateCall(
++            tryWrite, {ctx_, address, packed,
++                       builder_.getInt8(w ? width : width * 2),
++                       builder_.getInt32(inst.guest_pc)});
++        builder_.CreateCondBr(
++            builder_.CreateICmpNE(accepted, builder_.getInt32(0)), join, exact,
++            MDBuilder(context_).createBranchWeights(2000, 1));
++        fastEnds.push_back(builder_.GetInsertBlock());
++      };
++      offer(0, 4, 0, 0);
++      offer(4, 1, 0, 255);
++      offer(5, 2, 0, 65535);
++      offer(6, 1, -128, 127);
++      offer(7, 2, -32768, 32767);
++      function_->addFnAttr("dolrecomp-psq-wgpipe", "330");
++      builder_.SetInsertPoint(exact);
++    }
+   }
+   SwitchInst *typeSwitch =
+       builder_.CreateSwitch(typeValue, slow, inlineQuantized ? 5 : 1);

@@ -154,6 +154,27 @@ struct PortConfig {
   TriggerBinding l_analog, r_analog;
 };
 
+inline bool MigrateLegacyShoulderBindings(PortConfig* cfg) {
+  if (!cfg) return false;
+  // Older GekkoAOT profiles used the common SDL shoulder indices 4/5 for
+  // GameCube L/R while also assigning right shoulder to Z. That makes R1/RB
+  // assert Z+R and L1/LB assert L. Only rewrite that exact legacy triplet so
+  // genuinely customized profiles keep their explicit mappings.
+  const bool legacy =
+      cfg->z.button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER &&
+      cfg->z.joystick_button == 5 &&
+      cfg->l.button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER &&
+      cfg->l.joystick_button == 4 &&
+      cfg->r.button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER &&
+      cfg->r.joystick_button == 5;
+  if (!legacy) return false;
+  cfg->l.button = SDL_GAMEPAD_BUTTON_INVALID;
+  cfg->l.joystick_button = -1;
+  cfg->r.button = SDL_GAMEPAD_BUTTON_INVALID;
+  cfg->r.joystick_button = -1;
+  return true;
+}
+
 inline DigitalBinding Digital(const char* key, SDL_GamepadButton button, int joy_button) {
   return {detail::Key(key), button, joy_button};
 }
@@ -176,9 +197,14 @@ inline PortConfig DefaultPort(unsigned port) {
   out.x = Digital("U", SDL_GAMEPAD_BUTTON_WEST, 2);
   out.y = Digital("I", SDL_GAMEPAD_BUTTON_NORTH, 3);
   out.start = Digital("Return", SDL_GAMEPAD_BUTTON_START, 9);
+  // Match a GameCube pad on modern controllers:
+  //   R1/RB -> Z, L1/LB -> unbound, L2/LT + R2/RT -> analog L/R.
+  // The trigger axes below also assert the GameCube digital L/R bits near the
+  // end of travel, so binding the shoulder buttons to L/R would double-map
+  // R1 as both Z and R and incorrectly turn L1 into L.
   out.z = Digital("R", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 5);
-  out.l = Digital("Q", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 4);
-  out.r = Digital("E", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 5);
+  out.l = Digital("Q", SDL_GAMEPAD_BUTTON_INVALID, -1);
+  out.r = Digital("E", SDL_GAMEPAD_BUTTON_INVALID, -1);
   out.dpad_up = Digital("T", SDL_GAMEPAD_BUTTON_DPAD_UP, 12);
   out.dpad_down = Digital("G", SDL_GAMEPAD_BUTTON_DPAD_DOWN, 13);
   out.dpad_left = Digital("F", SDL_GAMEPAD_BUTTON_DPAD_LEFT, 14);
@@ -204,7 +230,9 @@ class SDLInput {
   std::array<SDL_Gamepad*, 4> gamepads_{};
   std::array<SDL_Joystick*, 4> joysticks_{};
   std::filesystem::path config_path_;
+  Uint64 last_device_health_ms_ = 0;
   Uint64 last_device_scan_ms_ = 0;
+  bool diag_si_enabled_ = false;
 #if defined(HAVE_X11)
   Display* x11_display_ = nullptr;
   std::array<KeyCode, SDL_SCANCODE_COUNT> x11_keycodes_{};
@@ -296,6 +324,12 @@ class SDLInput {
       LoadAxis(s, "main_x", &cfg.main_x); LoadAxis(s, "main_y", &cfg.main_y);
       LoadAxis(s, "c_x", &cfg.c_x); LoadAxis(s, "c_y", &cfg.c_y);
       LoadTrigger(s, "l_analog", &cfg.l_analog); LoadTrigger(s, "r_analog", &cfg.r_analog);
+      if (MigrateLegacyShoulderBindings(&cfg)) {
+        std::fprintf(stderr,
+                     "GEKKOAOT_SDL_MAPPING_MIGRATE port=%u legacy-shoulders=1 "
+                     "right-shoulder=Z left-shoulder=none triggers=L/R\n",
+                     i + 1);
+      }
     }
   }
 
@@ -396,9 +430,18 @@ class SDLInput {
   }
 
   void RefreshDevices(bool force = false) {
-    // GEKKOAOT_SDL_AUTODETECT_V22: connection state is cheap to check every
-    // poll; the global SDL device enumeration is throttled unless a port needs
-    // a device. This also makes hot-plug work independently of PADRead HLE.
+    // v183: UpdateUnlocked runs at the 120 Hz SI sampling cadence. SDL's
+    // connection queries take internal locks even when nothing changed, so
+    // checking all four ports on every sample is measurable idle overhead.
+    // Hot-plug is not a per-frame hardware event: cap only the device-health
+    // scan to 4 Hz while leaving buttons/axes sampled at the original 120 Hz.
+    const Uint64 now = SDL_GetTicks();
+    constexpr Uint64 kDeviceHealthIntervalMs = 250;
+    if (!force && last_device_health_ms_ &&
+        now - last_device_health_ms_ < kDeviceHealthIntervalMs)
+      return;
+    last_device_health_ms_ = now;
+
     bool needs_device = false;
     std::unordered_set<SDL_JoystickID> used;
     for (unsigned p = 0; p < 4; ++p) {
@@ -412,8 +455,8 @@ class SDLInput {
         needs_device = true;
     }
 
-    const Uint64 now = SDL_GetTicks();
-    if (!force && (!needs_device || (last_device_scan_ms_ && now - last_device_scan_ms_ < 250)))
+    if (!force && (!needs_device ||
+                   (last_device_scan_ms_ && now - last_device_scan_ms_ < 250)))
       return;
     last_device_scan_ms_ = now;
 
@@ -475,27 +518,37 @@ class SDLInput {
            (device && JoyButtonDown(joy, binding.joystick_button));
   }
 
-  static std::int8_t MappedAxis(const AxisBinding& binding, const std::uint8_t* keys, SDL_Gamepad* pad,
-                                SDL_Joystick* joy, bool keyboard, bool device) {
-    int keyboard_value = 0;
-    if (keyboard) {
-      if (KeyDown(keys, binding.negative)) keyboard_value -= 80;
-      if (KeyDown(keys, binding.positive)) keyboard_value += 80;
-    }
+  static int RawAxis(const AxisBinding& binding, SDL_Gamepad* pad, SDL_Joystick* joy,
+                     bool device) {
     int raw = 0;
     if (device && pad && binding.axis != SDL_GAMEPAD_AXIS_INVALID)
       raw = SDL_GetGamepadAxis(pad, binding.axis);
     else if (device && joy && binding.joystick_axis >= 0 && binding.joystick_axis < SDL_GetNumJoystickAxes(joy))
       raw = SDL_GetJoystickAxis(joy, binding.joystick_axis);
-    if (binding.invert) raw = -raw;
-    int device_value = 0;
-    if (std::abs(raw) > binding.deadzone) {
-      const int sign = raw < 0 ? -1 : 1;
-      const int magnitude = std::min(32767, std::abs(raw));
-      device_value = sign * (magnitude - binding.deadzone) * 80 / std::max(1, 32767 - binding.deadzone);
+    return binding.invert ? -raw : raw;
+  }
+
+  static Stick MappedStick(const AxisBinding& x, const AxisBinding& y,
+                           const std::uint8_t* keys, SDL_Gamepad* pad,
+                           SDL_Joystick* joy, bool keyboard, bool device,
+                           int* raw_x = nullptr, int* raw_y = nullptr) {
+    int dx = RawAxis(x, pad, joy, device);
+    int dy = RawAxis(y, pad, joy, device);
+    if (raw_x) *raw_x = dx;
+    if (raw_y) *raw_y = dy;
+    Stick mapped = MapStick(dx, dy, std::max(x.deadzone, y.deadzone));
+    if (keyboard) {
+      const int kx = (KeyDown(keys, x.positive) ? 32767 : 0) -
+                     (KeyDown(keys, x.negative) ? 32767 : 0);
+      const int ky = (KeyDown(keys, y.positive) ? 32767 : 0) -
+                     (KeyDown(keys, y.negative) ? 32767 : 0);
+      if (kx || ky) {
+        const Stick key_stick = MapStick(kx, ky, 0);
+        if (std::hypot(key_stick.mapped_x, key_stick.mapped_y) >=
+            std::hypot(mapped.mapped_x, mapped.mapped_y)) mapped = key_stick;
+      }
     }
-    const int chosen = std::abs(device_value) > std::abs(keyboard_value) ? device_value : keyboard_value;
-    return static_cast<std::int8_t>(std::clamp(chosen, -80, 80));
+    return mapped;
   }
 
   static std::uint8_t MappedTrigger(const TriggerBinding& binding, const std::uint8_t* keys, SDL_Gamepad* pad,
@@ -525,6 +578,14 @@ public:
     SDL_SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
     initialized_ = SDL_InitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_HAPTIC | SDL_INIT_EVENTS);
     if (!initialized_) return false;
+    // v185: GEKKOAOT_DIAG_SI is process configuration. getenv() showed up in
+    // the 120 Hz input hot path because it was queried once per active port on
+    // every sample. Cache it once at initialization; external processes cannot
+    // mutate our environment after launch, and ReloadConfig does not change it.
+    if (const char* diag = std::getenv("GEKKOAOT_DIAG_SI"))
+      diag_si_enabled_ = *diag == '1';
+    else
+      diag_si_enabled_ = false;
 #if defined(HAVE_X11)
     InitializeX11Keyboard();
 #endif
@@ -555,6 +616,9 @@ public:
     x11_keycodes_.fill(0);
 #endif
     snapshot_ = {}; pending_rumble_.fill(-1);
+    last_device_health_ms_ = 0;
+    last_device_scan_ms_ = 0;
+    diag_si_enabled_ = false;
     initialized_ = false;
   }
 
@@ -683,10 +747,24 @@ private:
       set(cfg.start, 0x1000); set(cfg.z, 0x0010); set(cfg.l, 0x0040); set(cfg.r, 0x0020);
       set(cfg.dpad_left, 0x0001); set(cfg.dpad_right, 0x0002);
       set(cfg.dpad_down, 0x0004); set(cfg.dpad_up, 0x0008);
-      pad.stick_x = MappedAxis(cfg.main_x, keys, gp, joy, keyboard, device);
-      pad.stick_y = MappedAxis(cfg.main_y, keys, gp, joy, keyboard, device);
-      pad.sub_x = MappedAxis(cfg.c_x, keys, gp, joy, keyboard, device);
-      pad.sub_y = MappedAxis(cfg.c_y, keys, gp, joy, keyboard, device);
+      int raw_x = 0, raw_y = 0;
+      const Stick main = MappedStick(cfg.main_x, cfg.main_y, keys, gp, joy,
+                                     keyboard, device, &raw_x, &raw_y);
+      const Stick sub = MappedStick(cfg.c_x, cfg.c_y, keys, gp, joy, keyboard, device);
+      pad.stick_x = main.x; pad.stick_y = main.y;
+      pad.sub_x = sub.x; pad.sub_y = sub.y;
+      if (diag_si_enabled_) {
+        static std::array<Uint64, 4> last_log{};
+        const Uint64 now = SDL_GetTicks();
+        if (now - last_log[i] >= 1000) {
+          last_log[i] = now;
+          std::fprintf(stderr,
+                       "GEKKOAOT_DIAG_SI port=%u raw=%d,%d normalized=%.3f,%.3f deadzone=%.3f mapped=%.3f,%.3f gc=%u,%u\n",
+                       i + 1, raw_x, raw_y, main.normalized_x, main.normalized_y,
+                       std::max(cfg.main_x.deadzone, cfg.main_y.deadzone) / 32767.f,
+                       main.mapped_x, main.mapped_y, 128 + int(main.x), 128 + int(main.y));
+        }
+      }
       pad.left = MappedTrigger(cfg.l_analog, keys, gp, joy, keyboard, device);
       pad.right = MappedTrigger(cfg.r_analog, keys, gp, joy, keyboard, device);
       if (pad.left >= 230) pad.buttons |= 0x0040;

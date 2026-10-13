@@ -1,0 +1,40 @@
+--- a/src/backend/llvm/floating_point.cpp
++++ b/src/backend/llvm/floating_point.cpp
+@@ -329,7 +329,20 @@
+ 
+     if (directSingle || directRound || nativeFinite) {
+       Value *fpscr = rawFPSCR();
+-      Value *safe = defaultControls(fpscr);
++      // GEKKOAOT_NATIVE_MATH_ANY_CONTROLS_V340: the finite native path also
++      // serves non-IEEE mode and every rounding mode. FPSCR[RN] and [NI] are
++      // mirrored into MXCSR (rounding control, DAZ+FTZ) by
++      // ppc_fpscr_control_updated, so the helper's double arithmetic and float
++      // conversion run under the same controls as this code. The one NI
++      // difference is handled below: the helper flushes |exact| < 2^-126 to
++      // zero before rounding. CoD runs with NI=1 (every fmuls hit the helper).
++      static const bool anyControls = [] {
++        const char *setting = std::getenv("DOLRECOMP_NATIVE_MATH_ANY_CONTROLS");
++        return !setting || setting[0] != '0';
++      }();
++      const bool relaxedControls = nativeFinite && anyControls;
++      Value *safe = relaxedControls ? static_cast<Value *>(builder_.getTrue())
++                                    : defaultControls(fpscr);
+       Value *left = stateValue(fprSlot(op == DOLIR_EXACT_FRSP ? b : a));
+       Value *left32 = builder_.CreateFPTrunc(left, f32);
+       if (!nativeFinite) safe = builder_.CreateAnd(safe, finiteF32(left32));
+@@ -364,6 +377,15 @@
+         }
+         nativeResult = directBinary(op,left,multiplier);
+         safe = builder_.CreateAnd(safe,finiteF64(nativeResult.first));
++        if (relaxedControls) {
++          Value* nonIEEE = builder_.CreateICmpNE(
++              builder_.CreateAnd(fpscr, builder_.getInt32(4)), builder_.getInt32(0));
++          Value* tiny = builder_.CreateICmpULT(
++              builder_.CreateAnd(builder_.CreateBitCast(nativeResult.first, i64),
++                                 builder_.getInt64(0x7FFFFFFFFFFFFFFFull)),
++              builder_.getInt64(0x3810000000000000ull));
++          safe = builder_.CreateAnd(safe, builder_.CreateNot(builder_.CreateAnd(nonIEEE, tiny)));
++        }
+       }
+ 
+       BasicBlock *fast = BasicBlock::Create(context_, "fp_direct", function_);

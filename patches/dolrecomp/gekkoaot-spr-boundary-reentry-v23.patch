@@ -1,0 +1,30 @@
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -203,6 +203,26 @@ void FunctionEmitter::scanRegionLeaders() {
+         }
+       }
+     }
++
++    // MTSPR is a host/runtime boundary and may return to the standalone
++    // dispatcher at the architectural next PC. Exception handlers are a
++    // concrete case: a DSI/ISI prologue may save state through SPRG0 and then
++    // resume at the following instruction. Without a leader there, the
++    // dispatcher falls into instruction fallback on an otherwise supported op.
++    //
++    // Keep this narrow to SPR writes instead of all MAY_EXIT helpers; the
++    // broader rule fragments hot functions and costs optimization quality.
++    if (i + 1u < source_.block_count) {
++      const DolIRBlock &body = source_.blocks[i];
++      for (u32 n = 0; n < body.instruction_count; n++) {
++        const DolIRInstruction &inst = body.instructions[n];
++        if (inst.op == DOLIR_OP_HELPER_CALL &&
++            inst.aux == DOLIR_HELPER_SPR_WRITE) {
++          region_leaders_[i + 1u] = true;
++          break;
++        }
++      }
++    }
+     u32 count = term.kind == DOLIR_TERM_COND_BRANCH ? 2u
+                 : term.kind == DOLIR_TERM_BRANCH    ? 1u
+                 : term.kind == DOLIR_TERM_INDIRECT  ? 2u

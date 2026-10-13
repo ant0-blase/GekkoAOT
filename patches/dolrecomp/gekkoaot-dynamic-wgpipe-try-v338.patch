@@ -1,0 +1,40 @@
+--- a/src/backend/llvm/memory_service.cpp
++++ b/src/backend/llvm/memory_service.cpp
+@@ -232,6 +232,37 @@
+     builder_.CreateCondBr(builder_.CreateICmpNE(accepted, builder_.getInt32(0)), done, full);
+     builder_.SetInsertPoint(full);
+     function_->addFnAttr("dolrecomp-native-wgpipe-try", "244");
++  } else if (!nativeSymbol &&
++             (width == 1u || width == 2u || width == 4u || width == 8u)) {
++    // GEKKOAOT_DYNAMIC_WGPIPE_TRY_V338: stores through a register holding the
++    // write-gather pipe (CoD: ~1M vertex writes/s via stw/sth/stfs) are not
++    // provable at compile time and paid a full state publication and reload
++    // per store. On this already-external path, offer a WGPIPE-aperture store
++    // to the native gather first; a rejection takes the exact path below.
++    // Opt-in: only the main module links gekkoaot_try_wgpipe_write.
++    static const bool dynamicTry = [] {
++      const char *setting = std::getenv("DOLRECOMP_DYNAMIC_WGPIPE_TRY");
++      return setting && setting[0] == '1';
++    }();
++    if (dynamicTry) {
++      auto tryWrite = module_.getOrInsertFunction("gekkoaot_try_wgpipe_write",
++          FunctionType::get(Type::getInt32Ty(context_),
++              {pointer, Type::getInt32Ty(context_), Type::getInt64Ty(context_),
++               Type::getInt8Ty(context_), Type::getInt32Ty(context_)}, false));
++      BasicBlock *gather = BasicBlock::Create(context_, "wgpipe_dynamic_try", function_);
++      BasicBlock *full = BasicBlock::Create(context_, "wgpipe_dynamic_full", function_);
++      Value *aperture = builder_.CreateICmpEQ(
++          builder_.CreateAnd(address, builder_.getInt32(0x3fffffe0u)),
++          builder_.getInt32(0x0c008000u));
++      builder_.CreateCondBr(aperture, gather, full);
++      builder_.SetInsertPoint(gather);
++      Value *accepted = builder_.CreateCall(tryWrite,
++          {ctx_, address, stored, builder_.getInt8(width), builder_.getInt32(current_pc_)});
++      builder_.CreateCondBr(builder_.CreateICmpNE(accepted, builder_.getInt32(0)), done, full,
++                            MDBuilder(context_).createBranchWeights(2000, 1));
++      builder_.SetInsertPoint(full);
++      function_->addFnAttr("dolrecomp-dynamic-wgpipe-try", "338");
++    }
+   }
+   materialize(current_pc_);
+   auto *functionType = FunctionType::get(

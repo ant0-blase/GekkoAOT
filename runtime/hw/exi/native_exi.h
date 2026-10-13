@@ -27,6 +27,7 @@ public:
 
   struct DeviceHooks {
     void* user = nullptr;
+    bool (*select)(void* user, std::uint32_t channel, std::uint8_t chip_select) = nullptr;
     bool (*present)(void* user, std::uint32_t channel, std::uint8_t chip_select) = nullptr;
     bool (*immediate)(void* user, std::uint32_t channel, std::uint8_t chip_select,
                       std::uint8_t direction, std::uint8_t length,

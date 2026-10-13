@@ -8,8 +8,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
-#include <vector>
 
 namespace GekkoAOT::DSP {
 namespace {
@@ -72,8 +72,27 @@ constexpr std::uint16_t SRC_AFC_2BIT = 5u;
 constexpr std::uint16_t SRC_PCM8 = 8u;
 constexpr std::uint16_t SRC_AFC_4BIT = 9u;
 constexpr std::uint16_t SRC_PCM16 = 16u;
+constexpr std::uint16_t SRC_PCM16_MRAM = 33u;
 
 constexpr double kPi = 3.1415926535897932384626433832795;
+
+// DSP mixing buses wrap at 16 bits; the DAC gain saturates afterwards.
+std::int32_t BusSample(std::int64_t value) {
+  const auto bits = static_cast<std::uint16_t>(value);
+  return bits < 0x8000u ? bits : static_cast<std::int32_t>(bits) - 0x10000;
+}
+std::int16_t RampMix(std::array<std::int32_t, 80>& bus,
+                     const std::array<std::int32_t, 80>& samples,
+                     std::int16_t current, std::int16_t delta) {
+  std::int64_t gain = static_cast<std::int64_t>(current) * 65536;
+  const std::int32_t step = static_cast<std::int32_t>(delta) * 65536 / 80;
+  for (std::size_t i = 0; i < bus.size(); ++i) {
+    bus[i] = BusSample(bus[i] + ((samples[i] * (gain >> 16u)) >> 16u));
+    gain += step;
+  }
+  return static_cast<std::int16_t>(BusSample(gain >> 16u));
+}
+
 
 std::int32_t SignExtend2(std::uint8_t v) {
   v &= 3u;
@@ -128,6 +147,16 @@ void NativeJAudioHLE::Voice::SetU32(std::size_t off, std::uint32_t value) {
 
 void NativeJAudioHLE::Reset() {
   active_ = false;
+  standard_task_ = standard_ready_ = dolby_louder_ = standard_blocked_ = false;
+  standard_state_ = StandardState::Waiting;
+  standard_replies_.clear();
+  standard_pending_packets_.clear();
+  standard_image_hash_ = standard_upload_seen_ = 0;
+  standard_upload_.fill(0);
+  standard_packet_.fill(0);
+  standard_masks_.fill(0);
+  standard_expected_ = standard_seen_ = standard_frames_ = standard_frame_ = 0;
+  standard_voice_ = standard_max_voice_ = standard_left_ = standard_right_ = 0;
   voice_count_ = 0;
   vpb_address_ = 0;
   resample_table_address_ = 0;
@@ -152,6 +181,10 @@ void NativeJAudioHLE::Reset() {
   sync_frames_ = 0;
   voices_mixed_ = 0;
   unsupported_sources_ = 0;
+  voice_slots_scanned_ = 0;
+  voice_full_loads_ = 0;
+  voice_slots_skipped_ = 0;
+  output_clips_ = 0;
 }
 
 bool NativeJAudioHLE::ReadMain(std::uint32_t address, void* dst, std::size_t size) const {
@@ -163,25 +196,37 @@ bool NativeJAudioHLE::WriteMain(std::uint32_t address, const void* src, std::siz
          dsp_->CoreWriteMain(address, static_cast<const std::uint8_t*>(src), static_cast<std::uint32_t>(size));
 }
 bool NativeJAudioHLE::ReadAram(std::uint32_t address, void* dst, std::size_t size) const {
-  if (!dsp_ || !dst) return false;
-  auto* out = static_cast<std::uint8_t*>(dst);
-  for (std::size_t i = 0; i < size; ++i) out[i] = dsp_->ReadAram(address + static_cast<std::uint32_t>(i));
-  return true;
+  return dsp_ && dst && size != 0u && size <= std::numeric_limits<std::uint32_t>::max() &&
+         dsp_->CoreReadAram(address, static_cast<std::uint8_t*>(dst),
+                            static_cast<std::uint32_t>(size));
 }
 bool NativeJAudioHLE::ReadMainS16(std::uint32_t address, std::int16_t* dst, std::size_t count) const {
   if (!dst || count == 0u) return false;
-  std::vector<std::uint8_t> raw(count * 2u);
-  if (!ReadMain(address, raw.data(), raw.size())) return false;
-  for (std::size_t i = 0; i < count; ++i)
-    dst[i] = static_cast<std::int16_t>(LoadBe16(raw.data() + i * 2u));
+  std::array<std::uint8_t, 512u> raw{};
+  std::size_t done = 0u;
+  while (done < count) {
+    const std::size_t samples = std::min<std::size_t>(count - done, raw.size() / 2u);
+    const std::size_t bytes = samples * 2u;
+    if (!ReadMain(address + static_cast<std::uint32_t>(done * 2u), raw.data(), bytes)) return false;
+    for (std::size_t i = 0; i < samples; ++i)
+      dst[done + i] = static_cast<std::int16_t>(LoadBe16(raw.data() + i * 2u));
+    done += samples;
+  }
   return true;
 }
 bool NativeJAudioHLE::WriteMainS16(std::uint32_t address, const std::int16_t* src, std::size_t count) {
   if (!src || count == 0u) return false;
-  std::vector<std::uint8_t> raw(count * 2u);
-  for (std::size_t i = 0; i < count; ++i)
-    StoreBe16(raw.data() + i * 2u, static_cast<std::uint16_t>(src[i]));
-  return WriteMain(address, raw.data(), raw.size());
+  std::array<std::uint8_t, 512u> raw{};
+  std::size_t done = 0u;
+  while (done < count) {
+    const std::size_t samples = std::min<std::size_t>(count - done, raw.size() / 2u);
+    const std::size_t bytes = samples * 2u;
+    for (std::size_t i = 0; i < samples; ++i)
+      StoreBe16(raw.data() + i * 2u, static_cast<std::uint16_t>(src[done + i]));
+    if (!WriteMain(address + static_cast<std::uint32_t>(done * 2u), raw.data(), bytes)) return false;
+    done += samples;
+  }
+  return true;
 }
 
 bool NativeJAudioHLE::LoadVoice(std::uint32_t index, Voice* voice) const {
@@ -191,8 +236,10 @@ bool NativeJAudioHLE::LoadVoice(std::uint32_t index, Voice* voice) const {
 }
 bool NativeJAudioHLE::StoreVoice(std::uint32_t index, const Voice& voice) {
   if (index >= voice_count_) return false;
+  // Nintendo's JAudio DSP writes back only the mutable first 0x80 words of a
+  // normal 0xC0-word VPB. Keep the PPC-owned tail untouched.
   return WriteMain(vpb_address_ + index * static_cast<std::uint32_t>(kVpbBytes),
-                   voice.bytes.data(), voice.bytes.size());
+                   voice.bytes.data(), kVpbWritebackBytes);
 }
 
 bool NativeJAudioHLE::LoadTables() {
@@ -209,6 +256,12 @@ bool NativeJAudioHLE::LoadTables() {
     patterns_[i] = static_cast<std::int16_t>(LoadBe16(src.data() + (256u + i) * 2u));
   for (std::size_t i = 0; i < 32u; ++i)
     afc_coefficients_[i] = static_cast<std::int16_t>(LoadBe16(afc.data() + i * 2u));
+  if (standard_task_) {
+    std::array<std::uint8_t, 256> sine{};
+    if (!ReadMain(resample_table_address_ + 0x400u, sine.data(), sine.size())) return false;
+    for (std::size_t i = 0; i < surround_sine_.size(); ++i)
+      surround_sine_[i] = static_cast<std::int16_t>(LoadBe16(sine.data() + 2u * i));
+  }
   tables_ready_ = true;
   return true;
 }
@@ -232,6 +285,9 @@ bool NativeJAudioHLE::Setup(const std::uint32_t* words, std::size_t count) {
                "GEKKOAOT_NATIVE_JAUDIO_HLE_V69=1 phase=setup voices=%u vpb=%08x src=%08x afc=%08x fx=%08x tables=%s\n",
                voice_count_, vpb_address_, resample_table_address_, afc_table_address_,
                fx_table_address_, tables_ready_ ? "guest" : "invalid");
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_JAUDIO_V245=1 pcm16-mram=1 vpb=active-direct writeback=0x%zx dac=front-lr-only trace-hot=off\n",
+               kVpbWritebackBytes);
   return true;
 }
 
@@ -289,15 +345,15 @@ void NativeJAudioHLE::ReadEffects() {
 
     for (std::size_t d = 0; d < 2u; ++d) {
       const std::uint16_t bus_id = LoadBe16(raw.data() + FX_DEST + d * 4u);
-      const std::int16_t volume = static_cast<std::int16_t>(LoadBe16(raw.data() + FX_DEST + d * 4u + 2u));
+      const std::uint16_t volume = LoadBe16(raw.data() + FX_DEST + d * 4u + 2u);
       auto* bus = BusForId(bus_id);
       if (!bus || bus_id == 0u || volume == 0) continue;
       for (std::size_t i = 0; i < kSamplesPerSubframe; ++i)
-        (*bus)[i] += static_cast<std::int32_t>((static_cast<std::int64_t>(work[i]) * volume) >> 15u);
+        (*bus)[i] = BusSample((*bus)[i] + Clamp16((static_cast<std::int64_t>(work[i]) * volume) >> 15u));
     }
-    if ((enabled & 1u) == 0u && (enabled & 2u) != 0u) filter();
+    if ((enabled & 2u) != 0u) filter();
     for (std::size_t i = 0; i < kSamplesPerSubframe; ++i)
-      buses_[kFeedback[fx]][i] += work[i];
+      buses_[kFeedback[fx]][i] = work[i];
   }
 }
 
@@ -330,7 +386,8 @@ void NativeJAudioHLE::BeginSubframe() {
     prev_bl_wet[i] = Clamp16(buses_[BackLeftWet][i]);
     prev_br_wet[i] = Clamp16(buses_[BackRightWet][i]);
   }
-  for (auto& bus : buses_) bus.fill(0);
+  buses_[FrontLeft].fill(0);
+  buses_[FrontRight].fill(0);
   for (std::size_t i = 0; i < kSamplesPerSubframe; ++i) {
     buses_[BackLeft][i] = static_cast<std::int32_t>(
         (static_cast<std::int64_t>(prev_bl[i]) * 0x6784) >> 15u);
@@ -339,15 +396,16 @@ void NativeJAudioHLE::BeginSubframe() {
   }
   ReadEffects();
   for (std::size_t i = 0; i < kSamplesPerSubframe; ++i) {
-    buses_[FrontLeftWet][i] += prev_bl_wet[i];
-    buses_[FrontRightWet][i] += static_cast<std::int32_t>(
-        (static_cast<std::int64_t>(prev_bl_wet[i]) * static_cast<std::int16_t>(0xb820)) >> 15u);
+    buses_[FrontLeftWet][i] = BusSample(buses_[FrontLeftWet][i] + Clamp16((static_cast<std::int64_t>(prev_bl_wet[i]) * 0x7fff) >> 15u));
+    buses_[FrontRightWet][i] = BusSample(buses_[FrontRightWet][i] + Clamp16((static_cast<std::int64_t>(prev_bl_wet[i]) * 0xb820) >> 15u));
     if (i >= kSamplesPerSubframe / 2u) {
-      buses_[FrontLeftWet][i - kSamplesPerSubframe / 2u] += static_cast<std::int32_t>(
-          (static_cast<std::int64_t>(prev_br_wet[i]) * static_cast<std::int16_t>(0xb820)) >> 15u);
-      buses_[FrontRightWet][i - kSamplesPerSubframe / 2u] += prev_br_wet[i];
+      const auto j = i - kSamplesPerSubframe / 2u;
+      buses_[FrontLeftWet][j] = BusSample(buses_[FrontLeftWet][j] + Clamp16((static_cast<std::int64_t>(prev_br_wet[i]) * 0xb820) >> 15u));
+      buses_[FrontRightWet][j] = BusSample(buses_[FrontRightWet][j] + Clamp16((static_cast<std::int64_t>(prev_br_wet[i]) * 0x7fff) >> 15u));
     }
   }
+  buses_[BackLeftWet].fill(0);
+  buses_[BackRightWet].fill(0);
 
   // The setup SRC table also carries four 64-sample oscillator patterns. The
   // last two are stateful in the light-JAudio microcode; evolve them once per
@@ -375,19 +433,24 @@ void NativeJAudioHLE::BeginSubframe() {
 
 void NativeJAudioHLE::FinishSubframe(std::int16_t* left, std::int16_t* right) {
   if (!left || !right) return;
+
+  // The JAudio DAC ucode writes the front L/R mix buffers after applying the
+  // 4.12 DSP mixer level. Back/wet/extra buffers feed those fronts through
+  // the normal mixer/reverb graph; adding them again here double-counts FX
+  // and rear energy and is a common source of clipping/muddy output.
   for (std::size_t i = 0; i < kSamplesPerSubframe; ++i) {
-    const std::int64_t wet = (static_cast<std::int64_t>(buses_[Extra0][i]) +
-                              buses_[Extra1][i] + buses_[Extra2][i] +
-                              buses_[FrontLeftWet][i] + buses_[FrontRightWet][i]) / 2;
-    std::int64_t l = static_cast<std::int64_t>(buses_[FrontLeft][i]) +
-                     ((static_cast<std::int64_t>(buses_[BackLeft][i]) * 0x6784) >> 15u) + wet;
-    std::int64_t r = static_cast<std::int64_t>(buses_[FrontRight][i]) +
-                     ((static_cast<std::int64_t>(buses_[BackRight][i]) * 0x6784) >> 15u) + wet;
-    l = (l * master_level_) >> 12u;
-    r = (r * master_level_) >> 12u;
+    const std::int64_t l =
+        (static_cast<std::int64_t>(buses_[FrontLeft][i]) * master_level_) >> 12u;
+    const std::int64_t r =
+        (static_cast<std::int64_t>(buses_[FrontRight][i]) * master_level_) >> 12u;
+    output_clips_ += (l < -32768 || l > 32767) ? 1u : 0u;
+    output_clips_ += (r < -32768 || r > 32767) ? 1u : 0u;
     left[i] = Clamp16(l);
     right[i] = Clamp16(r);
   }
+
+  // The rear dry buffers are persistent across frames and decay by 0x6784 in
+  // BeginSubframe(), matching the JAudio renderer's feedback behavior.
   previous_back_left_ = buses_[BackLeft];
   previous_back_right_ = buses_[BackRight];
   WriteEffects();
@@ -457,8 +520,9 @@ void NativeJAudioHLE::LoadPcm(Voice* voice, std::int16_t* output, std::uint16_t 
     const std::uint16_t take = static_cast<std::uint16_t>(
         std::min<std::uint32_t>(voice->U32(V_REMAINING), count));
     if (take == 0u) { voice->SetU16(V_DONE, 1u); std::fill(output, output + count, 0); return; }
-    std::vector<std::uint8_t> raw(static_cast<std::size_t>(take) * bytes_per_sample);
-    if (!ReadAram(voice->U32(V_ARAM), raw.data(), raw.size())) {
+    std::array<std::uint8_t, kRawSamples * 2u> raw{};
+    const std::size_t raw_bytes = static_cast<std::size_t>(take) * bytes_per_sample;
+    if (raw_bytes > raw.size() || !ReadAram(voice->U32(V_ARAM), raw.data(), raw_bytes)) {
       voice->SetU16(V_DONE, 1u); std::fill(output, output + count, 0); return;
     }
     if (bytes_per_sample == 1u) {
@@ -476,13 +540,90 @@ void NativeJAudioHLE::LoadPcm(Voice* voice, std::int16_t* output, std::uint16_t 
   }
 }
 
+void NativeJAudioHLE::LoadPcmMram(Voice* voice, std::int16_t* output,
+                                   std::uint16_t count) {
+  if (!voice || !output || count == 0u) return;
+  if (voice->U16(V_DONE) != 0u) {
+    std::fill(output, output + count, 0);
+    return;
+  }
+
+  // JAudio source type 33 is raw big-endian PCM16 in main RAM. Unlike the
+  // ARAM PCM sources, its stream cursor uses the high 16-bit position field
+  // directly and may switch the base pointer at the loop boundary.
+  std::uint16_t current = voice->U16(V_POSITION);
+  std::uint32_t base = voice->U32(V_BASE);
+  std::uint32_t remaining = voice->U32(V_REMAINING);
+
+  auto read_samples = [&](std::uint32_t address, std::int16_t* dst,
+                          std::uint32_t samples) -> bool {
+    if (samples == 0u) return true;
+    return ReadMainS16(address, dst, samples);
+  };
+
+  if (count > remaining) {
+    std::int16_t last = 0;
+    if (remaining != 0u) {
+      if (!read_samples(base + static_cast<std::uint32_t>(current) * 2u,
+                        output, remaining)) {
+        std::fill(output, output + count, 0);
+        voice->SetU16(V_DONE, 1u);
+        return;
+      }
+      last = output[remaining - 1u];
+    }
+    std::fill(output + remaining, output + count, last);
+    current = static_cast<std::uint16_t>(current + remaining);
+    voice->SetU16(V_POSITION, current);
+    voice->SetU32(V_REMAINING, 0u);
+    voice->SetU16(V_DONE, 1u);
+    return;
+  }
+
+  voice->SetU32(V_REMAINING, remaining - count);
+  const std::uint16_t loop_start = voice->U16(V_LOOP_END);
+  const std::uint16_t before_loop =
+      static_cast<std::uint16_t>(loop_start - current);
+  voice->SetU16(V_SAMPLES_BEFORE_LOOP, before_loop);
+
+  if (count <= before_loop) {
+    if (!read_samples(base + static_cast<std::uint32_t>(current) * 2u,
+                      output, count)) {
+      std::fill(output, output + count, 0);
+      voice->SetU16(V_DONE, 1u);
+      return;
+    }
+    voice->SetU16(V_POSITION, static_cast<std::uint16_t>(current + count));
+    return;
+  }
+
+  const std::uint16_t first = before_loop;
+  if (first != 0u &&
+      !read_samples(base + static_cast<std::uint32_t>(current) * 2u,
+                    output, first)) {
+    std::fill(output, output + count, 0);
+    voice->SetU16(V_DONE, 1u);
+    return;
+  }
+
+  const std::uint32_t loop_base = voice->U32(V_LOOP_ADDRESS);
+  const std::uint16_t second = static_cast<std::uint16_t>(count - first);
+  voice->SetU32(V_BASE, loop_base);
+  voice->SetU16(V_POSITION, second);
+  if (second != 0u && !read_samples(loop_base, output + first, second)) {
+    std::fill(output + first, output + count, 0);
+    voice->SetU16(V_DONE, 1u);
+  }
+}
+
 bool NativeJAudioHLE::DecodeAfcBlocks(Voice* voice, std::int16_t* output, std::size_t blocks) {
   if (!voice || !output || blocks == 0u) return blocks == 0u;
   const std::uint16_t source_type = voice->U16(V_SOURCE_TYPE);
   const std::uint8_t block_bytes = source_type == SRC_AFC_4BIT ? 9u : 5u;
-  std::vector<std::uint8_t> raw(blocks * block_bytes);
-  if (!ReadAram(voice->U32(V_ARAM), raw.data(), raw.size())) return false;
-  voice->SetU32(V_ARAM, voice->U32(V_ARAM) + static_cast<std::uint32_t>(raw.size()));
+  std::array<std::uint8_t, ((kRawSamples + 15u) / 16u) * 9u> raw{};
+  const std::size_t raw_bytes = blocks * block_bytes;
+  if (raw_bytes > raw.size() || !ReadAram(voice->U32(V_ARAM), raw.data(), raw_bytes)) return false;
+  voice->SetU32(V_ARAM, voice->U32(V_ARAM) + static_cast<std::uint32_t>(raw_bytes));
 
   std::int32_t yn2 = voice->S16(V_AFC_SAMPLES + 14u * 2u);
   std::int32_t yn1 = voice->S16(V_AFC_SAMPLES + 15u * 2u);
@@ -490,7 +631,7 @@ bool NativeJAudioHLE::DecodeAfcBlocks(Voice* voice, std::int16_t* output, std::s
   for (std::size_t block = 0; block < blocks; ++block) {
     const std::uint8_t header = source[0];
     const std::uint32_t shift = header >> 4u;
-    const std::int32_t scale = shift < 16u ? (1 << shift) : 0;
+    const std::int32_t scale = static_cast<std::int16_t>(1u << shift);
     const std::size_t predictor = header & 0x0fu;
     const std::int32_t c0 = afc_coefficients_[predictor * 2u];
     const std::int32_t c1 = afc_coefficients_[predictor * 2u + 1u];
@@ -505,7 +646,7 @@ bool NativeJAudioHLE::DecodeAfcBlocks(Voice* voice, std::int16_t* output, std::s
         const std::uint8_t bits = static_cast<std::uint8_t>((b >> (6u - ((i & 3u) * 2u))) & 3u);
         q = SignExtend2(bits) * 4;
       }
-      const std::int64_t sum = (static_cast<std::int64_t>(q) * scale << 11u) +
+      const std::int64_t sum = (static_cast<std::int64_t>(q) * scale * 2048) +
                                static_cast<std::int64_t>(yn1) * c0 +
                                static_cast<std::int64_t>(yn2) * c1;
       const std::int16_t sample = Clamp16(sum >> 11u);
@@ -532,8 +673,8 @@ void NativeJAudioHLE::LoadAfc(Voice* voice, std::int16_t* output, std::uint16_t 
   if (voice->U16(V_DONE) != 0u) { std::fill(output, output + count, 0); return; }
 
   while (count != 0u) {
-    const std::uint16_t cached = std::min<std::uint16_t>(voice->U16(V_AFC_CACHED), count);
-    const std::uint16_t cached_total = voice->U16(V_AFC_CACHED);
+    const std::uint16_t cached_total = std::min<std::uint16_t>(voice->U16(V_AFC_CACHED), 16u);
+    const std::uint16_t cached = std::min<std::uint16_t>(cached_total, count);
     for (std::uint16_t i = 0; i < cached; ++i) {
       const std::size_t index = 16u - cached_total + i;
       *output++ = voice->S16(V_AFC_SAMPLES + index * 2u);
@@ -559,10 +700,14 @@ void NativeJAudioHLE::LoadAfc(Voice* voice, std::int16_t* output, std::uint16_t 
       voice->SetU32(V_REMAINING, remaining - usable);
       if (usable > take) {
         const std::uint32_t cache_count = std::min<std::uint32_t>(16u, usable - take);
-        const std::uint32_t cache_start = take;
         for (std::uint32_t i = 0; i < 16u; ++i)
-          voice->SetS16(V_AFC_SAMPLES + i * 2u,
-                        i < cache_count ? decoded[cache_start + i] : 0);
+          voice->SetS16(V_AFC_SAMPLES + i * 2u, decoded[decoded_count - 16u + i]);
+        // At a non-aligned end, the valid tail must be right-aligned for the
+        // next cache read. Loop restart supplies its own predictor history.
+        if (usable < decoded_count) {
+          for (std::uint32_t i = 0; i < cache_count; ++i)
+            voice->SetS16(V_AFC_SAMPLES + (16u - cache_count + i) * 2u, decoded[take + i]);
+        }
         voice->SetU16(V_AFC_CACHED, static_cast<std::uint16_t>(cache_count));
       }
       if (count == 0u) return;
@@ -586,9 +731,12 @@ void NativeJAudioHLE::LoadAfc(Voice* voice, std::int16_t* output, std::uint16_t 
         voice->SetU16(V_DONE, 1u); std::fill(output, output + count, 0); return;
       }
       const std::uint32_t skip = loop_sample & 15u;
-      const std::uint32_t cached_count = 16u - skip;
+      const std::uint32_t cached_count = std::min(16u - skip, end_sample - loop_sample);
       for (std::uint32_t i = 0; i < 16u; ++i)
-        voice->SetS16(V_AFC_SAMPLES + i * 2u, i < cached_count ? loop_block[skip + i] : 0);
+        voice->SetS16(V_AFC_SAMPLES + i * 2u, loop_block[i]);
+      if (cached_count < 16u - skip)
+        for (std::uint32_t i = 0; i < cached_count; ++i)
+          voice->SetS16(V_AFC_SAMPLES + (16u - cached_count + i) * 2u, loop_block[skip + i]);
       voice->SetU16(V_AFC_CACHED, static_cast<std::uint16_t>(cached_count));
       voice->SetU32(V_REMAINING, end_sample - loop_sample - cached_count);
     }
@@ -653,6 +801,8 @@ void NativeJAudioHLE::LoadInput(std::uint32_t index, Voice* voice, MixBuffer* ou
     LoadPcm(voice, raw.data() + 4u, needed, 1u);
   else if (type == SRC_PCM16)
     LoadPcm(voice, raw.data() + 4u, needed, 2u);
+  else if (type == SRC_PCM16_MRAM)
+    LoadPcmMram(voice, raw.data() + 4u, needed);
   else {
     output->fill(0);
     if (unsupported_sources_++ < 16u)
@@ -724,23 +874,24 @@ void NativeJAudioHLE::MixVoice(Voice* voice, const MixBuffer& samples) {
     const std::size_t x = (pos >> 8u) & 0x7fu, y = pos & 0x7fu;
     const std::int32_t right = surround_sine_[x], left = surround_sine_[x ^ 0x7fu];
     const std::int32_t back = surround_sine_[y], front = surround_sine_[y ^ 0x7fu];
-    const std::array<std::int32_t,4> quad = {
-      (left * front) >> 16u, (left * back) >> 16u,
-      (right * front) >> 16u, (right * back) >> 16u};
+    const unsigned shift = dolby_louder_ ? 15u : 16u;
+    const std::array<std::int16_t,4> quad = {
+      static_cast<std::int16_t>((left * front) >> shift),
+      static_cast<std::int16_t>((left * back) >> shift),
+      static_cast<std::int16_t>((right * front) >> shift),
+      static_cast<std::int16_t>((right * back) >> shift)};
     const std::array<Bus,4> dry = {FrontLeft, BackLeft, FrontRight, BackRight};
     const std::array<Bus,4> wet = {FrontLeftWet, BackLeftWet, FrontRightWet, BackRightWet};
-    const std::int32_t current = voice->S16(V_DOLBY_CURRENT), target = voice->S16(V_DOLBY_TARGET);
+    const std::int16_t current = voice->S16(V_DOLBY_CURRENT), target = voice->S16(V_DOLBY_TARGET);
+    const std::int16_t delta = static_cast<std::int16_t>(target - current);
     const std::int32_t reverb = voice->S16(V_DOLBY_REVERB);
     for (std::size_t q = 0; q < 4u; ++q) {
-      const std::int32_t start = static_cast<std::int32_t>((static_cast<std::int64_t>(quad[q]) * current) >> 16u);
-      const std::int32_t end = static_cast<std::int32_t>((static_cast<std::int64_t>(quad[q]) * target) >> 16u);
-      for (std::size_t i = 0; i < kSamplesPerSubframe; ++i) {
-        const std::int32_t gain = start + static_cast<std::int32_t>(
-            (static_cast<std::int64_t>(end - start) * i) / kSamplesPerSubframe);
-        buses_[dry[q]][i] += static_cast<std::int32_t>((static_cast<std::int64_t>(samples[i]) * gain) >> 15u);
-        const std::int32_t wet_gain = static_cast<std::int32_t>((static_cast<std::int64_t>(gain) * reverb) >> 15u);
-        buses_[wet[q]][i] += static_cast<std::int32_t>((static_cast<std::int64_t>(samples[i]) * wet_gain) >> 15u);
-      }
+      const auto start = static_cast<std::int16_t>((quad[q] * current) >> shift);
+      const auto step = static_cast<std::int16_t>((static_cast<std::uint16_t>(quad[q]) * delta) >> shift);
+      const auto wet_start = static_cast<std::int16_t>((start * reverb) >> shift);
+      const auto wet_step = static_cast<std::int16_t>((step * reverb) >> shift);
+      RampMix(buses_[dry[q]], samples, start, step);
+      RampMix(buses_[wet[q]], samples, wet_start, wet_step);
     }
     voice->SetS16(V_DOLBY_CURRENT, static_cast<std::int16_t>(target));
     return;
@@ -762,14 +913,9 @@ void NativeJAudioHLE::MixVoice(Voice* voice, const MixBuffer& samples) {
     const std::uint16_t id = voice->U16(off + M_ID);
     auto* bus = BusForId(id);
     if (!bus || id == 0u) continue;
-    const std::int32_t current = voice->S16(off + M_CURRENT);
-    const std::int32_t target = voice->S16(off + M_TARGET);
-    for (std::size_t i = 0; i < kSamplesPerSubframe; ++i) {
-      const std::int32_t gain = current + static_cast<std::int32_t>(
-          (static_cast<std::int64_t>(target - current) * i) / kSamplesPerSubframe);
-      (*bus)[i] += static_cast<std::int32_t>((static_cast<std::int64_t>(samples[i]) * gain) >> 15u);
-    }
-    voice->SetS16(off + M_CURRENT, static_cast<std::int16_t>(target));
+    const std::int16_t current = voice->S16(off + M_CURRENT);
+    const std::int16_t delta = static_cast<std::int16_t>(voice->S16(off + M_TARGET) - current);
+    voice->SetS16(off + M_CURRENT, RampMix(*bus, samples, current, delta));
   }
 }
 
@@ -780,9 +926,61 @@ void NativeJAudioHLE::RenderVoice(std::uint32_t index, Voice* voice) {
   if (voice->S16(V_LPF_COEF) != 0) ApplyLowPass(voice, &input);
   if ((voice->U16(V_FILTER_MODE) & 0x1fu) != 0u) ApplyFir(voice, &input);
   if ((voice->U16(V_FILTER_MODE) & 0x20u) != 0u) ApplyBiquad(voice, &input);
+  static const bool trace = [] { const char* v = std::getenv("GEKKOAOT_TRACE_DSP"); return v && std::strcmp(v,"0") != 0; }();
+  static unsigned trace_voices = 0;
+  if (trace && trace_voices++ < 32u) {
+    const auto [lo,hi] = std::minmax_element(input.begin(), input.end());
+    std::fprintf(stderr,"GEKKOAOT_JAUDIO_VOICE index=%u type=%u constant=%u ratio=%04x min=%d max=%d pos=%08x remaining=%u dolby=%u gains=%04x/%04x\n",index,voice->U16(V_SOURCE_TYPE),voice->U16(V_CONSTANT),voice->U16(V_RATIO),*lo,*hi,voice->U32(V_POSITION),voice->U32(V_REMAINING),voice->U16(V_DOLBY_ENABLE),voice->U16(V_MIX+M_CURRENT),voice->U16(V_MIX+M_TARGET));
+  }
   MixVoice(voice, input);
   if (voice->U16(V_CONSTANT) == 0u) voice->SetU16(V_RESET, 0u);
   ++voices_mixed_;
+}
+
+void NativeJAudioHLE::RenderVoiceRange(std::uint32_t begin, std::uint32_t end,
+                                      const std::array<std::uint16_t, 4>* mask, std::uint8_t* table) {
+  // VPBs are linear in MEM1. Borrow one contiguous span per DSP work item so
+  // inactive voice checks are two BE16 loads instead of Resolve+384B memcpy.
+  // If the table is not directly resolvable (future paged/MMU path), retain
+  // the exact CoreReadMain/CoreWriteMain fallback.
+  const std::uint32_t table_bytes =
+      voice_count_ * static_cast<std::uint32_t>(kVpbBytes);
+  std::uint8_t* const vpb_table =
+      table ? table : (dsp_ ? dsp_->CoreResolveMain(vpb_address_, table_bytes) : nullptr);
+
+    for (std::uint32_t voice_index = begin; voice_index < std::min(end, voice_count_); ++voice_index) {
+      if (mask && ((*mask)[voice_index >> 4u] & (1u << (15u - (voice_index & 15u)))) == 0u) continue;
+      ++voice_slots_scanned_;
+      Voice voice{};
+
+      if (vpb_table) {
+        std::uint8_t* const raw =
+            vpb_table + voice_index * static_cast<std::uint32_t>(kVpbBytes);
+        if (LoadBe16(raw + V_ENABLED) == 0u || LoadBe16(raw + V_DONE) != 0u) {
+          ++voice_slots_skipped_;
+          continue;
+        }
+        std::memcpy(voice.bytes.data(), raw, kVpbBytes);
+        ++voice_full_loads_;
+        RenderVoice(voice_index, &voice);
+        std::memcpy(raw, voice.bytes.data(), kVpbWritebackBytes);
+      } else {
+        // Conservative fallback for non-contiguous/paged guest memory.
+        std::array<std::uint8_t, 4> header{};
+        const std::uint32_t voice_address =
+            vpb_address_ + voice_index * static_cast<std::uint32_t>(kVpbBytes);
+        if (!ReadMain(voice_address, header.data(), header.size())) continue;
+        if (LoadBe16(header.data() + V_ENABLED) == 0u ||
+            LoadBe16(header.data() + V_DONE) != 0u) {
+          ++voice_slots_skipped_;
+          continue;
+        }
+        if (!LoadVoice(voice_index, &voice)) continue;
+        ++voice_full_loads_;
+        RenderVoice(voice_index, &voice);
+        (void)StoreVoice(voice_index, voice);
+      }
+    }
 }
 
 bool NativeJAudioHLE::Sync(const std::uint32_t* words, std::size_t count) {
@@ -794,28 +992,224 @@ bool NativeJAudioHLE::Sync(const std::uint32_t* words, std::size_t count) {
   const std::uint32_t right_address = words[2] & 0x3fffffffu;
   if (left_address == 0u || right_address == 0u) return false;
 
-  std::vector<std::int16_t> left(subframes * kSamplesPerSubframe);
-  std::vector<std::int16_t> right(subframes * kSamplesPerSubframe);
+  std::array<std::int16_t, kMaxSubframes * kSamplesPerSubframe> left{};
+  std::array<std::int16_t, kMaxSubframes * kSamplesPerSubframe> right{};
+  const std::size_t output_samples = static_cast<std::size_t>(subframes) * kSamplesPerSubframe;
+
+  auto* vpb_table = dsp_ ? dsp_->CoreResolveMain(vpb_address_, voice_count_ * kVpbBytes) : nullptr;
   for (std::uint32_t sf = 0; sf < subframes; ++sf) {
     BeginSubframe();
-    for (std::uint32_t voice_index = 0; voice_index < voice_count_; ++voice_index) {
-      Voice voice{};
-      if (!LoadVoice(voice_index, &voice)) continue;
-      RenderVoice(voice_index, &voice);
-      (void)StoreVoice(voice_index, voice);
-    }
+    RenderVoiceRange(0u, voice_count_, nullptr, vpb_table);
     FinishSubframe(left.data() + sf * kSamplesPerSubframe,
                    right.data() + sf * kSamplesPerSubframe);
   }
-  if (!WriteMainS16(left_address, left.data(), left.size()) ||
-      !WriteMainS16(right_address, right.data(), right.size())) return false;
+  if (!WriteMainS16(left_address, left.data(), output_samples) ||
+      !WriteMainS16(right_address, right.data(), output_samples)) return false;
   ++sync_frames_;
   if (sync_frames_ <= 8u || (sync_frames_ % 256u) == 0u)
     std::fprintf(stderr,
-                 "GEKKOAOT_NATIVE_JAUDIO_HLE_V69=1 phase=sync frame=%llu subframes=%u samples=%zu master=%04x voices_total=%llu out=%08x/%08x\n",
-                 static_cast<unsigned long long>(sync_frames_), subframes, left.size(), master_level_,
-                 static_cast<unsigned long long>(voices_mixed_), left_address, right_address);
+                 "GEKKOAOT_NATIVE_JAUDIO_V245=1 phase=sync frame=%llu subframes=%u samples=%zu master=%04x voices_total=%llu scanned=%llu full=%llu skipped=%llu clips=%llu vpb_path=%s out=%08x/%08x\n",
+                 static_cast<unsigned long long>(sync_frames_), subframes, output_samples, master_level_,
+                 static_cast<unsigned long long>(voices_mixed_),
+                 static_cast<unsigned long long>(voice_slots_scanned_),
+                 static_cast<unsigned long long>(voice_full_loads_),
+                 static_cast<unsigned long long>(voice_slots_skipped_),
+                 static_cast<unsigned long long>(output_clips_),
+                 vpb_table ? "direct" : "copy-fallback", left_address, right_address);
   return true;
+}
+
+// Protocol and microcode profiles cross-checked against Dolphin Zelda.cpp
+// (GPL-2.0-or-later). No guest microcode is embedded in this native renderer.
+bool NativeJAudioHLE::ProbeStandardTask(std::uint32_t address, std::uint32_t bytes) {
+  Reset();
+  if (!dsp_ || bytes == 0u || bytes > 0x10000u) return false;
+  const auto* code = dsp_->CoreResolveMain(address, bytes);
+  if (!code) return false;
+  std::uint32_t hash = 0;
+  for (std::uint32_t i = 0; i < bytes; ++i) {
+    hash ^= code[i];
+    hash = (hash << 3u) | (hash >> 29u);
+  }
+  if (hash != 0x2fcdf1ecu && hash != 0x86840740u) return false;
+  standard_task_ = true;
+  standard_image_hash_ = hash;
+  dolby_louder_ = hash == 0x2fcdf1ecu;
+  std::fprintf(stderr, "GEKKOAOT_NATIVE_JAUDIO_STANDARD_V246=1 hash=%08x protocol=voice-sync dolby_louder=%u\n", hash, unsigned(dolby_louder_));
+  return true;
+}
+
+void NativeJAudioHLE::StartStandardTask() {
+  standard_ready_ = true;
+  standard_replies_.push_back({0xf3551111u, false});
+}
+
+void NativeJAudioHLE::QueueStandardAck(std::uint16_t token) {
+  standard_replies_.push_back({0xdcd10004u, true, 0x2000u});
+  standard_replies_.push_back({0xf3550000u | token, false});
+}
+
+void NativeJAudioHLE::AdvanceStandardMail(std::uint64_t cycles) {
+  if (!standard_ready_ || !dsp_ || dsp_->DspMailboxPending() || standard_replies_.empty()) return;
+  auto& queued = standard_replies_.front();
+  // Sticky DSP_CONTROL causes must be acknowledged before the next IRQ.
+  // Posting it inside syncDSP would let the old handler clear the new cause.
+  if (queued.irq && (dsp_->Control() & 0x80u) != 0u) return;
+  if (cycles < queued.delay) { queued.delay -= cycles; return; }
+  const auto reply = queued;
+  standard_replies_.pop_front();
+  dsp_->PostDspMailbox(reply.value, reply.irq);
+}
+
+std::uint64_t NativeJAudioHLE::CyclesUntilStandardMail() const {
+  if (!standard_ready_ || !dsp_ || dsp_->DspMailboxPending() || standard_replies_.empty())
+    return std::numeric_limits<std::uint64_t>::max();
+  return std::max<std::uint64_t>(standard_replies_.front().delay, 1u);
+}
+
+void NativeJAudioHLE::RenderStandard() {
+  while (standard_frame_ < standard_frames_) {
+    if (standard_voice_ == 0u && standard_max_voice_ == 0u) BeginSubframe();
+    const auto end = std::min(standard_max_voice_, voice_count_);
+    RenderVoiceRange(standard_voice_, end, &standard_masks_);
+    standard_voice_ = end;
+    if (standard_voice_ < voice_count_) return;
+    std::array<std::int16_t, kSamplesPerSubframe> left{}, right{};
+    FinishSubframe(left.data(), right.data());
+    (void)WriteMainS16(standard_left_, left.data(), left.size());
+    (void)WriteMainS16(standard_right_, right.data(), right.size());
+    standard_left_ += kSamplesPerSubframe * 2u;
+    standard_right_ += kSamplesPerSubframe * 2u;
+    QueueStandardAck(static_cast<std::uint16_t>(0xff00u | standard_frame_));
+    ++standard_frame_;
+    ++sync_frames_;
+    if (sync_frames_ <= 8u || (sync_frames_ & 255u) == 0u)
+      std::fprintf(stderr, "GEKKOAOT_JAUDIO_STANDARD_RENDER frame=%llu voices=%llu clips=%llu\n", static_cast<unsigned long long>(sync_frames_), static_cast<unsigned long long>(voices_mixed_), static_cast<unsigned long long>(output_clips_));
+    standard_voice_ = standard_max_voice_ = 0;
+    if (standard_frame_ < standard_frames_) {
+      BeginSubframe();
+      return;
+    }
+  }
+  standard_replies_.push_back({0xdcd10003u, true});
+  standard_blocked_ = true;
+}
+
+bool NativeJAudioHLE::HandleStandardMail(std::uint32_t mail) {
+  if (!standard_task_ || !standard_ready_) return false;
+  const auto payload = mail & 0x7fffffffu;
+  static const bool trace = [] { const char* value = std::getenv("GEKKOAOT_TRACE_DSP"); return value && std::strcmp(value, "0") != 0; }();
+  static unsigned trace_mails = 0;
+  if (trace && trace_mails++ < 1024u)
+    std::fprintf(stderr, "GEKKOAOT_JAUDIO_STANDARD_MAIL state=%u mail=%08x packet=%u/%u frame=%u/%u voice=%u blocked=%u\n", unsigned(standard_state_), mail, standard_seen_, standard_expected_, standard_frame_, standard_frames_, standard_voice_, unsigned(standard_blocked_));
+  switch (standard_state_) {
+  case StandardState::Upload: {
+    standard_upload_[standard_upload_seen_++] = payload;
+    if (standard_upload_seen_ != standard_upload_.size()) return true;
+    const auto bytes = standard_upload_[4] & 0xffffu;
+    const auto* code = dsp_->CoreResolveMain(standard_upload_[3], bytes);
+    std::uint32_t hash = 0;
+    if (code) for (std::uint32_t i = 0; i < bytes; ++i) {
+      hash ^= code[i]; hash = (hash << 3u) | (hash >> 29u);
+    }
+    // JAS yields and restores the same renderer task at its resume entry.
+    // Preserve native renderer state rather than rebooting it. A different
+    // image or a DRAM download is not admitted by this self-restore path.
+    if (!code || bytes == 0u || hash != standard_image_hash_ ||
+        (standard_upload_[1] & 0xffffu) != 0u || standard_upload_[5] != 0u) {
+      standard_state_ = StandardState::Halted;
+      std::fprintf(stderr, "GEKKOAOT_JAUDIO_STANDARD_UPLOAD_UNSUPPORTED hash=%08x bytes=%u\n", hash, bytes);
+      return true;
+    }
+    standard_state_ = StandardState::Waiting;
+    standard_blocked_ = false;
+    standard_replies_.push_back({0xdcd10001u, true, 0x2000u});
+    RunPendingStandardPackets();
+    return true;
+  }
+  case StandardState::Halted: return true;
+  case StandardState::SyncMask: {
+    const auto group = (payload >> 16u) & 0xffu;
+    if (group >= standard_masks_.size()) { standard_state_ = StandardState::Halted; return true; }
+    standard_masks_[group] = static_cast<std::uint16_t>(payload);
+    standard_max_voice_ = (group + 1u) * 16u;
+    RenderStandard();
+    standard_state_ = StandardState::Waiting;
+    return true;
+  }
+  case StandardState::Waiting:
+    if ((payload & 0xffff0000u) == 0x4dd10000u) {
+      // CONTINUE releases the next work packet after DSP_FRAME_END.
+      if ((payload & 0xffffu) == 1u) {
+        standard_state_ = StandardState::Upload;
+        standard_upload_seen_ = 0;
+      } else if ((payload & 0xffffu) == 3u) {
+        standard_blocked_ = false;
+        RunPendingStandardPackets();
+      }
+      else standard_state_ = StandardState::Halted;
+      return true;
+    }
+    if ((payload & 0xffffu) == 0u) {
+      if (standard_frame_ < standard_frames_) standard_state_ = StandardState::SyncMask;
+      return true;
+    }
+    standard_expected_ = payload & 0xffffu;
+    standard_seen_ = 0;
+    if (standard_expected_ > standard_packet_.size()) {
+      standard_state_ = StandardState::Halted;
+      return true;
+    }
+    standard_state_ = StandardState::Packet;
+    return true;
+  case StandardState::Packet:
+    standard_packet_[standard_seen_++] = mail;
+    if (standard_seen_ != standard_expected_) return true;
+    standard_state_ = StandardState::Waiting;
+    if (standard_blocked_ || standard_frame_ < standard_frames_) {
+      if (standard_pending_packets_.size() >= 64u) standard_state_ = StandardState::Halted;
+      else standard_pending_packets_.push_back({standard_packet_, standard_expected_});
+    } else ExecuteStandardPacket(standard_packet_, standard_expected_);
+    return true;
+  }
+  return true;
+}
+
+void NativeJAudioHLE::ExecuteStandardPacket(const std::array<std::uint32_t, 32>& packet, unsigned count) {
+    const auto token = static_cast<std::uint16_t>(packet[0] >> 16u);
+    switch (token & 0x7f00u) {
+    case 0x0100u:
+      if (Setup(packet.data(), count)) QueueStandardAck(token);
+      break;
+    case 0x0200u:
+      if (active_ && count == 3u) {
+        master_level_ = static_cast<std::uint16_t>(packet[0]);
+        standard_frames_ = token & 0xffu;
+        standard_frame_ = standard_voice_ = standard_max_voice_ = 0u;
+        standard_masks_.fill(0);
+        standard_left_ = packet[1] & 0x3fffffffu;
+        standard_right_ = packet[2] & 0x3fffffffu;
+        RenderStandard();
+      }
+      break;
+    case 0x0000u: case 0x0300u: case 0x0cu << 8u: case 0x0eu << 8u: case 0x0fu << 8u:
+      QueueStandardAck(token);
+      break;
+    case 0x0d00u:
+      // GameCube ARAM-base command has no effect on the ARAM device.
+      QueueStandardAck(token);
+      break;
+    default: standard_state_ = StandardState::Halted; break;
+    }
+}
+
+void NativeJAudioHLE::RunPendingStandardPackets() {
+  while (!standard_blocked_ && standard_frame_ == standard_frames_ &&
+         standard_state_ != StandardState::Halted && !standard_pending_packets_.empty()) {
+    auto next = standard_pending_packets_.front();
+    standard_pending_packets_.pop_front();
+    ExecuteStandardPacket(next.words, next.count);
+  }
 }
 
 bool NativeJAudioHLE::HandlePacket(const std::uint32_t* words, std::size_t count) {

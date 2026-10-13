@@ -1,0 +1,61 @@
+--- a/src/backend/llvm/memory_service.cpp
++++ b/src/backend/llvm/memory_service.cpp
+@@ -1,5 +1,7 @@
+ #include "backend/llvm/emitter.h"
+ #include "cpu/cpu.h"
++#include <cstdlib>
++#include <cstring>
+ 
+ #include <llvm/IR/BasicBlock.h>
+ #include <llvm/IR/Function.h>
+@@ -158,13 +160,27 @@
+       BasicBlock::Create(context_, "write_slow_done", function_);
+   builder_.CreateCondBr(builder_.CreateIsNotNull(function), call, done);
+   builder_.SetInsertPoint(call);
++  Value *stored = builder_.CreateZExtOrTrunc(value, Type::getInt64Ty(context_));
++  const char *tryLowering = std::getenv("DOLRECOMP_NATIVE_WGPIPE_TRY_LOWERING");
++  if (nativeSymbol && std::strcmp(nativeSymbol, "gekkoaot_wgpipe_write") == 0 &&
++      tryLowering && std::strcmp(tryLowering, "1") == 0) {
++    auto tryWrite = module_.getOrInsertFunction("gekkoaot_try_wgpipe_write",
++        FunctionType::get(Type::getInt32Ty(context_),
++            {pointer, Type::getInt32Ty(context_), Type::getInt64Ty(context_),
++             Type::getInt8Ty(context_), Type::getInt32Ty(context_)}, false));
++    Value *accepted = builder_.CreateCall(tryWrite,
++        {ctx_, address, stored, builder_.getInt8(width), builder_.getInt32(current_pc_)});
++    BasicBlock *full = BasicBlock::Create(context_, "wgpipe_full_boundary", function_);
++    builder_.CreateCondBr(builder_.CreateICmpNE(accepted, builder_.getInt32(0)), done, full);
++    builder_.SetInsertPoint(full);
++    function_->addFnAttr("dolrecomp-native-wgpipe-try", "244");
++  }
+   materialize(current_pc_);
+   auto *functionType = FunctionType::get(
+       Type::getVoidTy(context_),
+       {pointer, Type::getInt32Ty(context_), Type::getInt64Ty(context_),
+        Type::getInt8Ty(context_)},
+       false);
+-  Value *stored = builder_.CreateZExtOrTrunc(value, Type::getInt64Ty(context_));
+   if (nativeSymbol)
+     builder_.CreateCall(module_.getOrInsertFunction(nativeSymbol, functionType),
+                         {ctx_, address, stored, builder_.getInt8(width)});
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -240,7 +240,7 @@
+       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+       "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
+       "x86-return-registers=3|"
+-      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s",
++      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s",
+       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+       static_cast<unsigned>(options ? options->native_abi_policy
+@@ -253,6 +253,9 @@
+           ? "|sdk-clock-lowering=238" : "",
+       std::getenv("DOLRECOMP_NATIVE_HARDWARE_LOWERING") &&
+           std::string(std::getenv("DOLRECOMP_NATIVE_HARDWARE_LOWERING")) == "1"
+-          ? "|native-hardware-lowering=243" : "");
++          ? "|native-hardware-lowering=243" : "",
++      std::getenv("DOLRECOMP_NATIVE_WGPIPE_TRY_LOWERING") &&
++          std::string(std::getenv("DOLRECOMP_NATIVE_WGPIPE_TRY_LOWERING")) == "1"
++          ? "|native-wgpipe-try=244" : "");
+   return written >= 0 && static_cast<size_t>(written) < size;
+ }

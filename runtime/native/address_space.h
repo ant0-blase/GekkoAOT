@@ -4,8 +4,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <span>
-#include <vector>
+#include "guest_ram.h"
+#include "guest_address_window.h"
+#include "core/native_hardware.h"
 
 namespace GekkoAOT::Native {
 
@@ -30,11 +33,23 @@ public:
   static constexpr std::uint32_t RetailFakeVmemSize = 0x02000000u;
 
   explicit AddressSpace(bool enable_mem2 = false)
-      : mem1_(CompatMem1BackingSize), mem2_(enable_mem2 ? RetailMem2Size : 0u),
-        fake_vmem_(RetailFakeVmemSize) {}
+      : AddressSpace(CompatMem1BackingSize, enable_mem2 ? RetailMem2Size : 0u) {}
 
   AddressSpace(std::size_t mem1_size, std::size_t mem2_size)
-      : mem1_(mem1_size), mem2_(mem2_size), fake_vmem_(RetailFakeVmemSize) {}
+      : window_(mem1_size, mem2_size, RetailFakeVmemSize),
+        mem1_(mem1_size, window_.Ready() ? window_.Base() : nullptr),
+        mem2_(mem2_size, window_.Ready() && mem2_size ? window_.Base() + Mem2PhysicalBase : nullptr),
+        fake_vmem_(RetailFakeVmemSize, window_.Ready() ? window_.Base() + FakeVmemBase : nullptr),
+        flat_vmem_view_{fake_vmem_.data(), RetailFakeVmemSize, 0xffffffffu, nullptr, nullptr} {
+    flat_vmem_view_.paged_pages = paged_pages_.data();
+    flat_vmem_view_.paged_mru = paged_mru_.data();
+  }
+  AddressSpace(const AddressSpace&) = delete;
+  AddressSpace& operator=(const AddressSpace&) = delete;
+
+  // A fixed base is an address-layout contract, not permission to access MMIO
+  // or bypass the game's page tables. Resolve() retains all existing checks.
+  std::uint8_t* NativeAddressBase() const { return window_.Base(); }
 
   std::span<std::uint8_t> Mem1() { return mem1_; }
   std::span<const std::uint8_t> Mem1() const { return mem1_; }
@@ -42,8 +57,20 @@ public:
   std::span<std::uint8_t> Mem2() { return mem2_; }
   std::span<const std::uint8_t> Mem2() const { return mem2_; }
   std::span<std::uint8_t> FakeVmem() { return paged_vmem_ ? std::span<std::uint8_t>{} : fake_vmem_; }
+  // v274: the backing buffer regardless of paging, for write tracking.
+  std::span<std::uint8_t> FakeVmemBacking() { return fake_vmem_; }
   std::span<const std::uint8_t> FakeVmem() const { return paged_vmem_ ? std::span<const std::uint8_t>{} : fake_vmem_; }
-  void SetPagedVmem(bool enabled) { paged_vmem_ = enabled; }
+  const GekkoAOTFlatVmemView* FlatVmemView() const { return &flat_vmem_view_; }
+  // v322: DTLB mirror for the paged aperture (layout in native_hardware.h).
+  static constexpr std::uint32_t PagedViewPages = RetailFakeVmemSize >> 12u;
+  std::span<std::uint32_t> PagedViewPagesTable() { return paged_pages_; }
+  std::span<std::uint8_t> PagedViewMru() { return paged_mru_; }
+  void SetPagedViewSr(std::uint32_t sr) { flat_vmem_view_.paged_sr = sr; }
+  std::uint32_t PagedViewSr() const { return flat_vmem_view_.paged_sr; }
+  void SetPagedVmem(bool enabled) {
+    flat_vmem_view_.size = enabled ? 0u : RetailFakeVmemSize;
+    paged_vmem_ = enabled;
+  }
   bool PagedVmem() const { return paged_vmem_; }
   static constexpr bool IsVmem(std::uint32_t address) {
     return address >= FakeVmemBase && address < FakeVmemBase + RetailFakeVmemSize;
@@ -78,6 +105,24 @@ public:
     if (physical >= Mem2PhysicalBase)
       return ResolveRegion(mem2_, physical - Mem2PhysicalBase, size);
     return nullptr;
+  }
+
+  // Number of host-contiguous bytes available from a guest address.  Native
+  // SDK/libc replacements use this to operate on whole strings/ranges without
+  // repeatedly re-entering the address decoder for every byte.
+  std::size_t ContiguousAvailable(std::uint32_t address) const {
+    if (address >= FakeVmemBase && address < FakeVmemBase + RetailFakeVmemSize) {
+      if (paged_vmem_) return 0u;
+      const auto offset = static_cast<std::size_t>(address - FakeVmemBase);
+      return offset < fake_vmem_.size() ? fake_vmem_.size() - offset : 0u;
+    }
+    const auto physical = ToPhysical(address);
+    if (physical < mem1_.size()) return mem1_.size() - physical;
+    if (physical >= Mem2PhysicalBase) {
+      const auto offset = static_cast<std::size_t>(physical - Mem2PhysicalBase);
+      return offset < mem2_.size() ? mem2_.size() - offset : 0u;
+    }
+    return 0u;
   }
 
   bool Read8(std::uint32_t address, std::uint8_t* out) const {
@@ -122,9 +167,10 @@ public:
   }
 
   void Clear() {
-    std::fill(mem1_.begin(), mem1_.end(), 0);
-    std::fill(mem2_.begin(), mem2_.end(), 0);
-    std::fill(fake_vmem_.begin(), fake_vmem_.end(), 0);
+    if (window_.Ready() && window_.Clear()) return;
+    mem1_.Clear();
+    mem2_.Clear();
+    fake_vmem_.Clear();
   }
 
 private:
@@ -135,9 +181,14 @@ private:
     return memory.data() + offset;
   }
 
-  std::vector<std::uint8_t> mem1_;
-  std::vector<std::uint8_t> mem2_;
-  std::vector<std::uint8_t> fake_vmem_;
+  // Destroy views before the reservation they borrow.
+  GuestAddressWindow window_;
+  GuestRam mem1_;
+  GuestRam mem2_;
+  GuestRam fake_vmem_;
+  GekkoAOTFlatVmemView flat_vmem_view_;
+  std::array<std::uint32_t, RetailFakeVmemSize / 0x1000u> paged_pages_{};
+  std::array<std::uint8_t, 64> paged_mru_{};
   bool paged_vmem_ = false;
 };
 

@@ -37,7 +37,11 @@ public:
   bool Write(std::uint32_t address, std::uint64_t value, std::uint8_t size);
 
   void SetInterrupt(std::uint32_t cause, bool set = true);
-  bool InterruptPending() const { return (interrupt_cause_ & interrupt_mask_) != 0; }
+  // v182: the CPU probes PI on every safe AOT boundary.  Keep the derived
+  // level cached at the point where cause/mask change so the overwhelmingly
+  // common "no interrupt" path is one boolean load instead of reloading and
+  // ANDing both MMIO registers for every dispatched guest function.
+  bool InterruptPending() const { return interrupt_pending_; }
 
   std::uint32_t InterruptCauseValue() const { return interrupt_cause_; }
   std::uint32_t InterruptMaskValue() const { return interrupt_mask_; }
@@ -55,9 +59,13 @@ private:
 
   bool Read32(std::uint32_t offset, std::uint32_t* value) const;
   bool Write32(std::uint32_t offset, std::uint32_t value);
+  void RefreshInterruptPending() {
+    interrupt_pending_ = (interrupt_cause_ & interrupt_mask_) != 0u;
+  }
 
   std::uint32_t interrupt_cause_ = 0;
   std::uint32_t interrupt_mask_ = 0;
+  bool interrupt_pending_ = false;
   std::uint32_t fifo_cpu_base_ = 0;
   std::uint32_t fifo_cpu_end_ = 0;
   std::uint32_t fifo_cpu_write_pointer_ = 0;

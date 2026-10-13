@@ -1,0 +1,144 @@
+--- a/src/backend/llvm/branch_targets.cpp
++++ b/src/backend/llvm/branch_targets.cpp
+@@ -103,8 +103,10 @@
+   char name[64];
+   snprintf(name, sizeof(name), "func_%08X_budget", range->start);
+   const std::string targetName = symbolName(name);
+-  if (!nativeTarget)
+-    syncDirtyState();
++  // A native callee can exit through a host service or a budget/memory guard.
++  // Keep the caller's dirty registers in the shared chain before entering it.
++  // The exit path commits the union of every active frame's dirty mask.
++  syncDirtyState();
+   Value *callDepth = nullptr;
+   if (modern_runtime_ && nativeTarget) {
+     callDepth = builder_.CreateLoad(Type::getInt64Ty(context_), guard_steps_);
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -318,7 +318,10 @@
+   if (modern_runtime_) {
+     ArrayType *valuesType =
+         ArrayType::get(Type::getInt64Ty(context_), DOLIR_STATE_COUNT);
++    ArrayType *maskType =
++        ArrayType::get(Type::getInt64Ty(context_), DOLIR_STATE_MASK_WORDS);
+     Value *values = builder_.CreateStructGEP(chainType(), chain_, 8);
++    Value *mask = builder_.CreateStructGEP(chainType(), chain_, 9);
+     auto stage = [&](DolIRStateSlot slot, Value *value) {
+       if (value->getType()->isDoubleTy())
+         value = builder_.CreateBitCast(value, Type::getInt64Ty(context_));
+@@ -334,51 +337,49 @@
+       if (!dirty_[slot] || slot == DOLIR_STATE_FPSCR)
+         continue;
+       auto stateSlot = static_cast<DolIRStateSlot>(slot);
+-      if (!slotInMemory(stateSlot))
+-        stage(stateSlot, stateValue(stateSlot));
++      stage(stateSlot, stateValue(stateSlot));
+     }
+     materializeFPRF();
+     if (dirty_[DOLIR_STATE_FPSCR])
+       stage(DOLIR_STATE_FPSCR, stateValue(DOLIR_STATE_FPSCR));
+-    return;
+-  }
+-  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+-    if (!dirty_[slot] || slot == DOLIR_STATE_FPSCR)
+-      continue;
+-    auto stateSlot = static_cast<DolIRStateSlot>(slot);
+-    if (slotInMemory(stateSlot))
+-      continue;
+-    storeContext(
+-        stateSlot,
+-        builder_.CreateLoad(type(dolir_state_type(stateSlot)), state_[slot]));
+-  }
+-  materializeFPRF();
+-  if (dirty_[DOLIR_STATE_FPSCR])
+-    storeContext(DOLIR_STATE_FPSCR, stateValue(DOLIR_STATE_FPSCR));
+-}
+-
+-void FunctionEmitter::commitModernState() {
+-  if (!modern_runtime_)
+-    return;
+-  ArrayType *maskType =
+-      ArrayType::get(Type::getInt64Ty(context_), DOLIR_STATE_MASK_WORDS);
+-  const std::string name = source_.name + std::string(".dirty");
+-  GlobalVariable *mask = module_.getGlobalVariable(name, true);
+-  if (!mask) {
+-    std::vector<Constant *> words;
+-    for (u32 word = 0; word < DOLIR_STATE_MASK_WORDS; word++) {
++    for (u32 word = 0; word < DOLIR_STATE_MASK_WORDS; ++word) {
+       u64 bits = 0;
+-      for (u32 bit = 0; bit < 64; bit++) {
++      for (u32 bit = 0; bit < 64; ++bit) {
+         const u32 slot = word * 64u + bit;
+         if (slot < DOLIR_STATE_COUNT && dirty_[slot])
+           bits |= 1ull << bit;
+       }
+-      words.push_back(builder_.getInt64(bits));
+-    }
+-    mask = new GlobalVariable(module_, maskType, true,
+-                              GlobalValue::PrivateLinkage,
+-                              ConstantArray::get(maskType, words), name);
+-  }
++      if (!bits)
++        continue;
++      Value *address = builder_.CreateInBoundsGEP(
++          maskType, mask, {builder_.getInt64(0), builder_.getInt64(word)});
++      builder_.CreateStore(
++          builder_.CreateOr(builder_.CreateLoad(Type::getInt64Ty(context_),
++                                               address),
++                            builder_.getInt64(bits)),
++          address);
++    }
++    return;
++  }
++  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
++    if (!dirty_[slot] || slot == DOLIR_STATE_FPSCR)
++      continue;
++    auto stateSlot = static_cast<DolIRStateSlot>(slot);
++    if (slotInMemory(stateSlot))
++      continue;
++    storeContext(
++        stateSlot,
++        builder_.CreateLoad(type(dolir_state_type(stateSlot)), state_[slot]));
++  }
++  materializeFPRF();
++  if (dirty_[DOLIR_STATE_FPSCR])
++    storeContext(DOLIR_STATE_FPSCR, stateValue(DOLIR_STATE_FPSCR));
++}
++
++void FunctionEmitter::commitModernState() {
++  if (!modern_runtime_)
++    return;
++  Value *mask = builder_.CreateStructGEP(chainType(), chain_, 9);
+   Type *pointer = PointerType::getUnqual(context_);
+   FunctionCallee commit = module_.getOrInsertFunction(
+       "moderngekko_commit_state",
+--- a/src/backend/llvm/modern_wrapper.cpp
++++ b/src/backend/llvm/modern_wrapper.cpp
+@@ -67,6 +67,14 @@
+       builder_.CreateStructGEP(chainTy, chain, 6));
+   builder_.CreateStore(builder_.getInt32(0),
+                        builder_.CreateStructGEP(chainTy, chain, 7));
++  auto *maskTy = ArrayType::get(Type::getInt64Ty(context_),
++                                DOLIR_STATE_MASK_WORDS);
++  Value *mask = builder_.CreateStructGEP(chainTy, chain, 9);
++  for (u32 word = 0; word < DOLIR_STATE_MASK_WORDS; ++word)
++    builder_.CreateStore(builder_.getInt64(0),
++                         builder_.CreateInBoundsGEP(
++                             maskTy, mask, {builder_.getInt64(0),
++                                            builder_.getInt64(word)}));
+ 
+   Value *returnPC =
+       builder_.CreateAnd(loadContext(DOLIR_STATE_LR), builder_.getInt32(~3u));
+--- a/src/backend/llvm/native_abi.cpp
++++ b/src/backend/llvm/native_abi.cpp
+@@ -255,7 +255,9 @@
+        llvm::Type::getInt32Ty(context_), llvm::Type::getInt32Ty(context_),
+        llvm::Type::getInt32Ty(context_),
+        llvm::ArrayType::get(llvm::Type::getInt64Ty(context_),
+-                            DOLIR_STATE_COUNT)});
++                            DOLIR_STATE_COUNT),
++       llvm::ArrayType::get(llvm::Type::getInt64Ty(context_),
++                            DOLIR_STATE_MASK_WORDS)});
+ }
+ 
+ llvm::FunctionType *

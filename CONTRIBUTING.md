@@ -27,11 +27,11 @@ cmake --build build --parallel
 
 Windows builds are checked by CI with Visual Studio 2022 x64.
 
-At minimum, verify that changed JSON is valid and that relevant shell/Python tooling still parses.
+Run `ctest --test-dir build --output-on-failure` and `python tools/check_release_tree.py`. Keep full profiling captures, benchmark reports and code backups in ignored local state. At minimum, verify that changed JSON is valid and that relevant shell/Python tooling still parses.
 
 ## Commit messages and releases
 
-The repository uses **Conventional Commits** so Release Please can prepare the next version and changelog automatically.
+Use **Conventional Commits** to keep change history readable. Release versions and changelog entries are prepared explicitly.
 
 Examples:
 
@@ -47,7 +47,7 @@ Common types are `feat`, `fix`, `perf`, `refactor`, `docs`, `build`, `ci` and `t
 
 Breaking changes should include `!` or a `BREAKING CHANGE:` footer.
 
-Do not manually create routine version tags. The release workflow and Release Please are documented in [docs/RELEASING.md](docs/RELEASING.md).
+Use the [manual release workflow](.github/workflows/release.yml) to build, test and publish a version from `version.txt` and `CHANGELOG.md`.
 
 ## Compatibility reports
 

@@ -1,0 +1,55 @@
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -305,13 +305,17 @@
+         loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exram_size));
+     // GEKKOAOT_NATIVE_ADDRESS_LOWERING_V287: resolve once per native body,
+     // never once per access. This effect-free service needs no register spill.
++    // GEKKOAOT_PURE_HOST_SERVICES_V337: the three owner services return values
++    // fixed while the module is bound (the flat-VM view is a stable cell), so
++    // they are memory(none): after inlining, GVN keeps one call per function
++    // instead of one per inlined callee (11 in CoD's vertex loop).
+     const char* window = std::getenv("DOLRECOMP_NATIVE_ADDRESS_LOWERING");
+     if (window && std::string(window) == "1") {
+       Type* wide = builder_.getInt64Ty();
+       auto getter = module_.getOrInsertFunction("gekkoaot_native_address_base",
+           FunctionType::get(pointer, {ctx_->getType()}, false));
+       auto* service = llvm::cast<Function>(getter.getCallee());
+-      service->setOnlyReadsMemory();
++      service->setDoesNotAccessMemory();
+       service->setDoesNotThrow();
+       service->addFnAttr(Attribute::WillReturn);
+       Value* base = builder_.CreateCall(getter, {ctx_}, "host.address.base");
+@@ -331,7 +335,7 @@
+         auto lcGetter = module_.getOrInsertFunction("gekkoaot_native_locked_cache_base",
+             FunctionType::get(pointer, {pointer}, false));
+         auto* lcService = cast<Function>(lcGetter.getCallee());
+-        lcService->setOnlyReadsMemory();
++        lcService->setDoesNotAccessMemory();
+         lcService->setDoesNotThrow();
+         lcService->addFnAttr(Attribute::WillReturn);
+         native_locked_cache_base_ = builder_.CreateCall(lcGetter, {ctx_}, "host.locked.cache.base");
+@@ -344,7 +348,7 @@
+         auto viewGetter = module_.getOrInsertFunction("gekkoaot_native_flat_vmem_view",
+             FunctionType::get(pointer, {pointer}, false));
+         auto* viewService = cast<Function>(viewGetter.getCallee());
+-        viewService->setOnlyReadsMemory();
++        viewService->setDoesNotAccessMemory();
+         viewService->setDoesNotThrow();
+         viewService->addFnAttr(Attribute::WillReturn);
+         native_flat_vmem_view_ = builder_.CreateCall(viewGetter, {ctx_}, "host.flat.vmem.view");
+--- a/src/backend/llvm/floating_point.cpp
++++ b/src/backend/llvm/floating_point.cpp
+@@ -286,8 +286,12 @@
+     // provenance. A finite f64 result excludes NaN/invalid cases. Non-default
+     // controls, special results and subnormal multipliers keep the old helper.
+     const char* nativeMathFlag = std::getenv("DOLRECOMP_NATIVE_SCALAR_MATH");
++    // GEKKOAOT_NATIVE_FDIVS_V337: a finite quotient of a non-zero divisor
++    // raises nothing in the helper either (ZX needs a zero divisor, invalid
++    // results are NaN); the divisor test below keeps both cases exact.
+     bool nativeFinite = nativeMathFlag && nativeMathFlag[0] == '1' &&
+-        (op == DOLIR_EXACT_FADDS || op == DOLIR_EXACT_FSUBS || op == DOLIR_EXACT_FMULS);
++        (op == DOLIR_EXACT_FADDS || op == DOLIR_EXACT_FSUBS || op == DOLIR_EXACT_FMULS ||
++         op == DOLIR_EXACT_FDIVS);
+ 
+     auto emitLegacy = [&]() {
+       syncState(DOLIR_STATE_FPSCR);
