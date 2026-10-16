@@ -1808,6 +1808,30 @@ void EnsureSources(Pipeline& p) {
               << (Env("GEKKOAOT_PAIRED_NI_DENORMAL","1") != "0" ? 1 : 0)
               << " ops=add+sub+mul+muls strict=ni+f32-denormal-input\n";
 
+    // v351: a REL import from a module that is not on the disc (RE4 disc 1:
+    // st1_1.rel -> module 16) stays unpatched, as OSLink leaves it until that
+    // module is linked, instead of failing the whole secondary REL batch.
+    const auto rel_imports_patch = p.root / "patches/dolrecomp/gekkoaot-rel-unloaded-imports-v351.patch";
+    if (!fs::exists(rel_imports_patch))
+      throw std::runtime_error("missing DolRecomp REL unloaded-imports patch: "+rel_imports_patch.string());
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply --check "+Quote(rel_imports_patch)),
+            "DolRecomp REL unloaded-imports patch check");
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply "+Quote(rel_imports_patch)),
+            "DolRecomp REL unloaded-imports patch");
+    std::cout << "GEKKOAOT_DOLRECOMP_REL_UNLOADED_IMPORTS_V351=1 policy=oslink-leave-unlinked\n";
+
+    // v364: DOLRECOMP_REL_ALIGN lets the secondary build's dense canonical
+    // REL layout (titles whose 64 KiB slots overflow REL24 range of the DOL)
+    // reach the REL batch. Without it the batch keeps its 64 KiB slots.
+    const auto rel_dense_patch = p.root / "patches/dolrecomp/gekkoaot-rel-dense-layout-v364.patch";
+    if (!fs::exists(rel_dense_patch))
+      throw std::runtime_error("missing DolRecomp REL dense-layout patch: "+rel_dense_patch.string());
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply --check "+Quote(rel_dense_patch)),
+            "DolRecomp REL dense-layout patch check");
+    Require(Run("git -C "+Quote(p.dolrecomp_src)+" apply "+Quote(rel_dense_patch)),
+            "DolRecomp REL dense-layout patch");
+    std::cout << "GEKKOAOT_DOLRECOMP_REL_DENSE_LAYOUT_V364=1 env=DOLRECOMP_REL_ALIGN\n";
+
     std::cout << "GEKKOAOT_SOURCE_REUSE backend=dolrecomp unchanged="
               << source_times.RestoreUnchanged() << '\n';
   }
@@ -3554,7 +3578,7 @@ void ExtractDisc(Pipeline& p,const fs::path& image) {
   // v4: caches written before FST subdirectories were walked lack nested RELs
   // (Hide & Sneak files/mickey2/*.rel), so they are refreshed once.
   if(!fs::exists(p.disc/"sys/main.dol")||!fs::exists(p.disc/"meta/disc-id.txt")||
-     ReadLine(p.disc/"meta/exec-cache-policy.txt")!="v4-fst-subdirectories")
+     ReadLine(p.disc/"meta/exec-cache-policy.txt")!="v5-embedded-rel")
     Require(RunProcess(p.native_disc,std::vector<fs::path>{image,p.disc}),"nod disc extraction");
   p.game_id=ReadLine(p.disc/"meta/disc-id.txt");
   if(p.game_id.size()!=6)throw std::runtime_error("invalid GameCube disc id in nod cache");
@@ -4282,7 +4306,15 @@ const std::string artifact_key=std::string("v")+GEKKOAOT_VERSION+"-"+
   Require(Run(cfg),"game module configure"); Require(Run("cmake --build "+Quote(mb)+" -j"+std::to_string(Jobs())),"game module link");
   fs::path built=mb/("g"+p.game_id+"_recomp"+SharedSuffix()); if(!fs::exists(built)){auto x=FindFileRecursive(mb,built.filename().string());if(!x.empty())built=x;}
   if (!fs::exists(built)) throw std::runtime_error("linked game module not found");
-  fs::copy_file(built,module,fs::copy_options::overwrite_existing);
+  // Cancellation during a large copy must not turn a truncated DSO into a
+  // cache hit on the next launch. Publish only the complete native module.
+  auto temporary_module=module;
+  temporary_module += ".tmp";
+  fs::copy_file(built,temporary_module,fs::copy_options::overwrite_existing);
+  fs::rename(temporary_module,module,ec);
+  if(ec) { // Windows rename does not replace an existing destination.
+    fs::remove(module); fs::rename(temporary_module,module);
+  }
   std::cout<<"GEKKOAOT_PROGRESS=98|Native module ready\n"; return module;
 }
 
@@ -5237,6 +5269,7 @@ int main(int argc,char** argv) {
     if (native_port_audit) {
       // This path analyzes source only: no renderer build, module relink,
       // gameplay launch, input injection or memory-card access.
+      GekkoAOT::Build::PipelineLock disc_lock(p.state/"build-locks"/("disc-"+TextHash64(p.disc.string())));
       ExtractDisc(p,image);
       (void)AuditNativePort(p,shared_dolrecomp);
       if (native_port_build)
@@ -5251,12 +5284,18 @@ int main(int argc,char** argv) {
     pipeline_lock.Release();
     std::cout<<"GEKKOAOT_PIPELINE_LOCK_V196=0 phase=game-aot reason=immutable-toolchain-snapshot\n";
     std::cout<<"GEKKOAOT_PROGRESS=20|Native SDK and AuroraGX ready\n";
+    // Separate games compile concurrently. Requests for the same extraction
+    // directory or game module cache must not mutate those files concurrently,
+    // including requests from another launcher or a command-line process.
+    GekkoAOT::Build::PipelineLock disc_lock(p.state/"build-locks"/("disc-"+TextHash64(p.disc.string())));
     ExtractDisc(p,image);
 
     if(action=="inspect") {
       std::cout<<"Disc ID: "<<p.game_id<<"\nGEKKOAOT_PROGRESS=100|Inspection complete\n";
       return 0;
     }
+
+    GekkoAOT::Build::PipelineLock game_lock(p.state/"build-locks"/("game-"+TextHash64(p.game_id)));
 
     if(action=="pgo-recover") {
       if(backend!="llvm") throw std::runtime_error("PGO recovery requires GEKKOAOT_BACKEND=llvm");
@@ -5267,6 +5306,8 @@ int main(int argc,char** argv) {
     const auto module=CompileModule(p,dolrecomp,backend,false);
     const auto secondary_modules=BuildSecondaryModules(p,dolrecomp);
     WriteAotLaunchMetadata(p,image,module,bridge,secondary_modules);
+    game_lock.Release();
+    disc_lock.Release();
     if(action=="compile") return 0;
     if(action=="run") {
       return RunGame(p,image,module,bridge,secondary_modules);

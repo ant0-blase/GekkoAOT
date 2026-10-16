@@ -4,6 +4,13 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QProcessEnvironment>
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
 
 #ifdef Q_OS_UNIX
 #include <csignal>
@@ -17,32 +24,107 @@
 #define GEKKOAOT_VERSION "dev"
 #endif
 
-BuildController::BuildController(QObject* parent) : QObject(parent)
+BuildController::BuildController(QObject* parent, const QString& program) : QObject(parent), m_program(program)
 {
     m_process.setProcessChannelMode(QProcess::MergedChannels);
 #ifdef Q_OS_UNIX
     m_process.setChildProcessModifier([] { ::setpgid(0, 0); });
 #endif
+#ifdef Q_OS_WIN
+    // Attach the suspended controller to its own job before it can spawn any
+    // compilers. Closing the job also cleans descendants if the launcher exits.
+    m_process.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
+        args->flags |= CREATE_SUSPENDED;
+    });
+#endif
+    m_stopTimer.setSingleShot(true);
+    m_stopTimer.setInterval(1800);
+    connect(&m_stopTimer, &QTimer::timeout, this, [this] { terminateTree(true); });
     connect(&m_process, &QProcess::readyReadStandardOutput, this, [this] {
         const QByteArray bytes = m_process.readAllStandardOutput();
         if (!bytes.isEmpty())
             emit outputReady(QString::fromLocal8Bit(bytes));
     });
-    connect(&m_process, &QProcess::started, this, [this] { emit runningChanged(true); });
+    connect(&m_process, &QProcess::started, this, [this] {
+        m_processGroup = m_process.processId();
+#ifdef Q_OS_WIN
+        m_job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, DWORD(m_processGroup));
+        bool attached = m_job && process && SetInformationJobObject(m_job, JobObjectExtendedLimitInformation,
+            &limits, sizeof(limits)) && AssignProcessToJobObject(m_job, process);
+        if (process) CloseHandle(process);
+        bool resumed = false;
+        if (attached) {
+            HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 thread{};
+            thread.dwSize = sizeof(thread);
+            if (snapshot != INVALID_HANDLE_VALUE) {
+                if (Thread32First(snapshot, &thread)) do {
+                    if (thread.th32OwnerProcessID != DWORD(m_processGroup)) continue;
+                    HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE, thread.th32ThreadID);
+                    if (handle) { resumed = ResumeThread(handle) == 1; CloseHandle(handle); }
+                    if (resumed) break;
+                } while (Thread32Next(snapshot, &thread));
+                CloseHandle(snapshot);
+            }
+        }
+        if (!resumed) {
+            emit outputReady("Could not isolate the task's process tree; launch cancelled.\n");
+            terminateTree(true);
+            return;
+        }
+#endif
+        emit runningChanged(true);
+        if (m_stopping) { terminateTree(false); m_stopTimer.start(); }
+    });
     connect(&m_process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
             [this](int code, QProcess::ExitStatus status) {
-                const QByteArray tail = m_process.readAllStandardOutput();
-                if (!tail.isEmpty())
-                    emit outputReady(QString::fromLocal8Bit(tail));
-                emit runningChanged(false);
-                emit finished(code, status);
+                complete(code, status);
             });
+    connect(&m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) {
+            emit outputReady("Could not start controller: " + m_process.errorString() + "\n");
+            complete(2, QProcess::CrashExit);
+        }
+    });
+}
+
+BuildController::~BuildController()
+{
+    disconnect(&m_process, nullptr, this, nullptr);
+    m_stopTimer.stop();
+    terminateTree(true);
+    if (isRunning()) m_process.waitForFinished(3000);
+#ifdef Q_OS_WIN
+    if (m_job) CloseHandle(m_job);
+#endif
+}
+
+void BuildController::complete(int code, QProcess::ExitStatus status)
+{
+    if (m_finished) return;
+    m_finished = true;
+    m_stopTimer.stop();
+    const QByteArray tail = m_process.readAllStandardOutput();
+    if (!tail.isEmpty()) emit outputReady(QString::fromLocal8Bit(tail));
+    // A parent may exit on TERM while a compiler ignores it. Do not leave that
+    // compiler consuming CPU or writing cache files after cancellation finishes.
+    if (m_stopping) terminateTree(true);
+#ifdef Q_OS_WIN
+    if (m_job) { CloseHandle(m_job); m_job = nullptr; }
+#endif
+    m_processGroup = 0;
+    emit runningChanged(false);
+    emit finished(code, status);
 }
 
 bool BuildController::isRunning() const { return m_process.state() != QProcess::NotRunning; }
 
 QString BuildController::controlProgram() const
 {
+    if (!m_program.isEmpty()) return QFileInfo(m_program).absoluteFilePath();
     const QDir appDir(QCoreApplication::applicationDirPath());
 #ifdef Q_OS_WIN
     const QString local = appDir.filePath("gekkoaotctl.exe");
@@ -68,11 +150,14 @@ void BuildController::run(const BuildRequest& request)
         return;
     }
 
+    m_finished = false;
+    m_stopping = false;
+
     const QString controller = controlProgram();
     if (!QFileInfo::exists(controller)) {
         emit outputReady(QString("gekkoaotctl was not built beside the GUI. Rebuild GekkoAOT v%1.\n")
                              .arg(QStringLiteral(GEKKOAOT_VERSION)));
-        emit finished(2, QProcess::NormalExit);
+        complete(2, QProcess::NormalExit);
         return;
     }
 
@@ -99,7 +184,8 @@ void BuildController::run(const BuildRequest& request)
     env.insert("GEKKOAOT_RUN_ARGS", request.runArgs);
     env.insert("GEKKOAOT_USER_DIR", request.userDir);
     env.insert("GEKKOAOT_WINDOW_SYSTEM", request.windowSystem);
-    const QString runtimeEmbedWindow = matchGdb ? QString() : request.embedWindow;
+    const QString runtimeEmbedWindow = matchGdb && !request.persistentShell ? QString() : request.embedWindow;
+    emit presentationEmbedded(!runtimeEmbedWindow.isEmpty());
     env.insert("GEKKOAOT_EMBED_WINDOW", runtimeEmbedWindow);
     env.insert("GEKKOAOT_NATIVE_GX_SINGLE_WINDOW", runtimeEmbedWindow.isEmpty() ? "0" : "1");
     // Compatibility alias used by the established v42 Aurora X11 path.
@@ -111,9 +197,17 @@ void BuildController::run(const BuildRequest& request)
     // Only force SDL/X11 when we are actually embedding the Aurora surface.
     // The GDB-match profile intentionally keeps Aurora standalone so the GUI
     // and debugger exercise the same SDL/WebGPU presentation path.
-    if (!matchGdb && request.windowSystem.compare("x11", Qt::CaseInsensitive) == 0 &&
+    if (request.windowSystem.compare("x11", Qt::CaseInsensitive) == 0 &&
         !runtimeEmbedWindow.isEmpty())
         env.insert("SDL_VIDEODRIVER", "x11");
+    if (request.graphicsBackend == "OGL") {
+        QString driver = env.value("SDL_VIDEODRIVER");
+        if (driver.isEmpty()) driver = request.windowSystem;
+        if (driver == "x11" || driver == "wayland") {
+            env.insert("SDL_VIDEODRIVER", driver);
+            env.insert("EGL_PLATFORM", driver);
+        }
+    }
 #endif
     env.insert("GEKKOAOT_ASPECT_MODE", request.aspectMode);
     env.insert("GEKKOAOT_RESOLUTION", request.resolution);
@@ -142,7 +236,22 @@ void BuildController::run(const BuildRequest& request)
         env.insert("GEKKOAOT_VFS_GC_TIMING", "0");
     env.insert("GEKKOAOT_GUI_MATCH_GDB_ACTIVE", matchGdb ? "1" : "0");
     env.insert("GEKKOAOT_PERF_METRICS", "1");
-    env.insert("GEKKOAOT_FRAME_INTERPOLATION", "0");
+    env.insert("GEKKOAOT_FRAME_INTERPOLATION", request.frameInterpolation ? "1" : "0");
+    // v358: the frame-rate unlock re-renders geometry; never an image blend.
+    env.insert("GEKKOAOT_INTERPOLATION_MODE", "replay");
+    env.insert("GEKKOAOT_REPLAY_PREDICT", request.graphics.unlock_predict ? "1" : "0");
+    env.insert("GEKKOAOT_RENDER_WIDTH", QString::number(request.graphics.render_width));
+    env.insert("GEKKOAOT_RENDER_HEIGHT", QString::number(request.graphics.render_height));
+    env.insert("GEKKOAOT_RENDER_PERCENT", QString::number(request.graphics.render_percent));
+    env.insert("GEKKOAOT_FXAA", QString::number(request.graphics.fxaa));
+    env.insert("GEKKOAOT_POSTFX_BRIGHTNESS", QString::number(request.graphics.brightness));
+    env.insert("GEKKOAOT_POSTFX_CONTRAST", QString::number(request.graphics.contrast));
+    env.insert("GEKKOAOT_POSTFX_SATURATION", QString::number(request.graphics.saturation));
+    env.insert("GEKKOAOT_POSTFX_GAMMA", QString::number(request.graphics.gamma));
+    env.insert("GEKKOAOT_POSTFX_EXPOSURE", QString::number(request.graphics.exposure));
+    env.insert("GEKKOAOT_POSTFX_TEMPERATURE", QString::number(request.graphics.temperature));
+    env.insert("GEKKOAOT_POSTFX_VIBRANCE", QString::number(request.graphics.vibrance));
+    env.insert("GEKKOAOT_POSTFX_TINT", QString::number(request.graphics.tint));
     if (!env.contains("GEKKOAOT_NATIVE_GX_MSAA"))
         env.insert("GEKKOAOT_NATIVE_GX_MSAA", QString::number(request.msaaSamples));
     if (!env.contains("GEKKOAOT_NATIVE_GX_ANISOTROPY"))
@@ -304,17 +413,23 @@ void BuildController::run(const BuildRequest& request)
 
 void BuildController::stop()
 {
-    if (!isRunning()) return;
+    if (!isRunning() || m_stopping) return;
+    m_stopping = true;
+    emit cancellationRequested();
     emit outputReady("\nStopping current task and native runtime...\n");
+    terminateTree(false);
+    m_stopTimer.start();
+}
+
+void BuildController::terminateTree(bool force)
+{
 #ifdef Q_OS_UNIX
-    const qint64 pid = m_process.processId();
-    if (pid > 0) ::kill(-static_cast<pid_t>(pid), SIGTERM); else m_process.terminate();
-    if (!m_process.waitForFinished(1800)) {
-        if (pid > 0) ::kill(-static_cast<pid_t>(pid), SIGKILL); else m_process.kill();
-        m_process.waitForFinished(1500);
-    }
+    if (m_processGroup > 0) ::kill(-static_cast<pid_t>(m_processGroup), force ? SIGKILL : SIGTERM);
+    else if (isRunning()) { if (force) m_process.kill(); else m_process.terminate(); }
+#elif defined(Q_OS_WIN)
+    if (m_job) TerminateJobObject(m_job, 1);
+    else if (isRunning()) m_process.kill();
 #else
-    m_process.terminate();
-    if (!m_process.waitForFinished(1800)) { m_process.kill(); m_process.waitForFinished(1500); }
+    if (isRunning()) { if (force) m_process.kill(); else m_process.terminate(); }
 #endif
 }

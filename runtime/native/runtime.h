@@ -456,13 +456,17 @@ private:
     }
     AdvanceRuntimeCycles(charged, result);
   }
-  std::uint64_t IdleWakeDeadlineCycles() const;
-  void WaitForIdleEvent(RunResult& result,std::uint64_t maximum_cycles=~std::uint64_t{0},bool masked_timer=false);
+  std::uint64_t IdleWakeDeadlineCycles(bool include_decrementer=true) const;
+  void WaitForIdleEvent(RunResult& result,std::uint64_t maximum_cycles=~std::uint64_t{0},bool masked_timer=false,
+                        bool hold_decrementer=false);
   void ConsumeAotPollPark(RunResult& result);
   void ParkSdkIdlePoll(RunResult& result);
   void ParkNativeReadPoll(RunResult& result);
   void ParkNativeCounterPoll(RunResult& result);
   void ParkClockSpin(RunResult& result);
+  void ParkYieldSpin();
+  void ParkFixedPointPoll(RunResult& result);
+  void NoteMmioPoll(std::uint32_t address, std::uint64_t value);
   // v333: optional guest execution rate cap (see ThrottleGuestRate). Guest
   // time is wall time, so this is a slower host CPU from the guest's view.
   void ThrottleGuestRate(RunResult& result);
@@ -886,6 +890,27 @@ private:
   struct ClockSpinEntry {std::uint32_t lr=0,entry=0;bool wide=false;std::uint32_t cooldown=0;std::uint64_t exit=0;};
   std::array<ClockSpinEntry,64> clock_spins_{};
   SpinProbe spin_probe_;
+  // v344: no-op OSYieldThread loops (see ParkYieldSpin). DispatchOsHle counts
+  // yields that returned to their caller without a thread switch.
+  bool yield_spin_enabled_ = false;
+  std::uint32_t yield_noop_lr_ = 0, yield_noop_count_ = 0;
+  std::uint64_t yield_spin_parks_ = 0, yield_spin_declines_ = 0, yield_spin_park_ns_ = 0;
+  std::chrono::steady_clock::time_point yield_spin_start_{};
+  RunResult* active_result_ = nullptr;
+  // v346: wait loops whose iteration is a fixed point (see ParkFixedPointPoll).
+  bool fixed_point_park_enabled_ = false;
+  struct FixedPointEntry {std::uint32_t pc=0,hits=0,cooldown=0,failures=0;bool proven=false;};
+  std::array<FixedPointEntry,64> fixed_points_{};
+  std::uint32_t fixed_point_last_pc_ = 0;
+  std::uint64_t fixed_point_parks_ = 0, fixed_point_probes_ = 0, fixed_point_park_ns_ = 0;
+  // v347: repeated device-status reads (see NoteMmioPoll).
+  bool mmio_poll_park_enabled_ = false;
+  // v355: idle decrementer coalescing (EA THREAD_yieldticks(10) storms).
+  std::uint64_t idle_dec_quantum_ticks_ = 0, idle_dec_last_tb_ = 0;
+  std::uint64_t idle_dec_coalesced_ = 0;
+  std::uint32_t mmio_poll_address_ = 0, mmio_poll_count_ = 0;
+  std::uint64_t mmio_poll_value_ = 0, mmio_poll_parks_ = 0, mmio_poll_park_ns_ = 0;
+  std::chrono::steady_clock::time_point mmio_poll_start_{};
   std::uint64_t native_read_poll_generation_=1,native_read_poll_epoch_=0,native_read_poll_parks_=0;
   std::array<std::uint32_t,4096> native_read_poll_negatives_{};
   struct NativeReadPollEntry {std::uint32_t pc=0;NativeReadPoll plan;};
@@ -991,6 +1016,7 @@ private:
   std::uint64_t perf_last_presents_ = 0;
   std::uint64_t perf_last_interpolated_ = 0;
   std::uint64_t perf_last_dropped_ = 0;
+  double perf_last_thread_seconds_ = -1.0;
   std::uint64_t perf_metrics_poll_cycles_ = 0;
 
   // v176: widescreen CPU-frustum assist. The renderer can widen the GX
@@ -1020,6 +1046,7 @@ private:
   float widescreen_frustum_observed_aspect_ = 4.0f / 3.0f;
 
   std::filesystem::path live_video_config_path_;
+  GX::GraphicsSettings live_graphics_settings_ = GX::GraphicsSettingsFromEnvironment();
   std::filesystem::file_time_type live_video_config_mtime_{};
   bool live_video_config_mtime_valid_ = false;
   std::uint64_t live_video_config_poll_cycles_ = 0;
@@ -1106,6 +1133,10 @@ private:
   std::uint32_t last_mmio_read_ = 0;
   std::uint64_t mmio_reads_ = 0;
   std::uint64_t same_mmio_read_streak_ = 0;
+  bool cp_poll_drain_enabled_ = true;
+  bool cp_poll_park_enabled_ = false;
+  bool gx_matrix_chain_enabled_ = false;
+  std::uint64_t cp_poll_drains_ = 0;
   std::array<std::uint8_t, 32> cpu_fifo_gather_{};
   std::uint32_t cpu_fifo_gather_size_ = 0;
   std::uint32_t cpu_fifo_gather_base_ = 0;

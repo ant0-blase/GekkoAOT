@@ -97,5 +97,93 @@ int main() {
   CHECK(!LooksLikeCameraFov(180.0f));
   CHECK(MatchesObservedFov(55.0f, 55.0f));
   CHECK(!MatchesObservedFov(65.0f, 55.0f));
+  // v343: letterbox bars/fades reach both clip edges; HUD panels and
+  // partial-width geometry stay centred at the original aspect.
+  using Span = std::array<float,2>;
+  const std::array<Span,8> bars{{{-1.f,1.f},{1.f,1.f},{1.f,.7f},{-1.f,.7f},
+                                 {-1.f,-.7f},{1.f,-.7f},{1.f,-1.f},{-1.f,-1.f}}};
+  CHECK(IsEdgeAnchoredSpan(bars));
+  const std::array<Span,3> beyond{{{-1.f,-1.133f},{1.f,-1.133f},{1.f,-.829f}}};
+  CHECK(IsEdgeAnchoredSpan(beyond));
+  const std::array<Span,4> panel{{{-.6f,.2f},{.6f,.2f},{.6f,-.2f},{-.6f,-.2f}}};
+  CHECK(!IsEdgeAnchoredSpan(panel));
+  const std::array<Span,4> left_only{{{-1.f,1.f},{-1.f,.5f},{-1.f,-.5f},{-1.f,-1.f}}};
+  CHECK(!IsEdgeAnchoredSpan(left_only));
+  const std::array<Span,3> off_screen{{{-1.f,1.1f},{1.f,1.1f},{1.f,1.4f}}};
+  CHECK(!IsEdgeAnchoredSpan(off_screen));
+  // v353: whole-screen composite (Shadow's bloom) vs a letterbox bar.
+  const std::array<Span,4> whole{{{-.998f,.998f},{1.002f,.998f},{-.998f,-1.002f},{1.002f,-1.002f}}};
+  CHECK(IsFullScreenSpan(whole));
+  CHECK(!IsFullScreenSpan(beyond));
+  CHECK(!IsFullScreenSpan(panel));
+  // Only single-colour textures may be stretched with such a span.
+  const std::array<std::uint8_t,8> black16{{0,0,0,0,0,0,0,0}};
+  const std::array<std::uint8_t,8> pattern16{{0x80,0x00,0x80,0x00,0x80,0x00,0x80,0x00}};
+  const std::array<std::uint8_t,8> art16{{0x80,0x00,0x81,0x00,0x80,0x00,0x80,0x00}};
+  CHECK(IsUniformTexture(black16.data(), black16.size(), 5u));
+  CHECK(IsUniformTexture(pattern16.data(), pattern16.size(), 5u));
+  CHECK(!IsUniformTexture(art16.data(), art16.size(), 5u));
+  CHECK(!IsUniformTexture(pattern16.data(), pattern16.size(), 1u));  // I8 must repeat bytewise
+  CHECK(!IsUniformTexture(nullptr, 64u, 1u));
+  // v353: CMPR (format 14) compares decoded texels. Metroid Prime's letterbox
+  // texture is white with equal endpoints and varying index bits.
+  const std::array<std::uint8_t,16> cmpr_white{{0xff,0xff,0xff,0xff,0x00,0x55,0xaa,0xff,
+                                                0xff,0xff,0xff,0xff,0x12,0x34,0x56,0x78}};
+  CHECK(!IsUniformTexture(cmpr_white.data(), cmpr_white.size(), 14u));  // index 3 is transparent
+  const std::array<std::uint8_t,16> cmpr_flat{{0xff,0xff,0xff,0xff,0x00,0x55,0xaa,0x2a,
+                                               0xff,0xff,0xff,0xff,0x15,0x26,0x19,0x22}};
+  CHECK(IsUniformTexture(cmpr_flat.data(), cmpr_flat.size(), 14u));    // indices 0..2 only
+  const std::array<std::uint8_t,8> cmpr_ramp{{0xf8,0x00,0x00,0x1f,0x00,0x55,0xaa,0xff}};
+  CHECK(!IsUniformTexture(cmpr_ramp.data(), cmpr_ramp.size(), 14u));
+  CHECK(IsOpaqueTexture(cmpr_ramp.data(), cmpr_ramp.size(), 14u));      // c0 > c1: 4-colour mode
+  CHECK(!IsOpaqueTexture(cmpr_white.data(), cmpr_white.size(), 14u));   // index 3 transparent
+  CHECK(IsOpaqueTexture(cmpr_flat.data(), cmpr_flat.size(), 14u));
+  CHECK(IsOpaqueTexture(nullptr, 0u, 1u));                              // I8 has no alpha
+  CHECK(!IsOpaqueTexture(pattern16.data(), pattern16.size(), 6u));      // RGBA8 not proven
+  // v348: Luigi's Mansion draws its live 3D portrait into 477,370 110x84
+  // inside the Game Boy Horror frame; split-screen halves touch an edge.
+  CHECK(IsInsetSpan(477.f, 110.f, 640.f));
+  CHECK(!IsInsetSpan(0.f, 148.f, 640.f));     // texture producer at the EFB origin
+  CHECK(!IsInsetSpan(320.f, 320.f, 640.f));   // right split-screen half
+  CHECK(!IsInsetSpan(40.f, 560.f, 640.f));    // narrowed main view
+  CHECK(!IsInsetSpan(477.f, 110.f, 0.f));
+  // v354: Lemony's pyramid: full copy -> 320x240 pass -> copy -> ... stays
+  // screen-derived; a 3D render copied from 0,0 148x116 does not.
+  CopyProvenance provenance;
+  int screen = 0, half = 0, portrait = 0;
+  CHECK(provenance.NoteCopy(&screen, 0.f, 0.f, 640.f, 480.f, 640.f, 480.f));
+  provenance.NoteScreenDraw(0.f, 0.f, 320.f, 240.f);
+  CHECK(provenance.NoteCopy(&half, 0.f, 0.f, 320.f, 240.f, 640.f, 480.f));
+  CHECK(!provenance.NoteCopy(&portrait, 0.f, 0.f, 148.f, 480.f, 640.f, 480.f)); // mostly outside
+  CHECK(provenance.IsScreenDerived(&screen) && provenance.IsScreenDerived(&half));
+  CHECK(!provenance.IsScreenDerived(&portrait));
+  provenance.BeginFrame();
+  CHECK(!provenance.NoteCopy(&half, 0.f, 0.f, 148.f, 116.f, 640.f, 480.f));   // new frame, no pass
+  CHECK(!provenance.IsScreenDerived(&half));
+  DisplayInsets insets;
+  insets.NoteDraw(477.f, 110.f, 7u);
+  CHECK(!insets.IsInset(477.f, 110.f, 7u));   // unconfirmed during its first frame
+  insets.NoteCopy(0.f, 640.f, 7u);            // a full-screen grab is not a producer copy
+  insets.EndFrame(7u);
+  CHECK(insets.IsInset(477.f, 110.f, 8u));
+  CHECK(insets.IsInset(477.f, 110.f, 10u));
+  CHECK(!insets.IsInset(477.f, 110.f, 11u));  // expires when no longer drawn
+  CHECK(!insets.IsInset(478.f, 110.f, 8u));
+  insets.NoteDraw(477.f, 110.f, 11u);
+  insets.NoteCopy(479.f, 106.f, 11u);         // copied out: a render-to-texture pass
+  insets.EndFrame(11u);
+  CHECK(!insets.IsInset(477.f, 110.f, 12u));
+  insets.NoteDraw(200.f, 128.f, 20u);
+  insets.EndFrame(21u);                       // drawn in another frame: not confirmed
+  CHECK(!insets.IsInset(200.f, 128.f, 22u));
+  // v362: perspective cards of a 2D screen keep the UI scissor only after a
+  // run of frames without depth-writing 3D geometry.
+  FlatFrameHistory flat;
+  for (unsigned i=0;i<FlatFrameHistory::Frames-1u;++i) { flat.EndFrame(0u); CHECK(!flat.Flat()); }
+  flat.EndFrame(0u);
+  CHECK(flat.Flat());
+  flat.EndFrame(250u);                         // a 3D frame ends the 2D screen at once
+  CHECK(!flat.Flat());
+  for (unsigned i=0;i<8u;++i) { flat.EndFrame(i%2u ? 0u : 40u); CHECK(!flat.Flat()); } // 3D/2D alternation
   std::cout << "Widescreen projection and copy provenance passed\n";
 }

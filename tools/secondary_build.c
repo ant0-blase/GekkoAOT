@@ -37,6 +37,16 @@
 #define REL_ALIGN 0x00010000u
 #define REL24_WINDOW_SIZE 0x02000000u
 #define REL24_WINDOW_GUARD REL_ALIGN
+/* v364: when 64 KiB slots cannot keep every REL within a REL24 branch of the
+   DOL (Twilight Princess: 757 RELs, 10 MiB of images, 50 MiB of slots), the
+   canonical layout packs the images at one shared alignment (the largest REL
+   section/BSS alignment, at least 0x20), each ending at its last section.
+   DolRecomp's REL batch places them identically from DOLRECOMP_REL_ALIGN.
+   Titles that already fit keep the 64 KiB layout, so their REL batches are
+   unchanged. */
+#define REL_DENSE_ALIGN 0x20u
+static int g_rel_dense_layout=0;
+static uint32_t g_rel_dense_align=REL_DENSE_ALIGN;
 #define MAX_REL_SECTIONS 4096u
 #define SECONDARY_ROUTER_CACHE_TAG "gekkoaot-secondary-router-v20-lc-v308"
 #define REL_CODEGEN_CACHE_TAG "gekkoaot-rel-published-pointer-v220-own-code-data-cross-module-xmodgpr207-cfgaddr221-materialize222"
@@ -48,7 +58,7 @@ typedef struct { uint32_t index, offset, size; int executable, bss; uint32_t lin
 typedef struct {
   char path[MAX_PATHBUF];
   uint32_t module_id, version, section_count, section_info, file_size;
-  uint32_t bss_size, bss_alignment, fix_size, base;
+  uint32_t bss_size, bss_alignment, fix_size, base, alignment;
   RelSection* sections;
 } RelInfo;
 
@@ -229,23 +239,77 @@ static int dol_rel24_bounds(const char* p,uint32_t* code_low,uint32_t* occupied_
   free(d);if(low==0xffffffffu||!high)return 0;*code_low=low;*occupied_end=high;return 1;
 }
 
-static uint32_t rel_layout_end_at(const RelVec* rels,uint32_t base){
+/* Shared dense alignment of a REL set, or 0 when one REL cannot be packed. */
+static uint32_t rel_dense_alignment(const RelVec* rels){
+  uint32_t align=REL_DENSE_ALIGN;
+  for(size_t i=0;i<rels->n;i++){
+    const RelInfo* r=&rels->v[i];
+    if(r->alignment>align)align=r->alignment;
+    if(r->bss_alignment&(r->bss_alignment-1u)||r->bss_alignment>REL_ALIGN)return 0;
+    if(r->bss_alignment>align)align=r->bss_alignment;
+  }
+  return align;
+}
+/* The cursor after a REL placed at `base`: the end of its file image and BSS
+   or of its last section (BSS follows fix_size at its own alignment, as in
+   assign_rel_sections), whichever is later, at the shared alignment. This is
+   DolRecomp's next_rel_base with DOLRECOMP_REL_ALIGN. */
+static uint32_t rel_dense_end(const RelInfo* r,uint32_t base){
+  uint64_t end=(uint64_t)base+r->file_size+r->bss_size;
+  uint32_t bss=align_up(base+r->fix_size,r->bss_alignment);
+  for(uint32_t i=0;i<r->section_count;i++){
+    const RelSection* s=&r->sections[i];
+    if(!s->size)continue;
+    const uint64_t at=s->bss?bss:(uint64_t)base+s->offset;
+    if(s->bss)bss=align_up(bss+s->size,r->bss_alignment);
+    if(at+s->size>end)end=at+s->size;
+  }
+  if(end>0xffffffffull)return 0;
+  return align_up((uint32_t)end,g_rel_dense_align);
+}
+static uint32_t rel_layout_end_dense(const RelVec* rels,uint32_t base,int dense){
   uint32_t cursor=base;
   for(size_t i=0;i<rels->n;i++){
     const RelInfo* r=&rels->v[i];
-    const uint64_t end=(uint64_t)cursor+r->file_size+r->bss_size;
-    if(end>0xffffffffull)return 0;
-    cursor=align_up((uint32_t)end,REL_ALIGN);
+    if(!dense){
+      const uint64_t end=(uint64_t)cursor+r->file_size+r->bss_size;
+      if(end>0xffffffffull)return 0;
+      cursor=align_up((uint32_t)end,REL_ALIGN);
+    } else {
+      cursor=rel_dense_end(r,cursor);
+    }
     if(!cursor)return 0;
   }
   return cursor;
 }
+static uint32_t rel_layout_end_at(const RelVec* rels,uint32_t base){
+  return rel_layout_end_dense(rels,base,g_rel_dense_layout);
+}
 
+static uint32_t choose_rel_canonical_base_mode(const RelVec* rels,const char* boot_dol,int* fits);
 static uint32_t choose_rel_canonical_base(const RelVec* rels,const char* boot_dol){
+  int fits=0;
+  g_rel_dense_layout=0;
+  const uint32_t base=choose_rel_canonical_base_mode(rels,boot_dol,&fits);
+  if(fits)return base;
+  g_rel_dense_align=rel_dense_alignment(rels);
+  if(!g_rel_dense_align)return base;
+  g_rel_dense_layout=1;
+  const uint32_t dense=choose_rel_canonical_base_mode(rels,boot_dol,&fits);
+  if(fits){
+    printf("GEKKOAOT_REL24_DENSE_LAYOUT_V364=1 rel_base=0x%08X rel_end=0x%08X rels=%zu align=0x%X policy=shared-alignment-packing\n",
+           dense,rel_layout_end_at(rels,dense),rels->n,g_rel_dense_align);
+    return dense;
+  }
+  g_rel_dense_layout=0;
+  return base;
+}
+static uint32_t choose_rel_canonical_base_mode(const RelVec* rels,const char* boot_dol,int* fits){
+  *fits=0;
   const uint32_t default_end=rel_layout_end_at(rels,REL_BASE);
   if(!default_end)die("REL canonical address overflow");
   uint32_t dol_code_low=0u,dol_occupied_end=0u;
-  if(!boot_dol||!dol_rel24_bounds(boot_dol,&dol_code_low,&dol_occupied_end))return REL_BASE;
+  if(!boot_dol||!dol_rel24_bounds(boot_dol,&dol_code_low,&dol_occupied_end)){*fits=1;return REL_BASE;}
 
   const uint32_t min_base=align_up(dol_occupied_end,REL_ALIGN);
   if(!min_base)die("REL canonical minimum base overflow");
@@ -276,6 +340,7 @@ static uint32_t choose_rel_canonical_base(const RelVec* rels,const char* boot_do
   if(chosen!=REL_BASE)
     printf("GEKKOAOT_REL24_AUTO_LAYOUT=1 rel_base=0x%08X default=0x%08X dol_code_low=0x%08X dol_end=0x%08X rel_end=0x%08X policy=fit-dol+rel-in-rel24-window\n",
            chosen,REL_BASE,dol_code_low,dol_occupied_end,chosen_end);
+  *fits=1;
   return chosen;
 }
 
@@ -283,7 +348,7 @@ static int parse_rel(const char* p,RelInfo* r){ memset(r,0,sizeof(*r)); size_t n
   uint32_t id=be32(d), sc=be32(d+0x0c), si=be32(d+0x10), ver=be32(d+0x1c); if(!id||!sc||sc>MAX_REL_SECTIONS||ver<1u||ver>3u||si<0x40u||(si&3u)||(uint64_t)si+sc*8ull>n){free(d);return 0;}
   RelSection* secs=(RelSection*)calloc(sc,sizeof(*secs)); if(!secs){free(d);return 0;} int have_exec=0;
   for(uint32_t i=0;i<sc;i++){uint32_t raw=be32(d+si+i*8),sz=be32(d+si+i*8+4),off=raw&~1u; int ex=(raw&1u)!=0,bss=off==0&&sz!=0; if((!bss&&sz&&(uint64_t)off+sz>n)||(ex&&sz&&((off&3u)||(sz&3u)||bss))){free(secs);free(d);return 0;} secs[i]=(RelSection){i,off,sz,ex,bss,0}; if(ex&&sz&&!bss)have_exec=1;}
-  if(!have_exec){free(secs);free(d);return 0;} snprintf(r->path,sizeof(r->path),"%s",p);r->module_id=id;r->version=ver;r->section_count=sc;r->section_info=si;r->file_size=(uint32_t)n;r->bss_size=be32(d+0x20);r->bss_alignment=n>=0x48?be32(d+0x44):4;r->fix_size=(ver>=3&&n>=0x4c)?be32(d+0x48):(uint32_t)n; if(!r->bss_alignment)r->bss_alignment=4; if(!r->fix_size||r->fix_size>n){free(secs);free(d);return 0;}r->sections=secs;free(d);return 1; }
+  if(!have_exec){free(secs);free(d);return 0;} snprintf(r->path,sizeof(r->path),"%s",p);r->module_id=id;r->version=ver;r->section_count=sc;r->section_info=si;r->file_size=(uint32_t)n;r->bss_size=be32(d+0x20);r->bss_alignment=n>=0x48?be32(d+0x44):4;r->fix_size=(ver>=3&&n>=0x4c)?be32(d+0x48):(uint32_t)n; if(!r->bss_alignment)r->bss_alignment=4; r->alignment=(ver>=2&&n>=0x44)?be32(d+0x40):4u; if(!r->alignment||(r->alignment&(r->alignment-1u))||r->alignment>REL_ALIGN)r->alignment=REL_ALIGN; if(!r->fix_size||r->fix_size>n){free(secs);free(d);return 0;}r->sections=secs;free(d);return 1; }
 static void free_rel(RelInfo* r){free(r->sections);r->sections=NULL;}
 static void assign_rel_sections(RelInfo* r){ uint32_t bss=align_up(r->base+r->fix_size,r->bss_alignment); for(uint32_t i=0;i<r->section_count;i++){RelSection* s=&r->sections[i]; if(!s->size)continue; if(s->bss){s->linked=bss;bss=align_up(bss+s->size,r->bss_alignment);}else s->linked=r->base+s->offset;} }
 
@@ -544,6 +609,10 @@ static void make_secondary_llvm_command(char* cmd,size_t cap,const char* dolreco
   append_env(cmd,cap,"DOLRECOMP_LLVM_CACHE",cache);
   if(rel_mode&&g_rel_pointer_manifest[0])
     append_env(cmd,cap,"DOLRECOMP_REL_POINTER_MANIFEST",g_rel_pointer_manifest);
+  if(rel_mode&&g_rel_dense_layout){
+    snprintf(num,sizeof(num),"0x%X",g_rel_dense_align);
+    append_env(cmd,cap,"DOLRECOMP_REL_ALIGN",num);
+  }
   append_env(cmd,cap,"DOLRECOMP_DISPATCH_LOOKUP","indexed");
   append_env(cmd,cap,"DOLRECOMP_FP_REGION_COALESCE",
              env_u32("GEKKOAOT_FP_REGION_COALESCE",1,0,1) ? "1" : "0");
@@ -1376,7 +1445,7 @@ static int build_rel_modules(const char* files,const char* boot_dol,const char* 
     for(size_t i=0;i<overlays.n;i++){printf("GEKKOAOT_REL_OVERLAY_BUILD=1 index=%zu total=%zu source=\"%s\"\n",i+1,overlays.n,overlays.v[i].path);printf("GEKKOAOT_SECONDARY_ITEM=1 kind=rel index=%zu total=%zu source=\"%s\"\n",i+1,overlays.n,overlays.v[i].path);CandidateVec one={&overlays.v[i],1,1};if(!build_rel_modules(files,boot_dol,dolrecomp,dolsrc,gekko,output,game,jobs,&one,built)){free(unique.v);free(overlays.v);return 0;}}
     free(unique.v);free(overlays.v);return 1;
   }
-  const uint32_t rel_base=choose_rel_canonical_base(&rels,boot_dol);h=fnv_bytes(h,&rel_base,4);uint32_t cursor=rel_base;RangeVec canonical={0};for(size_t i=0;i<rels.n;i++){RelInfo* r=&rels.v[i];r->base=cursor;assign_rel_sections(r);for(uint32_t j=0;j<r->section_count;j++)if(r->sections[j].size)rv_push(&canonical,r->sections[j].linked,r->sections[j].linked+r->sections[j].size);uint64_t end=(uint64_t)r->base+r->file_size+r->bss_size;if(end>0xffffffffu)die("REL canonical address overflow");cursor=align_up((uint32_t)end,REL_ALIGN);if(!cursor)die("REL canonical alignment overflow");}qsort(canonical.v,canonical.n,sizeof(Range),range_cmp);
+  const uint32_t rel_base=choose_rel_canonical_base(&rels,boot_dol);h=fnv_bytes(h,&rel_base,4);if(g_rel_dense_layout){h=fnv_bytes(h,"dense-v364b",11);h=fnv_bytes(h,&g_rel_dense_align,4);}uint32_t cursor=rel_base;RangeVec canonical={0};for(size_t i=0;i<rels.n;i++){RelInfo* r=&rels.v[i];r->base=cursor;assign_rel_sections(r);for(uint32_t j=0;j<r->section_count;j++)if(r->sections[j].size)rv_push(&canonical,r->sections[j].linked,r->sections[j].linked+r->sections[j].size);if(g_rel_dense_layout){cursor=rel_dense_end(r,r->base);if(!cursor)die("REL canonical address overflow");continue;}uint64_t end=(uint64_t)r->base+r->file_size+r->bss_size;if(end>0xffffffffu)die("REL canonical address overflow");cursor=align_up((uint32_t)end,REL_ALIGN);if(!cursor)die("REL canonical alignment overflow");}qsort(canonical.v,canonical.n,sizeof(Range),range_cmp);
   char suffix[16];module_suffix(suffix,sizeof(suffix));char modules[MAX_PATHBUF];path_join(modules,sizeof(modules),output,"modules");mkdirs(modules);char key[32];snprintf(key,sizeof(key),"%016llx",(unsigned long long)h);int cache=1;for(size_t i=0;i<rels.n;i++){char name[256],p[MAX_PATHBUF];snprintf(name,sizeof(name),"g%s_rel_%u_%s%s",game,rels.v[i].module_id,key,suffix);path_join(p,sizeof(p),modules,name);if(!is_file(p)){cache=0;break;}}if(cache){for(size_t i=0;i<rels.n;i++){char name[256],p[MAX_PATHBUF];snprintf(name,sizeof(name),"g%s_rel_%u_%s%s",game,rels.v[i].module_id,key,suffix);path_join(p,sizeof(p),modules,name);sv_push_unique(built,p);}printf("GEKKOAOT_REL_AOT_CACHE_HIT=1 modules=%zu key=%s\n",rels.n,key);goto done;}
   char work[MAX_PATHBUF],stage[MAX_PATHBUF],genroot[MAX_PATHBUF];char wn[128];snprintf(wn,sizeof(wn),"rel-all-%s",key);path_join(work,sizeof(work),output,wn);path_join(stage,sizeof(stage),work,"rel-input");path_join(genroot,sizeof(genroot),work,"dolrecomp");mkdirs(stage);mkdirs(genroot);for(size_t i=0;i<rels.n;i++){char n[256],dst[MAX_PATHBUF];snprintf(n,sizeof(n),"%04zu_%u.rel",i,rels.v[i].module_id);path_join(dst,sizeof(dst),stage,n);if(!copy_file(rels.v[i].path,dst))die("failed staging REL");}
   path_join(g_rel_pointer_manifest,sizeof(g_rel_pointer_manifest),work,"rel-pointer-materializations-v222.txt");

@@ -94,6 +94,9 @@ void PrintRuntimeSnapshot(const GekkoAOT::Native::HostRuntime& runtime) {
             << " loader_stage=" << unsigned(dsp.SdkTaskLoaderStage())
             << " ax=" << dsp.NativeAxHleActive() << " jaudio=" << dsp.NativeJAudioHleActive()
             << " core_pc=" << dsp.NativeCorePc()
+            << " aid_ctl=" << dsp.AudioDmaControl() << std::dec
+            << " aid_debt_blocks=" << dsp.AudioDmaPendingBlocks()
+            << " aid_irqs=" << dsp.AidInterruptCount() << std::hex
             << "\nGEKKOAOT_SNAPSHOT_DI status=" << di.Status() << " control=" << di.DMAControl()
             << " opcode=" << unsigned(di.LastOpcode()) << " error=" << di.LastError()
             << " dma=" << di.DMAAddress() << " remaining=" << di.DMALength()
@@ -595,9 +598,11 @@ int main(int argc, char** argv) {
     if (!result.halt_text_10.empty())
       std::cout << " halt_text10=\"" << EscapeForLog(result.halt_text_10) << "\"";
     std::cout << "\n";
-    if (result.status == GekkoAOT::Native::RunStatus::GuestHalted) {
+    {
+      const char* label = result.status == GekkoAOT::Native::RunStatus::GuestHalted
+          ? "GEKKOAOT_GUEST_HALT_BACKTRACE_V164=1" : "GEKKOAOT_GUEST_FAULT_BACKTRACE_V366=1";
       for (std::uint8_t depth = 0; depth < result.halt_frame_count; ++depth) {
-        std::cout << "GEKKOAOT_GUEST_HALT_BACKTRACE_V164=1 depth="
+        std::cout << label << " depth="
                   << std::dec << static_cast<unsigned>(depth)
                   << std::hex << " sp=0x" << result.halt_frame_sp[depth]
                   << " caller_lr=0x" << result.halt_frame_caller_lr[depth]

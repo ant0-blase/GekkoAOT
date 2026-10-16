@@ -10,6 +10,135 @@ Releases are prepared explicitly and published through the manual Release workfl
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.7...v0.0.8) (2026-10-16)
+
+### Highlights
+
+- A new launcher, with a desktop library and a controller-driven TV mode for
+  the living room and the Steam Deck.
+- Discord Rich Presence.
+- An in-game performance HUD.
+- Reworked widescreen: 3D scenes are widened while menus, HUDs and screen
+  effects keep their original proportions.
+- Lower CPU and memory use. Idle detection brings several games from 13 % to
+  3–7 % of the machine, and Tales of Symphonia now uses 430 MB of RAM instead
+  of 1.8 GB.
+- Crash fixes for Animaniacs, Ghost Recon 2, Harry Potter and the Sorcerer's
+  Stone and Medal of Honor: Frontline.
+
+### Launcher
+
+- Redesigned desktop window: a game library with banners read from the disc,
+  search, folder import, play time and last-played tracking, and playback
+  controls in the title bar.
+- TV mode: a full-screen interface with Library, Recent and Settings that works
+  with a controller, keyboard or mouse. Switching between TV mode and the
+  desktop keeps the running game.
+- Compilation queue: games can be compiled in the background; the
+  Compilations panel shows their progress.
+- Graphics settings with presets (Original, Crisp, Balanced, Cinematic, Custom)
+  and a preview: graphics API, aspect ratio, anti-aliasing, texture filtering,
+  sharpening, bloom, tone mapping, local contrast and color controls.
+- Controller settings for each port: keyboard, gamepad or joystick, remapping,
+  dead zones and axis inversion.
+- Memory card manager: browse, import, export and convert saves (RAW, GCP, MCI,
+  GCI, GCS and SAV), create cards, and keep a backup before every edit. See
+  [Memory cards](docs/memory-cards.md).
+- Discord Rich Presence through the official Discord Social SDK, optional at
+  build time. It shows the game and the session time, never file names or
+  paths. See [Discord Rich Presence](docs/discord-rich-presence.md).
+- New typefaces (Google Sans Flex and Doto), icons and a reduced-motion option.
+
+### Performance HUD
+
+- Shows the frame rate, frame time and a frame-time graph, the game's own
+  frame rate, the video interface rate, game speed, CPU use (process and main
+  thread) and GPU load. Each item can be turned on or off.
+- GPU load is read from the kernel DRM interface on Linux, from sysfs on AMD,
+  through NVML on NVIDIA and through PDH on Windows.
+- The displayed frame rate is now the real presentation rate: duplicate
+  presents of interlaced fields are no longer counted, so 30 fps games report
+  30 fps.
+
+### Widescreen
+
+- Perspective 3D is widened to the window; orthographic menus and HUDs stay at
+  4:3 in the center. Fades, letterbox bars and full-screen effects cover the
+  whole width.
+- HUD elements that contain live 3D stay inside their frames (the Game Boy
+  Horror in Luigi's Mansion).
+- Copies of the screen used for bloom, blur and region restores keep their
+  original width. This fixes the bloom seams in Shadow the Hedgehog and the
+  black box in Lemony Snicket's A Series of Unfortunate Events.
+- Frames built on a pre-rendered background switch to 4:3 automatically
+  (Resident Evil rooms).
+- Menus drawn as perspective cards are clipped to 4:3 (Pikmin file select).
+- Fixed the letterbox bars in Metroid Prime, 512-pixel-wide frames in Finding
+  Nemo and the mission fade-ins in Call of Duty: Finest Hour.
+
+### Performance
+
+- Idle threads sleep until the next event instead of servicing a stream of
+  timer interrupts. Medal of Honor: Rising Sun went from 13 % to 5 % of the
+  machine and GoldenEye: Rogue Agent from 13 % to 3 %.
+- More busy-wait loops are parked: clock polls, yield loops, loops that make
+  no progress and hardware register polls. Cars went from 13 % to 7 %.
+- REL modules are no longer copied into huge pages at load time. Only the main
+  executable is, which removes about 1.4 GB of resident memory in Tales of
+  Symphonia at no measurable CPU cost.
+
+### Compatibility
+
+- Animaniacs: The Great Edgar Hunt no longer crashes when a level loads.
+  NativeOS now removes finished threads from the SDK's active-thread list, so
+  the game can safely reuse their memory.
+- Tom Clancy's Ghost Recon 2 reaches its menus without an IPL ROM. GekkoAOT
+  provides its own boot-ROM font when none is supplied.
+- Killer7: aiming works in the opening chapter. EFB color and depth peeks now
+  read the frame that was just displayed.
+- Medal of Honor: Frontline: choosing "Abort Mission" no longer freezes.
+- Harry Potter and the Sorcerer's Stone: fixed a crash when the game reuses the
+  memory of a finished thread.
+- Tony Hawk's Underground: a GPU drain deferred by a FIFO breakpoint is now
+  served when the game polls the command processor, which removes one cause of
+  its opening freeze. The game can still freeze; see the known issues.
+- Resident Evil 4: REL modules stored inside archive files are found and
+  compiled. REL imports from modules that are not on the current disc are left
+  unresolved, as on the console.
+- The Legend of Zelda: Twilight Princess compiles: its 757 REL modules now fit
+  the native code window. It boots to the opening logos.
+
+### Diagnostics
+
+- Logs for guest exceptions, guest call stacks on every fault, the live REL
+  memory map, memory watch points and a stall watchdog that also reports
+  interrupt, DSP and audio state.
+- New options to compare behaviors: `GEKKOAOT_NATIVE_OS_ACTIVE_QUEUE`,
+  `GEKKOAOT_HUGE_TEXT_SECONDARY`, `GEKKOAOT_ROM_FONT` and
+  `GEKKOAOT_CP_POLL_DRAIN`. See [Performance](docs/OPTIMIZATIONS.md).
+
+### Upgrading
+
+- Compiled games are stored per release, so each game is compiled again on its
+  first launch after updating.
+
+### Known issues
+
+- The Legend of Zelda: Twilight Princess crashes after the opening logos.
+- The Legend of Zelda: The Wind Waker halts a few seconds after boot with
+  NativeOS enabled. With NativeOS disabled it reaches its title screen.
+- Super Monkey Ball 2 crashes after Start is pressed on the title screen.
+- Spyro: A Hero's Tail freezes during its first in-engine cutscene.
+- Tony Hawk's Underground can freeze after the Neversoft logo.
+- GoldenEye: Rogue Agent reaches gameplay but is still unstable.
+- Killer7 renders some textures incorrectly.
+- Finding Nemo runs at about 16 fps.
+- Resident Evil 4 has not been verified in game with the new REL extraction.
+- The experimental frame-rate unlock is disabled by default and not ready for
+  use.
+
+See [Compatibility](docs/COMPATIBILITY.md) for every tested game.
+
 ## [0.0.7](https://github.com/ant0-blase/GekkoAOT/compare/v0.0.6...v0.0.7) (2026-10-13)
 
 This entry covers the local implementation since the public `main` baseline [`063f218`](https://github.com/ant0-blase/GekkoAOT/commit/063f21858dd147c2bcd30c096c10621dc5f3ef05), including the compiler/runtime, graphics, audio, compatibility and launcher changes accumulated after 0.0.6.

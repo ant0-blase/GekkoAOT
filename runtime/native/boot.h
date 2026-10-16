@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -127,7 +128,11 @@ inline GameCubeBootResult InitializeGameCubeBoot(
   RequireWrite(memory.Write32(0x80000020u, kBootedFromBootrom), "boot source");
   RequireWrite(memory.Write32(0x80000028u, AddressSpace::ReportedMem1Size()),
                "physical memory size");
-  RequireWrite(memory.Write32(0x8000002cu, kLatestDevkit), "console type");
+  // Diagnostic: GEKKOAOT_CONSOLE_TYPE=<hex> overrides the reported board.
+  std::uint32_t console_type = kLatestDevkit;
+  if (const char* text = std::getenv("GEKKOAOT_CONSOLE_TYPE"); text && *text)
+    console_type = static_cast<std::uint32_t>(std::strtoul(text, nullptr, 16));
+  RequireWrite(memory.Write32(0x8000002cu, console_type), "console type");
   RequireWrite(memory.Write32(0x800000ccu, ntsc ? 0u : 1u), "VI mode");
   RequireWrite(memory.Write32(0x800000d0u, kAramSize), "ARAM size");
   RequireWrite(memory.Write32(0x800000ecu, kMem1CachedEnd), "debug monitor address");

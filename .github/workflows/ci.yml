@@ -33,6 +33,9 @@ jobs:
             arch: x86_64
 
     runs-on: ${{ matrix.os }}
+    env:
+      GEKKOAOT_DISCORD_SDK: ${{ (github.actor == 'dependabot[bot]' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'OFF' || 'ON' }}
+      GEKKOAOT_DISCORD_SDK_ROOT: ${{ github.workspace }}/.deps/discord_social_sdk
 
     steps:
       - name: Checkout
@@ -55,7 +58,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ pkg-config
+          sudo apt-get install -y cmake ninja-build g++ pkg-config libasound2-dev libpulse-dev libx11-dev libatomic1
 
       - name: Install Qt (Windows)
         if: runner.os == 'Windows'
@@ -72,6 +75,7 @@ jobs:
           python tools/release_notes.py --version "$(tr -d '\r\n' < version.txt)" --check
           python tools/check_release_tree.py
           python tests/hardware/test_release_tree.py
+          python tests/hardware/test_discord_packaging.py
           python - <<'PY'
           import json
           from pathlib import Path
@@ -85,6 +89,13 @@ jobs:
           python -m py_compile tools/adaptive_pgo.py tools/crossgame_db.py tools/release_notes.py tools/stage_portable_toolchain.py tools/check_release_tree.py
           ! grep -RniE 'run-native-gx-v4[12]|native_gx_v4[12]' --exclude-dir=.git .
 
+      - name: Prepare official Discord SDK
+        if: env.GEKKOAOT_DISCORD_SDK == 'ON'
+        uses: ./.github/actions/discord-sdk
+        with:
+          deploy-key: ${{ secrets.GEKKOAOT_DISCORD_SDK_DEPLOY_KEY }}
+          platform: ${{ runner.os }}
+
       - name: Configure Linux
         if: runner.os == 'Linux'
         run: >-
@@ -94,6 +105,7 @@ jobs:
           -DGEKKOAOT_BUILD_NATIVE_HOST=ON
           -DGEKKOAOT_NATIVE_NOD=ON
           -DGEKKOAOT_NATIVE_PORTABLE=ON
+          -DGEKKOAOT_DISCORD_SDK=${{ env.GEKKOAOT_DISCORD_SDK }}
 
       - name: Configure Windows
         if: runner.os == 'Windows'
@@ -103,7 +115,8 @@ jobs:
             -DGEKKOAOT_BUILD_GUI=ON `
             -DGEKKOAOT_BUILD_NATIVE_HOST=ON `
             -DGEKKOAOT_NATIVE_NOD=ON `
-            -DGEKKOAOT_NATIVE_PORTABLE=ON
+            -DGEKKOAOT_NATIVE_PORTABLE=ON `
+            -DGEKKOAOT_DISCORD_SDK=${{ env.GEKKOAOT_DISCORD_SDK }}
 
       - name: Build Linux
         if: runner.os == 'Linux'
@@ -175,6 +188,10 @@ jobs:
 
       - name: Validate staged release contents
         run: python tools/check_release_tree.py --package stage
+
+      - name: Validate installed Discord SDK and launcher assets
+        if: env.GEKKOAOT_DISCORD_SDK == 'ON'
+        run: python tools/check_discord_package.py --package stage --platform "${{ runner.os }}"
 
       - name: Smoke-test installed Linux controller
         if: runner.os == 'Linux'

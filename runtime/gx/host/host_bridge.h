@@ -4,6 +4,7 @@
 #include "native/address_space.h"
 #include "gx/pe_event_queue.h"
 #include "gx/native_command_stream.h"
+#include "gx/graphics_settings.h"
 
 #include <array>
 #include <atomic>
@@ -117,11 +118,18 @@ public:
   bool PresentInterpolated(float alpha);
   // v128b optional ABI: 4:3 / live window-aspect changes without restarting.
   void SetAspectMode(const std::string& mode);
+  bool ApplyGraphicsSettings(const GraphicsSettings& settings);
+  // v359 optional ABI: live runtime values for the in-game performance HUD.
+  void PublishPerf(const float* values, std::uint32_t count) const {
+    if (ready_ && publish_perf_) publish_perf_(values, count);
+  }
   bool WidescreenActive() const { return widescreen_active_; }
   float WidescreenTargetAspect() const;
   bool CurrentPerspectiveCamera(float* fov_y_degrees, float* guest_aspect) const;
   void SetCyclePresentEnabled(bool enabled) { cycle_present_enabled_ = enabled; }
   bool QuitRequested() const { return quit_requested_; }
+  void PollEvents();
+  void SetPaused(bool paused);
 
   // The renderer callback runs synchronously on the guest CPU thread while a
   // FIFO command is consumed. Give the native host a direct event sink so PE
@@ -235,9 +243,15 @@ private:
   PresentInterpolatedFn present_interpolated_ = nullptr;
   InterpolationReadyFn interpolation_ready_ = nullptr;
   SetAspectModeFn set_aspect_mode_ = nullptr;
+  using ApplyGraphicsSettingsFn = bool (*)(const GraphicsSettings*, std::uint32_t);
+  ApplyGraphicsSettingsFn apply_graphics_settings_ = nullptr;
+  using PublishPerfFn = void (*)(const float*, std::uint32_t);
+  PublishPerfFn publish_perf_ = nullptr;
   TargetAspectFn target_aspect_ = nullptr;
   CameraSignatureFn camera_signature_ = nullptr;
   ShouldQuitFn should_quit_ = nullptr;
+  using SetPausedFn = void (*)(bool);
+  SetPausedFn set_paused_ = nullptr;
   ShutdownFn shutdown_ = nullptr;
   SetPeCallbackFn set_pe_callback_ = nullptr;
   PeEventSinkFn pe_event_sink_ = nullptr;
@@ -331,5 +345,8 @@ private:
   std::atomic<bool> pe_token_interrupt_seen_{false};
   std::string last_error_;
 };
+
+// CPU time consumed by the calling thread, in seconds (-1 if unavailable).
+double CurrentThreadCpuSeconds() noexcept;
 
 } // namespace GekkoAOT::GX

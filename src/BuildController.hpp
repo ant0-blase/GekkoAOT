@@ -1,9 +1,11 @@
 #pragma once
+#include "../runtime/gx/graphics_settings.h"
 
 #include <QMap>
 #include <QObject>
 #include <QProcess>
 #include <QString>
+#include <QTimer>
 
 struct BuildRequest
 {
@@ -12,6 +14,7 @@ struct BuildRequest
     QString gameSlug;
     QString backend;
     QString graphicsBackend;
+    GekkoAOT::GX::GraphicsSettings graphics;
     QString profile;
     QString toolchain;
     QString llvmDir;
@@ -23,6 +26,7 @@ struct BuildRequest
     QString userDir;
     QString windowSystem;
     QString embedWindow;
+    bool persistentShell = false;
     QString aspectMode;
     QString resolution;
     bool fullscreen = false;
@@ -48,7 +52,8 @@ class BuildController final : public QObject
 {
     Q_OBJECT
 public:
-    explicit BuildController(QObject* parent = nullptr);
+    explicit BuildController(QObject* parent = nullptr, const QString& program = {});
+    ~BuildController() override;
     bool isRunning() const;
 
 public slots:
@@ -58,9 +63,21 @@ public slots:
 signals:
     void outputReady(const QString& text);
     void runningChanged(bool running);
+    void presentationEmbedded(bool embedded);
+    void cancellationRequested();
     void finished(int exitCode, QProcess::ExitStatus status);
 
 private:
     QString controlProgram() const;
+    void terminateTree(bool force);
+    void complete(int code, QProcess::ExitStatus status);
     QProcess m_process;
+    QTimer m_stopTimer;
+    QString m_program;
+    qint64 m_processGroup = 0;
+    bool m_stopping = false;
+    bool m_finished = true;
+#ifdef Q_OS_WIN
+    void* m_job = nullptr;
+#endif
 };

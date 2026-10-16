@@ -1,44 +1,45 @@
 # Building GekkoAOT
 
-## Supported CI targets
+CI builds and tests two targets:
 
-The public CI validates:
+- Linux x86-64;
+- Windows x86-64 with Visual Studio 2022 (MSVC).
 
-- Linux x86_64;
-- Windows x86_64 (Visual Studio 2022 / MSVC).
+Other hosts may work but are not part of the release matrix. See
+[launcher platforms](launcher-platforms.md) for what has been tested where.
 
-Other hosts may work but are not part of the release build matrix.
+## Requirements
 
-## Common requirements
-
-- Git;
-- CMake 3.25+;
+- Git and CMake 3.25 or newer;
 - a C++20 compiler;
-- network access on first setup so pinned external dependencies can be fetched;
-- Qt 6.5+ when `GEKKOAOT_BUILD_GUI=ON`;
-- Python 3 only for optional Adaptive PGO/CrossGameDB tools.
+- LLVM 19 or 20 development files (used to build DolRecomp);
+- Qt 6.5 or newer for the launcher (`GEKKOAOT_BUILD_GUI=ON`);
+- network access on the first build, to fetch the pinned dependencies;
+- Python 3 only for optional tooling (adaptive PGO, CrossGameDB, the Windows
+  Qt installer).
 
-The normal controller/runtime is native C/C++. Python is **not** a runtime CPU/GX/DSP dependency, but current optional profiling/database workflows do call `tools/adaptive_pgo.py` and `tools/crossgame_db.py`.
+The controller and runtime are C/C++. Python is never part of the CPU, GX or
+DSP paths.
 
 ## Linux
 
-Recommended development dependencies:
+Install the dependencies (package names vary by distribution):
 
-```bash
-# Package names vary by distribution.
-# Arch example:
-sudo pacman -S --needed base-devel cmake ninja git qt6-base python
+```sh
+# Arch Linux
+sudo pacman -S --needed base-devel cmake ninja git qt6-base llvm python
 ```
 
-Build the normal desktop target:
+Build and install into `bin/`:
 
-```bash
+```sh
 ./build-linux.sh
+./bin/gekkoaot
 ```
 
 Or configure manually:
 
-```bash
+```sh
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DGEKKOAOT_BUILD_GUI=ON \
@@ -46,9 +47,9 @@ cmake -S . -B build -G Ninja \
 cmake --build build --parallel
 ```
 
-Core-only CI-style build:
+A core-only build, as used by CI:
 
-```bash
+```sh
 cmake -S . -B build-core -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DGEKKOAOT_BUILD_GUI=OFF \
@@ -59,120 +60,100 @@ cmake --build build-core --parallel
 
 ## Windows
 
-Recommended host toolchain:
-
-- Windows 10/11 x86_64;
-- Visual Studio 2022 or Build Tools with **Desktop development with C++**;
-- CMake;
-- Git;
-- Python 3 only for the automatic Qt bootstrap helper.
-
-You do **not** need to install Qt manually anymore for the normal GekkoAOT Windows build.
-
-Run:
+You need Windows 10 or 11 (x86-64), Visual Studio 2022 or its Build Tools with
+**Desktop development with C++**, CMake and Git. Ninja is not required: the
+helper uses the Visual Studio generator.
 
 ```bat
 build-windows.cmd
 ```
 
-On the first run, if Qt is not already available through `GEKKOAOT_QT_DIR`, GekkoAOT installs the pinned Qt 6.8.3 MSVC 2022 x64 package into:
-
-```text
-.deps/Qt/6.8.3/msvc2022_64/
-```
-
-The helper uses `aqtinstall` only to download the official Qt binary packages. To install Qt without building:
+If Qt is not found through `GEKKOAOT_QT_DIR`, the first run installs the pinned
+Qt 6.8.3 MSVC 2022 x64 package into `.deps/Qt/6.8.3/msvc2022_64/`, using
+`aqtinstall` to download the official binaries. To install Qt without
+building:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-qt6-windows.ps1
 ```
 
-To use an existing Qt installation instead:
+To use an existing Qt installation:
 
 ```powershell
 $env:GEKKOAOT_QT_DIR = "C:\Qt\6.8.3\msvc2022_64"
 .\build-windows.cmd
 ```
 
-The Windows helper uses the Visual Studio 2022 CMake generator directly, so Ninja is no longer required.
-
-The finished local deployable tree is:
+The result is a deployable tree:
 
 ```text
 dist/GekkoAOT/bin/
     gekkoaot.exe
     gekkoaotctl.exe
     gekkoaot-native-run.exe
-    Qt6Core.dll
-    Qt6Gui.dll
-    Qt6Widgets.dll
+    Qt6Core.dll, Qt6Gui.dll, Qt6Widgets.dll
     platforms/qwindows.dll
     ...
 ```
 
-`cmake --install` invokes Qt's deployment tooling on Windows, so the GUI package carries the Qt runtime and platform plugin beside the executable.
+`cmake --install` runs Qt's deployment tool, so the package carries the Qt
+runtime and platform plugin next to the executable.
 
-## encounter/nod
+## Discord Rich Presence
 
-With `GEKKOAOT_NATIVE_NOD=ON`, CMake first looks for an installed `nod` package. If none is found, the native host fetches the pinned prebuilt encounter/nod package for supported desktop targets.
+Discord Rich Presence needs the Discord Social SDK, which Discord distributes
+under its own terms and which this repository does not include. Download it
+for your target from the Discord Developer Portal and point CMake at it:
 
-Current pin: `v2.0.0-alpha.12`.
+```sh
+cmake -S . -B build \
+  -DGEKKOAOT_DISCORD_SDK=ON \
+  -DGEKKOAOT_DISCORD_SDK_ROOT=/absolute/path/to/discord_social_sdk
+```
 
-## DolRecomp and Aurora
+`AUTO` (the default) enables the feature when the SDK is found, `ON` fails if
+it is missing and `OFF` leaves it out. Builds without the SDK work normally and
+report the feature as unavailable. `build-linux.sh` installs the SDK library
+next to the binaries when the build produced it. See
+[Discord Rich Presence](discord-rich-presence.md) for details.
 
-They are not vendored as dirty source trees. On first game compile/run, `gekkoaotctl`:
+## Dependencies fetched by the build
 
-1. clones/fetches the pinned upstream revision;
-2. resets the tool-owned checkout to that exact revision;
-3. cleans untracked files;
-4. validates every GekkoAOT patch with `git apply --check`;
-5. applies the patch series;
-6. builds the required upstream tool/backend.
+**encounter/nod.** With `GEKKOAOT_NATIVE_NOD=ON`, CMake uses an installed `nod`
+package, or downloads the pinned prebuilt release (`v2.0.0-alpha.12`) for
+supported desktop targets.
 
-This behavior is intentional and reproducible. See `patches/dolrecomp/` and `patches/aurora/`.
+**DolRecomp and Aurora.** They are not vendored. On the first compilation of a
+game, `gekkoaotctl`:
 
-## Portable end-user packages
+1. fetches the pinned upstream revision;
+2. resets its own checkout to that revision and removes untracked files;
+3. checks every GekkoAOT patch with `git apply --check`;
+4. applies the patches and overlay scripts;
+5. builds the compiler and the renderer plugin.
 
-Release CI prepares a self-contained user toolchain instead of requiring Git,
-CMake, Ninja, MSVC/GCC/Clang or Qt to be installed on the target machine.
+The patches are in `patches/dolrecomp/` and `patches/aurora/`; Aurora overlay
+scripts are in `runtime/gx/aurora/`.
 
-The release builder precompiles the pinned DolRecomp engine and AuroraGX bridge,
-ships the patched DolRecomp source required by module glue, bundles portable
-CMake + Ninja + Zig, deploys Qt/VC runtime on Windows, and creates an AppImage
-on Linux.
+## Portable packages
 
-At runtime `share/gekkoaot/toolchain/engine.ready` switches the controller into
+Release CI produces packages that do not need Git, CMake, Ninja, a compiler or
+Qt on the user's machine. The release builder precompiles DolRecomp and the
+AuroraGX plugin, ships the patched DolRecomp sources needed to link game
+modules, bundles portable CMake, Ninja and Zig, deploys Qt and the Visual C++
+runtime on Windows, and builds an AppImage on Linux.
+
+The file `share/gekkoaot/toolchain/engine.ready` switches the controller to
 portable mode:
 
 ```text
-disc image
-   |
-   v
-bundled DolRecomp
-   |
-   v
-LLVM AOT object chunks
-   |
-   v
-bundled CMake + Ninja + Zig
-   |
-   v
-native game module
-   |
-   v
-prebuilt GekkoAOT runtime + AuroraGX
+disc image → bundled DolRecomp → LLVM objects → bundled CMake/Ninja/Zig
+           → native game module → prebuilt runtime + AuroraGX
 ```
 
-The Windows ZIP is intended to need no separate Qt, Git, CMake, Ninja, Visual
-Studio Build Tools or MSVC installation.
-
-The Linux AppImage is the preferred no-install Linux artifact. The host still
-provides the Linux kernel and working GPU/audio/input drivers; those hardware
-and kernel components cannot be meaningfully bundled into an application.
+The host still provides the kernel and the GPU, audio and input drivers.
 
 ## Installed layout
-
-A CMake install uses:
 
 ```text
 <prefix>/bin/
@@ -184,19 +165,10 @@ A CMake install uses:
     gekkoaot-native-disc
 
 <prefix>/share/gekkoaot/
-    runtime/
-    patches/
-    game-packs/
-    crossgame-db/
-    docs/
-    tools/
-    README.md
-    CHANGELOG.md
-    CONTRIBUTING.md
-    LICENSE
-    COPYING
-    THIRD_PARTY_NOTICES.md
-    version.txt
+    runtime/  patches/  game-packs/  crossgame-db/  docs/  tools/
+    README.md  CHANGELOG.md  CONTRIBUTING.md  LICENSE  COPYING
+    THIRD_PARTY_NOTICES.md  version.txt
 ```
 
-The installed `share/gekkoaot` tree is treated as read-only. Mutable downloads/builds/caches live in the user state directory.
+`share/gekkoaot` is read-only at run time. Downloads, builds, caches and saves
+live in the user state directory.

@@ -207,6 +207,7 @@ bool NativeDSP::InterruptPending() const {
 }
 
 void NativeDSP::GenerateInterrupt(std::uint16_t cause) {
+  if (cause & kAid) ++aid_interrupts_;
   control_ |= static_cast<std::uint16_t>(cause & kInterruptCauses);
 }
 

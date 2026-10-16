@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=GekkoAOT
+Comment=GameCube static recompilation and native runtime
+Exec=gekkoaot
+Icon=gekkoaot
+Terminal=false
+Categories=Game;
+StartupWMClass=GekkoAOT
+Actions=TV;
+
+[Desktop Action TV]
+Name=TV Mode
+Exec=gekkoaot --tv

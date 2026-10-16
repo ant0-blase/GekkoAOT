@@ -1,29 +1,56 @@
 # Roadmap
 
-The current implementation is described in [Architecture](ARCHITECTURE.md). These items remain development goals, not release guarantees.
+What GekkoAOT does today is described in [Architecture](ARCHITECTURE.md).
+The items below are goals, not release commitments.
 
 ## Compatibility
 
-- Validate complete gameplay, level changes and save/load behavior across a wider title corpus.
-- Improve movie frontends/container handling, JAudio families, EFB effects, shadows and custom texture paths.
-- Make widescreen UI placement, clipping and CPU-side frustum/culling corrections more reliable without distorting 2D content.
-- Keep regressions reproducible without distributing commercial game or SDK assets.
+- Validate complete playthroughs, level changes and save/load across more
+  games, not only the opening scenes.
+- Fix the open crashes: Twilight Princess after the opening logos, Super Monkey
+  Ball 2 after the title screen, Spyro: A Hero's Tail in its first cutscene and
+  Wind Waker with NativeOS enabled.
+- Movies: complete container and frontend handling, and add H4M/HVQM4.
+- More JAudio variants, EFB effects, shadows and custom texture paths.
+- Widescreen: CPU-side culling and frustum widening, so objects at the edges
+  of a 16:9 view are not culled by the game.
 
 ## More direct native execution
 
-- Extend complete-body SDK recognition for GX, PAD, DVD, OS and audio services.
-- Replace additional register/FIFO round trips with ordered native commands when all observable effects can be reproduced.
-- Reduce CPUState materialization and generic dispatch at proven boundaries.
-- Broaden direct memory lowering while retaining permissions, aliases, cache publication and exception restart semantics.
-- Improve scheduling at semantic events rather than adding frequent arbitrary runtime returns.
+- Recognize more complete SDK functions for GX, PAD, DVD, OS and audio.
+- Replace more register and FIFO round trips with ordered native commands
+  where every observable effect can be reproduced.
+- Materialize less CPU state and dispatch less at proven boundaries.
+- Extend direct memory access while keeping permissions, aliases, cache
+  publication and exception restarts exact.
+- Schedule at semantic events instead of frequent arbitrary returns to the
+  runtime.
 
-## Build and runtime efficiency
+## Build time and efficiency
 
-- Reduce cold AOT build time through shared analysis, safe incremental caches and balanced compiler work.
-- Target measured game, renderer, driver and audio hotspots while validating real game speed.
-- Reduce redundant GPU synchronization and resource scanning with sound invalidation/lifetime tracking.
-- Broaden native DSP handling while retaining unsupported microcode compatibility.
+- Shorten cold compilation through shared analysis, safe incremental caches and
+  better balanced compiler work, especially for games with many REL modules.
+- Smaller REL modules: native entry points only where they can be reached.
+- Profile real game, renderer, driver and audio hotspots and validate the game
+  speed after each change.
+- Less GPU synchronization and resource scanning, with sound invalidation and
+  lifetime tracking.
+- Broaden native DSP coverage while keeping the microcode fallback.
 
-## Longer-term targets
+## Frame rate
 
-Whole-program DOL/ELF/REL analysis, further host-thread scheduling, reconstructed intermediate representations and additional host architectures remain research areas. A static recompiler plus increasingly native services does not yet provide an automatic complete PC port of every GameCube game.
+- Decouple the presentation rate from the game's own rate without changing
+  game speed, animation or input latency. An experimental geometry-replay
+  mode exists and is disabled by default.
+
+## Longer term
+
+- Whole-program analysis of DOL, ELF and REL modules as one program.
+- A canonical GekkoAOT IR feeding both a direct LLVM backend and
+  reconstructed portable C++ (GekkoTranslate).
+- GCINE, the native GameCube environment below the recompiled game logic.
+- More host threads where the guest semantics allow it.
+- ARM64 hosts, then WebAssembly/WebGPU.
+
+A static recompiler with a growing set of native services is not yet an
+automatic, complete PC port of every GameCube game.

@@ -4,10 +4,21 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_graphics_settings.py"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_msaa_depth.py")
+
 set(GEKKOAOT_AURORA_SOURCE "" CACHE PATH "Pinned Aurora source checkout")
 if(NOT EXISTS "${GEKKOAOT_AURORA_SOURCE}/CMakeLists.txt")
   message(FATAL_ERROR "GEKKOAOT_AURORA_SOURCE must point to encounter/aurora")
 endif()
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_graphics_settings.py" "${GEKKOAOT_AURORA_SOURCE}"
+  COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_msaa_depth.py" "${GEKKOAOT_AURORA_SOURCE}"
+  COMMAND_ERROR_IS_FATAL ANY)
 
 # GekkoAOT v42-compatible single-window adaptation.
 #
@@ -892,7 +903,7 @@ foreach(_gekkoaot_aurora_test IN ITEMS gx_fifo_tests gx_shader_tests gx_texture_
   endif()
 endforeach()
 
-add_library(gekkoaot-native-gx SHARED bridge.cpp bounding_box.cpp)
+add_library(gekkoaot-native-gx SHARED bridge.cpp bounding_box.cpp perf_hud.cpp)
 # aurora::gx and aurora::core reference the VI helper implemented in
 # Aurora's dedicated aurora_vi target (configured_fb_size/configure).  Because
 # gekkoaot-native-gx is a shared object, leaving aurora::vi out can produce a
@@ -1031,6 +1042,34 @@ if(NOT _gekkoaot_ui_scissor_result EQUAL 0)
 endif()
 
 execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_ui_inset_v348.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_ui_inset_result)
+if(NOT _gekkoaot_ui_inset_result EQUAL 0)
+  message(FATAL_ERROR "Aurora UI inset overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_peek_snapshot_v349.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_peek_snapshot_result)
+if(NOT _gekkoaot_peek_snapshot_result EQUAL 0)
+  message(FATAL_ERROR "Aurora display-copy peek snapshot overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_perspective_fill_v356.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_perspective_fill_result)
+if(NOT _gekkoaot_perspective_fill_result EQUAL 0)
+  message(FATAL_ERROR "Aurora perspective screen fill overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_perspective_ui_v362.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_perspective_ui_result)
+if(NOT _gekkoaot_perspective_ui_result EQUAL 0)
+  message(FATAL_ERROR "Aurora perspective UI v362 overlay failed")
+endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_CURRENT_LIST_DIR}/aurora_bind_group_cache_v297.py" "${GEKKOAOT_AURORA_SOURCE}"
   RESULT_VARIABLE _gekkoaot_bind_group_cache_result)
 if(NOT _gekkoaot_bind_group_cache_result EQUAL 0)
@@ -1079,3 +1118,29 @@ execute_process(COMMAND "${Python3_EXECUTABLE}"
 if(NOT _gekkoaot_native_cache_lifetime_result EQUAL 0)
   message(FATAL_ERROR "Aurora native cache lifetime v317 overlay failed")
 endif()
+
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_present_overlay_v359.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_present_overlay_result)
+if(NOT _gekkoaot_present_overlay_result EQUAL 0)
+  message(FATAL_ERROR "Aurora present overlay v359 failed")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_present_overlay_v359.py")
+
+# Runs last: it anchors on code that earlier overlays rewrite.
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_frame_replay_v358.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_frame_replay_result)
+if(NOT _gekkoaot_frame_replay_result EQUAL 0)
+  message(FATAL_ERROR "Aurora frame replay v358 overlay failed")
+endif()
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_replay_efb_start_v360.py" "${GEKKOAOT_AURORA_SOURCE}"
+  RESULT_VARIABLE _gekkoaot_replay_efb_start_result)
+if(NOT _gekkoaot_replay_efb_start_result EQUAL 0)
+  message(FATAL_ERROR "Aurora replay EFB start v360 overlay failed")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_frame_replay_v358.py"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_replay_efb_start_v360.py")

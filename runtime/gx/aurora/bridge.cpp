@@ -25,12 +25,21 @@
 #include "dolphin/vi/vi_internal.hpp"
 #include "webgpu/gpu.hpp"
 #include <SDL3/SDL.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "window.hpp"
 #include "../host/tlut_memory.h"
 #include "bounding_box.h"
+#include "../graphics_settings.h"
 
 #include <algorithm>
 #include "../widescreen_policy.h"
+#include "../frame_replay_policy.h"
+#include "perf_hud.h"
 #include "../array_upload_policy.h"
 #include "../compact_array_window.h"
 #include "../cached_scanout.h"
@@ -47,12 +56,14 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 
 #ifndef GEKKOAOT_VERSION
 #define GEKKOAOT_VERSION "dev"
 #endif
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <utility>
 
 #ifdef GEKKOAOT_HAVE_X11
@@ -86,8 +97,115 @@ bool g_frame_open = false;
 // v128b renderer-level aspect mode. Keep only the two user-facing policies:
 // exact 4:3, or a live window-aspect mode with projection compensation.
 std::atomic<std::uint32_t> g_aspect_mode{0u};
+// v363: pre-rendered scenes (a full-screen backdrop writing depth from a
+// texture: Resident Evil rooms) hold no image beyond 4:3. While one is shown,
+// frames are rendered and presented at the original 4:3 instead of
+// stretching the backdrop under hor+ characters.
+bool g_wide_prerendered_43 = true;
+bool g_frame_prerendered = false;
+unsigned g_prerendered_idle = 0;
+std::atomic<bool> g_frame_force_43{false};
+bool g_present_force_43 = false; // render worker: the presented slot was recorded at 4:3
+bool g_recorded_force_43 = false; // mode of the frame the current display copy ends
+// Aspect mode the current frame records with.
+std::uint32_t RecordAspectMode() noexcept {
+  return g_frame_force_43.load(std::memory_order_relaxed) ? 0u : g_aspect_mode.load(std::memory_order_relaxed);
+}
 bool g_alt_enter_latched = false;
 bool g_screen_fill_draw = false;
+// v345: logical width of the last GXCopyDisp (the frame the VI scans out).
+std::atomic<std::uint32_t> g_display_copy_width{640u};
+// v345: ProjectionAspect normalizes a viewport against a 640-wide 4:3 display.
+// Titles with a narrower EFB (Nemo: 512x480, stretched to the full 4:3 screen
+// by the VI scaler) render a 4:3 camera into it; measure the viewport against
+// the width of the frame the VI actually scans out (the last GXCopyDisp).
+float DisplayViewWidth(float width) noexcept {
+  const float display = static_cast<float>(g_display_copy_width.load(std::memory_order_relaxed));
+  return display >= 320.f && display < 636.f && width <= display * 1.02f ? width * 640.f / display : width;
+}
+
+// v348: HUD insets (viewport/scissor spans clear of both canvas edges) follow
+// the UI transform once a frame shows them without copying them to a texture.
+bool g_ui_insets = true;
+GekkoAOT::GX::DisplayInsets g_display_insets;
+// v354: screen-derived EFB copies (bloom/blur pyramids) keep the retail width.
+bool g_copy_provenance_enabled = true;
+bool g_wide_perspective_fills = true;
+// v362: perspective cards of a 2D screen (no depth-writing 3D for a few
+// frames) get the UI scissor, so off-screen menu elements stay hidden.
+bool g_wide_perspective_ui = true;
+GekkoAOT::GX::FlatFrameHistory g_flat_frames;
+unsigned g_frame_depth_draws = 0;
+bool g_draw_perspective_ui = false;
+// FPS-unlock feasibility probe (GEKKOAOT_INTERP_PROBE=1): how many draws of a
+// guest frame find a structural partner in the previous frame, and how many of
+// those changed matrices (what a replay renderer would interpolate).
+struct InterpProbe {
+  std::vector<std::pair<std::uint64_t,std::uint64_t>> current, previous;
+  std::uint64_t frames=0, draws=0, matched=0, moved=0;
+};
+bool g_interp_probe_enabled = false;
+InterpProbe g_interp_probe;
+// v358 FPS unlock: frame interpolation re-renders the last guest frame's real
+// geometry at host present times, with its uniforms extrapolated from the
+// frame before. Blocks are keyed by the draw that built them; a frame is
+// replayed only while Aurora still holds its encoded passes.
+struct ReplayBlock {
+  std::uint64_t key=0;
+  std::uint32_t offset=0, size=0, proj=0, data=0, pnmtx=0;
+};
+struct ReplayCapture {
+  std::uint64_t frame_id=0;
+  std::vector<ReplayBlock> blocks;
+  std::vector<std::uint8_t> bytes;
+  std::unordered_map<std::uint64_t,std::uint32_t> index;
+  std::chrono::steady_clock::time_point produced{};
+  aurora::webgpu::TextureWithSampler present;
+  bool eligible=false;
+};
+bool g_replay_mode = true;
+// Default: show poses between the previous and the newest guest frame (no
+// overshoot, one guest frame of latency). GEKKOAOT_REPLAY_PREDICT=1 instead
+// predicts past the newest frame (no added latency, overshoots on sudden
+// direction changes).
+bool g_replay_interpolate = true;
+bool g_vsync_default = false;
+// Steady-clock nanoseconds of the last swapchain present (render worker).
+std::atomic<std::int64_t> g_last_present_ns{0};
+// Present pacing over the current log window (render worker writes, the GX
+// thread reads approximately for the 5 s log).
+struct PresentPacing { double sum=0.0, sum_sq=0.0, worst=0.0; std::uint64_t count=0; };
+PresentPacing g_present_pacing;
+std::atomic<bool> g_replay_capture_on{false};
+ReplayCapture g_replay_building;
+std::unordered_map<std::uint64_t,std::uint32_t> g_replay_occurrences;
+std::uint64_t g_replay_draw_sig = 0;
+std::uint32_t g_replay_draw_pnmtx = 0;
+bool g_replay_frame_bbox = false;
+std::mutex g_replay_mutex;
+std::shared_ptr<const ReplayCapture> g_replay_current, g_replay_previous;
+std::atomic<bool> g_replay_busy{false};
+// Diagnostics: captures/eligible (GX thread), requests and declines (host thread).
+std::atomic<std::uint64_t> g_replay_captures{0}, g_replay_eligible{0}, g_replay_requests{0},
+    g_replay_declined_early{0}, g_replay_declined_period{0}, g_replay_declined_busy{0}, g_replay_queued{0};
+struct ReplayStats {
+  std::uint64_t replays=0, skipped=0, blocks=0, matched=0, moved=0, cuts=0, frame_cuts=0;
+  double alpha=0.0;
+};
+ReplayStats g_replay_stats; // render worker only
+GekkoAOT::GX::CopyProvenance g_copy_provenance;
+// Logical width of the canvas the VI scans out (Nemo: a 512-wide EFB).
+float DisplayCanvasWidth() noexcept {
+  const float display = static_cast<float>(g_display_copy_width.load(std::memory_order_relaxed));
+  return display >= 320.f && display < 636.f ? display
+                                             : static_cast<float>(aurora::vi::configured_fb_size().x);
+}
+
+// v343: untextured full-width orthographic spans also bypass the UI x-scale.
+bool g_wide_solid_spans = true;
+unsigned g_wide_span_logs = 0;
+bool g_wide_span_trace = false;
+constexpr unsigned kMaxSpanVertices = 24;
 AuroraInfo g_info{};
 std::vector<std::uint8_t> g_fifo;
 std::size_t g_fifo_read = 0;
@@ -270,6 +388,10 @@ bool g_frame_interpolation_enabled = false;
 // v196 universal final-XFB presentation filter. The Balanced defaults mirror
 // the restrained HPCOS Remaster look; Cinematic enables the stronger MOH-style
 // filmic/edge-soft presentation without touching guest EFB/RAM semantics.
+std::atomic<unsigned> g_render_percent{100};
+std::atomic<unsigned> g_render_width{0}, g_render_height{0};
+GekkoAOT::GX::GraphicsSettings g_video;
+bool g_interpolation_requested = false;
 bool g_post_processing_enabled = true;
 float g_post_sharpen = 0.28f;
 float g_post_bloom = 0.10f;
@@ -409,6 +531,7 @@ struct XfbZeroCopySlot {
   // Profile only: last generation handed to VI scanout (dead-copy accounting).
   std::uint64_t presented_generation = 0;
   bool valid = false;
+  bool force_43 = false; // v363: recorded at the original 4:3
   // Own the resolved XFB independently from the live EFB.  This is the key
   // difference from the old render-target rotation path: later EFB clears or
   // unrelated display copies cannot mutate the VI-visible image.
@@ -767,7 +890,7 @@ aurora::webgpu::Viewport PresentViewportForAspect(std::uint32_t surface_width,
   // stretch mode so fullscreen/resizes immediately fill the surface; retain an
   // exact 4:3 viewport in original mode.
   if (surface_width == 0u || surface_height == 0u) return {};
-  const auto mode = g_aspect_mode.load(std::memory_order_acquire);
+  const auto mode = g_present_force_43 ? 0u : g_aspect_mode.load(std::memory_order_acquire);
   const float target = mode == 1u
                            ? static_cast<float>(surface_width) / static_cast<float>(surface_height)
                            : 4.0f / 3.0f;
@@ -797,7 +920,7 @@ aurora::webgpu::Viewport PresentViewportForAspect(std::uint32_t surface_width,
 
 bool FrameInterpolationForAspect(std::uint32_t mode) {
   (void)mode;
-  return false;
+  return g_interpolation_requested;
 }
 
 void ApplyAspectMode(std::uint32_t mode, bool log_change) {
@@ -992,14 +1115,119 @@ bool ClassifyScreenFill(const std::uint8_t* data,std::size_t length,
                         GXPrimitive primitive,GXVtxFmt format,unsigned count) {
   using namespace aurora::gx;
   const auto& state=g_gxState;
-  if (state.projType!=GX_ORTHOGRAPHIC ||
-      !((count==4u && (primitive==GX_QUADS || primitive==GX_TRIANGLESTRIP)) ||
-        (count==6u && primitive==GX_TRIANGLES)) ||
-      state.numTexGens!=1u || state.numTevStages>2u ||
-      state.blendMode!=GX_BM_NONE) return false;
+  // v356: a fade or flash drawn as a 3D quad in front of the camera covers the
+  // retail view exactly; hor+ would shrink it to 4:3 and leave the widened
+  // scene visible beside it (Call of Duty: Finest Hour level fades).
+  const bool perspective=state.projType==GX_PERSPECTIVE;
+  if (perspective ? !g_wide_perspective_fills : state.projType!=GX_ORTHOGRAPHIC) return false;
+  // Meshes never qualify: only a single quad (or two triangles) can be a fade.
+  if (perspective && !((count==4u && (primitive==GX_QUADS || primitive==GX_TRIANGLESTRIP ||
+                                       primitive==GX_TRIANGLEFAN)) ||
+                       (count==6u && primitive==GX_TRIANGLES))) return false;
+  const bool fill=!perspective && state.numTexGens==1u && state.numTevStages<=2u &&
+      state.blendMode==GX_BM_NONE &&
+      ((count==4u && (primitive==GX_QUADS || primitive==GX_TRIANGLESTRIP)) ||
+       (count==6u && primitive==GX_TRIANGLES));
+  // v343: full-width spans (letterbox bars, fades, flashes) also bypass the UI
+  // x-scale. Otherwise they stay centred at 4:3 width and leave the widened 3D
+  // scene visible beside a cinematic bar or a fade.
+  const bool span=g_wide_solid_spans && count<=kMaxSpanVertices &&
+      ((primitive==GX_QUADS && count>=4u && count%4u==0u) ||
+       (primitive==GX_TRIANGLES && count>=3u && count%3u==0u) ||
+       // v357: fans too (Call of Duty: Finest Hour's mission fade-in).
+       ((primitive==GX_TRIANGLESTRIP || primitive==GX_TRIANGLEFAN) && count>=4u));
+  // A stage samples its texture only when a combiner input reads TEXC/TEXA
+  // (Aurora's shader_info rule); CoS binds texmap 0 to its solid cinematic
+  // bars without reading it.
+  const auto samples=[](const TevStage& stage) {
+    if (stage.texMapId==GX_TEXMAP_NULL) return false;
+    const auto& c=stage.colorPass; const auto& a=stage.alphaPass;
+    for (const auto arg : {c.a,c.b,c.c,c.d}) if (arg==GX_CC_TEXC || arg==GX_CC_TEXA) return true;
+    for (const auto arg : {a.a,a.b,a.c,a.d}) if (arg==GX_CA_TEXA) return true;
+    return false;
+  };
+  bool sampled=state.numIndStages!=0u || state.zTexOp!=GX_ZT_DISABLE, uniform=!sampled;
+  // Perspective quads test their geometry first (cheap) and textures after.
+  const auto texture_uniformity=[&] {
+  for (unsigned stage=0;span && uniform && stage<state.numTevStages && stage<MaxTevStages;++stage) {
+    const auto map=state.tevStages[stage].texMapId;
+    if (!samples(state.tevStages[stage])) continue;
+    sampled=true;
+    const auto& slot=state.loadedTextures[unsigned(map)&7u];
+    const std::size_t bytes=slot.data ? texture::texture_source_size(slot.raw_format(),slot.width(),slot.height(),1u) : 0u;
+    uniform=GekkoAOT::GX::IsUniformTexture(static_cast<const std::uint8_t*>(slot.data),
+                                           std::min<std::size_t>(bytes,16384u),slot.raw_format());
+  }
+  };
+  if (!perspective) texture_uniformity();
+  // v353: a whole-screen quad sampling only EFB copies composites screen-
+  // derived data: bloom/blur chains downsample the widened EFB into small
+  // copies and add the result back over the frame (Shadow the Hedgehog). The
+  // small copy fails the screen-copy size test, but it still covers the whole
+  // retail width, so it must keep it rather than shrink to 4:3.
+  bool copy_only=false, screen_inputs=false;
+  const aurora::gfx::ClipRect* copy_source=nullptr;
+  if (span && sampled && state.numIndStages==0u && !perspective) {
+    bool any=false;
+    copy_only=true;
+    screen_inputs=g_copy_provenance_enabled;
+    for (unsigned stage=0;stage<state.numTevStages && stage<MaxTevStages;++stage) {
+      if (!samples(state.tevStages[stage])) continue;
+      any=true;
+      const auto& slot=state.loadedTextures[unsigned(state.tevStages[stage].texMapId)&7u];
+      const auto copy=slot.data ? state.copyTextures.find(slot.data) : state.copyTextures.end();
+      if (copy==state.copyTextures.end()) { copy_only=false; break; }
+      screen_inputs=screen_inputs && g_copy_provenance.IsScreenDerived(slot.data);
+      copy_source=copy_source && copy_source!=&copy->second.guestSource ? nullptr : &copy->second.guestSource;
+    }
+    copy_only=copy_only && any;
+    screen_inputs=screen_inputs && copy_only;
+  }
+  // v353: a single modulate stage (RASC x TEXC) with a black raster colour
+  // draws black whatever the texture holds (Metroid Prime's letterbox bars);
+  // with alpha that ignores the texture, or an opaque texture, it is solid.
+  bool vertex_black=false;
+  if (!perspective && span && sampled && !uniform && state.numTevStages==1u && state.numIndStages==0u &&
+      state.zTexOp==GX_ZT_DISABLE) {
+    const auto& st=state.tevStages[0];
+    const auto& c=st.colorPass; const auto& a=st.alphaPass;
+    const bool modulate=c.a==GX_CC_ZERO && c.d==GX_CC_ZERO &&
+        ((c.b==GX_CC_RASC && c.c==GX_CC_TEXC) || (c.b==GX_CC_TEXC && c.c==GX_CC_RASC));
+    const bool alpha_reads_texture=a.a==GX_CA_TEXA || a.b==GX_CA_TEXA || a.c==GX_CA_TEXA || a.d==GX_CA_TEXA;
+    const auto& slot=state.loadedTextures[unsigned(st.texMapId)&7u];
+    const std::size_t bytes=slot.data ? texture::texture_source_size(slot.raw_format(),slot.width(),slot.height(),1u) : 0u;
+    const bool alpha_solid=!alpha_reads_texture ||
+        GekkoAOT::GX::IsOpaqueTexture(static_cast<const std::uint8_t*>(slot.data),
+                                      std::min<std::size_t>(bytes,16384u),slot.raw_format());
+    if (modulate && alpha_solid && (st.channelId==GX_COLOR0A0 || st.channelId==GX_COLOR0)) {
+      if (state.colorChannelConfig[0].matSrc==GX_SRC_REG) {
+        const auto& m=state.colorChannelState[0].matColor;
+        uniform=m[0]==0.f && m[1]==0.f && m[2]==0.f;
+      } else {
+        vertex_black=state.vtxDesc[GX_VA_CLR0]==GX_DIRECT;
+      }
+    }
+  }
+  // Diagnostic: GEKKOAOT_WIDESCREEN_DRAWLOG_AT=<s> logs every small draw for
+  // ~0.1 s that many seconds after the first draw.
+  static const double drawlog_at=[] { const char* v=std::getenv("GEKKOAOT_WIDESCREEN_DRAWLOG_AT"); return v ? std::atof(v) : 0.0; }();
+  static const auto drawlog_origin=std::chrono::steady_clock::now();
+  bool drawlog=false;
+  if (drawlog_at>0.0) {
+    const double t=std::chrono::duration<double>(std::chrono::steady_clock::now()-drawlog_origin).count();
+    static const double drawlog_for=[] { const char* v=std::getenv("GEKKOAOT_WIDESCREEN_DRAWLOG_FOR"); return v ? std::atof(v) : 4.0; }();
+    drawlog=t>=drawlog_at && t<drawlog_at+drawlog_for;
+  }
+  const bool trace=(g_wide_span_trace || drawlog) && count>=3u && count<=kMaxSpanVertices &&
+      primitive!=GX_POINTS && primitive!=GX_LINES && primitive!=GX_LINESTRIP;
+  if (!fill && !span && !trace) return false;
   const auto display=aurora::vi::configured_fb_size();
   const auto& viewport=state.logicalViewport;
-  if (viewport.width<display.x*.95f || viewport.height<display.y*.95f) return false;
+  // Horizontal stretching only needs a full-width viewport; PoA renders its
+  // cinematics into a 640x448 viewport of a 640x480 display.
+  const bool wide_viewport=DisplayViewWidth(viewport.width)>=display.x*.95f;
+  const bool full_viewport=wide_viewport && viewport.height>=display.y*.95f;
+  if (!wide_viewport && !trace && !copy_only) return false;
   const unsigned stride=VertexSize(format);
   if (!stride || length!=3u+count*stride) return false;
   unsigned position_offset=0, matrix_offset=0;
@@ -1018,9 +1246,40 @@ bool ClassifyScreenFill(const std::uint8_t* data,std::size_t length,
   const unsigned components=comp_cnt_count(GX_VA_POS,posfmt.cnt);
   const unsigned size=comp_type_size(GX_VA_POS,posfmt.type);
   if (components<2u || components>3u || !size) return false;
-  std::array<std::array<float,2>,6> corners{};
+  // CLR0 offset, laid out exactly like calc_vtx_size().
+  unsigned color_offset=0;
+  const auto color_type=state.vtxFmts[format].attrs[GX_VA_CLR0].type;
+  if (vertex_black) {
+    for (int attr=GX_VA_PNMTXIDX;attr<GX_VA_CLR0;++attr) {
+      const auto d=state.vtxDesc[attr];
+      const auto& f=state.vtxFmts[format].attrs[attr];
+      if (d==GX_DIRECT)
+        color_offset+=unsigned(comp_type_size(static_cast<GXAttr>(attr),f.type))*
+                      comp_cnt_count(static_cast<GXAttr>(attr),f.cnt);
+      else if (d==GX_INDEX8 || d==GX_INDEX16)
+        color_offset+=(attr==GX_VA_NRM && f.cnt==GX_NRM_NBT3 ? 3u : 1u)*(d==GX_INDEX16 ? 2u : 1u);
+    }
+    vertex_black=color_offset+comp_type_size(GX_VA_CLR0,color_type)<=stride;
+  }
+  int vertex_alpha=-1;
+  std::array<std::array<float,2>,kMaxSpanVertices> corners{};
+  std::array<float,kMaxSpanVertices> view_z{};
   for (unsigned i=0;i<count;++i) {
     const auto* vertex=data+3u+i*stride;
+    if (vertex_black) {
+      const auto* p=vertex+color_offset;
+      unsigned rgb=1u, alpha=255u;
+      switch (color_type) {
+      case GX_RGB565: rgb=(unsigned(p[0])<<8)|p[1]; break;
+      case GX_RGB8: case GX_RGBX8: rgb=unsigned(p[0])|p[1]|p[2]; break;
+      case GX_RGBA4: rgb=unsigned(p[0])|(p[1]&0xf0u); alpha=(p[1]&0x0fu)*17u; break;
+      case GX_RGBA6: { const unsigned v=(unsigned(p[0])<<16)|(unsigned(p[1])<<8)|p[2]; rgb=v>>6; alpha=v&63u; break; }
+      case GX_RGBA8: rgb=unsigned(p[0])|p[1]|p[2]; alpha=p[3]; break;
+      default: break;
+      }
+      if (rgb!=0u || (vertex_alpha>=0 && unsigned(vertex_alpha)!=alpha)) vertex_black=false;
+      vertex_alpha=int(alpha);
+    }
     const auto* pos=vertex+position_offset;
     bool little=false;
     if (desc==GX_INDEX8 || desc==GX_INDEX16) {
@@ -1046,16 +1305,191 @@ bool ClassifyScreenFill(const std::uint8_t* data,std::size_t length,
     }
     const unsigned matrix=indexed_matrix ? (vertex[matrix_offset]&63u) : state.currentPnMtx;
     if (matrix+2u>=state.xfPosRows.size()) return false;
-    float transformed[2]={0,0};
-    for (unsigned axis=0;axis<2;++axis)
+    float transformed[3]={0,0,0};
+    for (unsigned axis=0;axis<(perspective ? 3u : 2u);++axis)
       for (unsigned j=0;j<4;++j) transformed[axis]+=state.xfPosRows[matrix+axis][j]*xyz[j];
-    corners[i]={state.proj.m0[0]*transformed[0]+state.proj.m0[3],
-                state.proj.m1[1]*transformed[1]+state.proj.m1[3]};
+    view_z[i]=transformed[2];
+    if (perspective) {
+      const auto row=[&](const auto& m) {
+        return m[0]*transformed[0]+m[1]*transformed[1]+m[2]*transformed[2]+m[3];
+      };
+      const float w=row(state.proj.m3);
+      if (!(w>1e-6f)) return false;
+      corners[i]={row(state.proj.m0)/w,row(state.proj.m1)/w};
+    } else {
+      corners[i]={state.proj.m0[0]*transformed[0]+state.proj.m0[3],
+                  state.proj.m1[1]*transformed[1]+state.proj.m1[3]};
+    }
+    // HUD sprites and glyphs fail the span test at their first vertex.
+    if (!fill && !trace && !copy_only && std::abs(corners[i][0])<.975f) return false;
   }
-  if (count==6u) return GekkoAOT::GX::IsScreenFillTriangles(corners);
-  std::array<std::array<float,2>,4> quad{};
-  std::copy_n(corners.begin(),4u,quad.begin());
-  return GekkoAOT::GX::IsScreenFillQuad(quad,primitive==GX_TRIANGLESTRIP);
+  if (g_wide_prerendered_43 && state.zTexOp!=GX_ZT_DISABLE && state.depthUpdate && count<=6u &&
+      GekkoAOT::GX::IsFullScreenSpan({corners.data(),count}))
+    g_frame_prerendered=true;
+  if (trace) {
+    float lo_x=corners[0][0],hi_x=lo_x,lo_y=corners[0][1],hi_y=lo_y;
+    for (unsigned i=1;i<count;++i) {
+      lo_x=std::min(lo_x,corners[i][0]); hi_x=std::max(hi_x,corners[i][0]);
+      lo_y=std::min(lo_y,corners[i][1]); hi_y=std::max(hi_y,corners[i][1]);
+    }
+    unsigned maps=0;
+    for (unsigned stage=0;stage<state.numTevStages && stage<MaxTevStages;++stage)
+      maps=maps*16u+(state.tevStages[stage].texMapId==GX_TEXMAP_NULL ? 15u : unsigned(state.tevStages[stage].texMapId)&7u);
+    const std::uint64_t signature=(std::uint64_t(primitive)<<56)^(std::uint64_t(count)<<48)^
+        (std::uint64_t(state.numTexGens)<<44)^(std::uint64_t(maps)<<24)^(std::uint64_t(state.blendMode)<<20)^
+        (std::uint64_t(viewport.height)<<8)^std::uint64_t(int(lo_y*8.f)&15)^(std::uint64_t(int(hi_y*8.f)&15)<<4);
+    for (unsigned stage=0;stage<state.numTevStages && stage<MaxTevStages;++stage) {
+      if (!samples(state.tevStages[stage])) continue;
+      const auto& slot=state.loadedTextures[unsigned(state.tevStages[stage].texMapId)&7u];
+      const auto copy=state.copyTextures.find(slot.data);
+      if (!slot.data || copy==state.copyTextures.end()) continue;
+      const auto& src=copy->second.guestSource;
+      static std::vector<std::uint64_t> sprites;
+      const std::uint64_t key=(std::uint64_t(src.width)<<48)^(std::uint64_t(src.height)<<36)^
+          (std::uint64_t(int(lo_x*16.f)&255)<<16)^(std::uint64_t(int(hi_x*16.f)&255)<<8)^std::uint64_t(viewport.width);
+      if (sprites.size()<64u && std::find(sprites.begin(),sprites.end(),key)==sprites.end()) {
+        sprites.push_back(key);
+        std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_COPY_SPRITE_TRACE src=%d,%d,%dx%d tex=%ux%u viewport=%.0fx%.0f@%.0f,%.0f "
+                     "x=%.3f..%.3f y=%.3f..%.3f count=%u prim=0x%02x\n",src.x,src.y,src.width,src.height,
+                     slot.width(),slot.height(),viewport.width,viewport.height,viewport.left,viewport.top,
+                     lo_x,hi_x,lo_y,hi_y,count,unsigned(primitive));
+      }
+    }
+    static std::vector<std::uint64_t> seen;
+    if (hi_x-lo_x>=1.5f && seen.size()<128u &&
+        std::find(seen.begin(),seen.end(),signature)==seen.end()) {
+      seen.push_back(signature);
+      const auto& st0=state.tevStages[0];
+      std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_SPAN_TRACE_V343 prim=0x%02x count=%u texgens=%u tev=%u maps=%x blend=%u "
+                   "viewport=%.0fx%.0f@%.0f,%.0f full=%u x=%.3f..%.3f y=%.3f..%.3f fill=%u span=%u sampled=%u uniform=%u "
+                   "c0=%u,%u,%u,%u a0=%u,%u,%u,%u chan=%u kc=%u matsrc=%u mat=%.2f,%.2f,%.2f,%.2f clr0=%u tex=%ux%u:%u\n",
+                   unsigned(primitive),count,unsigned(state.numTexGens),unsigned(state.numTevStages),maps,
+                   unsigned(state.blendMode),viewport.width,viewport.height,viewport.left,viewport.top,
+                   full_viewport?1u:0u,lo_x,hi_x,lo_y,hi_y,fill?1u:0u,span?1u:0u,sampled?1u:0u,uniform?1u:0u,
+                   unsigned(st0.colorPass.a),unsigned(st0.colorPass.b),unsigned(st0.colorPass.c),unsigned(st0.colorPass.d),
+                   unsigned(st0.alphaPass.a),unsigned(st0.alphaPass.b),unsigned(st0.alphaPass.c),unsigned(st0.alphaPass.d),
+                   unsigned(st0.channelId),unsigned(st0.kcSel),unsigned(state.colorChannelConfig[0].matSrc),
+                   state.colorChannelState[0].matColor[0],state.colorChannelState[0].matColor[1],
+                   state.colorChannelState[0].matColor[2],state.colorChannelState[0].matColor[3],
+                   unsigned(state.vtxDesc[GX_VA_CLR0]),
+                   st0.texMapId==GX_TEXMAP_NULL?0u:state.loadedTextures[unsigned(st0.texMapId)&7u].width(),
+                   st0.texMapId==GX_TEXMAP_NULL?0u:state.loadedTextures[unsigned(st0.texMapId)&7u].height(),
+                   st0.texMapId==GX_TEXMAP_NULL?0u:unsigned(state.loadedTextures[unsigned(st0.texMapId)&7u].raw_format()));
+      if (st0.texMapId!=GX_TEXMAP_NULL && state.loadedTextures[unsigned(st0.texMapId)&7u].data) {
+        const auto* tb=static_cast<const std::uint8_t*>(state.loadedTextures[unsigned(st0.texMapId)&7u].data);
+        std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_SPAN_TEX");
+        for (unsigned i=0;i<48;++i) std::fprintf(stderr,"%s%02x",i%8?"":" ",tb[i]);
+        std::fprintf(stderr,"\n");
+      }
+    }
+  }
+  if (vertex_black) uniform=true;
+  if (drawlog) {
+    float lo_x=corners[0][0],hi_x=lo_x,lo_y=corners[0][1],hi_y=lo_y;
+    for (unsigned i=1;i<count;++i) {
+      lo_x=std::min(lo_x,corners[i][0]); hi_x=std::max(hi_x,corners[i][0]);
+      lo_y=std::min(lo_y,corners[i][1]); hi_y=std::max(hi_y,corners[i][1]);
+    }
+    float vz_lo=view_z[0],vz_hi=view_z[0];
+    for (unsigned i=1;i<count;++i) { vz_lo=std::min(vz_lo,view_z[i]); vz_hi=std::max(vz_hi,view_z[i]); }
+    const auto& st0=state.tevStages[0];
+    // Wide draws, and draws entirely outside the 4:3 view that widescreen
+    // can reveal in the side bands.
+    if (hi_x-lo_x>=1.f || (hi_x<-1.f && hi_x>-1.4f) || (lo_x>1.f && lo_x<1.4f))
+    std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_DRAWLOG copy=%llu ztex=%u fill=%u ztest=%u zwrite=%u vz=%.2f..%.2f pm=%.3f,%.3f proj=%u prim=0x%02x count=%u x=%.3f..%.3f y=%.3f..%.3f view=%.0fx%.0f@%.0f,%.0f scissor=%d,%d,%dx%d tev=%u texgens=%u blend=%u span=%u sampled=%u uniform=%u copy_only=%u c0=%u,%u,%u,%u a0=%u,%u,%u,%u tex=%ux%u:%u\n",
+                 static_cast<unsigned long long>(g_display_copy_count),unsigned(state.zTexOp),fill?1u:0u,
+                 state.depthCompare?1u:0u,state.depthUpdate?1u:0u,
+                 vz_lo,vz_hi,state.proj.m0[0],state.proj.m1[1],unsigned(state.projType),unsigned(primitive),count,
+                 lo_x,hi_x,lo_y,hi_y,viewport.width,viewport.height,viewport.left,viewport.top,
+                 state.logicalScissor.x,state.logicalScissor.y,state.logicalScissor.width,state.logicalScissor.height,
+                 unsigned(state.numTevStages),unsigned(state.numTexGens),unsigned(state.blendMode),span?1u:0u,
+                 sampled?1u:0u,uniform?1u:0u,copy_only?1u:0u,
+                 unsigned(st0.colorPass.a),unsigned(st0.colorPass.b),unsigned(st0.colorPass.c),unsigned(st0.colorPass.d),
+                 unsigned(st0.alphaPass.a),unsigned(st0.alphaPass.b),unsigned(st0.alphaPass.c),unsigned(st0.alphaPass.d),
+                 st0.texMapId==GX_TEXMAP_NULL?0u:state.loadedTextures[unsigned(st0.texMapId)&7u].width(),
+                 st0.texMapId==GX_TEXMAP_NULL?0u:state.loadedTextures[unsigned(st0.texMapId)&7u].height(),
+                 st0.texMapId==GX_TEXMAP_NULL?0u:unsigned(state.loadedTextures[unsigned(st0.texMapId)&7u].raw_format()));
+  }
+  if (perspective) {
+    if (!span || !wide_viewport || !GekkoAOT::GX::IsFullScreenSpan({corners.data(),count})) return false;
+    texture_uniformity();
+    const bool screen=uniform;
+    static unsigned perspective_logs=0;
+    if (screen && perspective_logs++<8u)
+      std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_PERSPECTIVE_FILL_V356 prim=0x%02x count=%u blend=%u sampled=%u action=retail-width\n",
+                   unsigned(primitive),count,unsigned(state.blendMode),sampled?1u:0u);
+    return screen;
+  }
+  if (copy_only && g_copy_provenance_enabled) {
+    // Logical EFB rectangle covered by this pass (GX viewport y points down).
+    float lo_x=corners[0][0],hi_x=lo_x,lo_y=corners[0][1],hi_y=lo_y;
+    for (unsigned i=1;i<count;++i) {
+      lo_x=std::min(lo_x,corners[i][0]); hi_x=std::max(hi_x,corners[i][0]);
+      lo_y=std::min(lo_y,corners[i][1]); hi_y=std::max(hi_y,corners[i][1]);
+    }
+    const float x0=viewport.left+(std::max(lo_x,-1.f)+1.f)*.5f*viewport.width;
+    const float x1=viewport.left+(std::min(hi_x,1.f)+1.f)*.5f*viewport.width;
+    const float y0=viewport.top+(1.f-std::min(hi_y,1.f))*.5f*viewport.height;
+    const float y1=viewport.top+(1.f-std::max(lo_y,-1.f))*.5f*viewport.height;
+    // v354 rule A: a pass sampling only screen-derived copies is EFB pixel
+    // work (downsample/blur/upsample/composite) and keeps the retail width.
+    // Rule B: a copy drawn back onto exactly its own source rectangle
+    // restores saved EFB contents (Lemony saves the quarter its bloom
+    // pyramid overwrites) and must land on the same pixels.
+    const bool restore=copy_source &&
+        std::abs(x0-float(copy_source->x))<=2.f && std::abs(y0-float(copy_source->y))<=2.f &&
+        std::abs(x1-float(copy_source->x+copy_source->width))<=2.f &&
+        std::abs(y1-float(copy_source->y+copy_source->height))<=2.f;
+    if (screen_inputs || restore) {
+      if (screen_inputs) g_copy_provenance.NoteScreenDraw(x0,y0,x1,y1);
+      static unsigned provenance_logs=0;
+      if (provenance_logs++<16u)
+        std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_COPY_PROVENANCE_V354 rule=%s rect=%.0f,%.0f-%.0f,%.0f viewport=%.0fx%.0f action=retail-width\n",
+                     screen_inputs ? "screen-derived" : "restore",x0,y0,x1,y1,viewport.width,viewport.height);
+      return true;
+    }
+  }
+  if (span && wide_viewport && copy_only &&
+      GekkoAOT::GX::IsFullScreenSpan({corners.data(),count})) {
+    static unsigned composite_logs=0;
+    if (composite_logs++<8u)
+      std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_COPY_COMPOSITE_V353 prim=0x%02x count=%u blend=%u action=retail-width\n",
+                   unsigned(primitive),count,unsigned(state.blendMode));
+    return true;
+  }
+  if (span && wide_viewport && uniform &&
+      GekkoAOT::GX::IsEdgeAnchoredSpan({corners.data(),count})) {
+    if (g_wide_span_logs<8u) {
+      ++g_wide_span_logs;
+      std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_SPAN_V343 prim=0x%02x count=%u sampled=%u blend=%u y=%.3f..%.3f\n",
+                   unsigned(primitive),count,sampled?1u:0u,unsigned(state.blendMode),
+                   corners[0][1],corners[count-1u][1]);
+    }
+    return true;
+  }
+  if (!fill || !full_viewport) return false;
+  bool screen=false;
+  if (count==6u) {
+    std::array<std::array<float,2>,6> triangles{};
+    std::copy_n(corners.begin(),6u,triangles.begin());
+    screen=GekkoAOT::GX::IsScreenFillTriangles(triangles);
+  } else {
+    std::array<std::array<float,2>,4> quad{};
+    std::copy_n(corners.begin(),4u,quad.begin());
+    screen=GekkoAOT::GX::IsScreenFillQuad(quad,primitive==GX_TRIANGLESTRIP);
+  }
+  if (screen) {
+    // Diagnostic: which textures the opaque full-screen rule stretches.
+    const auto& slot=state.loadedTextures[0];
+    const std::uint64_t key=(std::uint64_t(slot.width())<<32)|(std::uint64_t(slot.height())<<8)|slot.raw_format();
+    static std::vector<std::uint64_t> fills;
+    if (fills.size()<8u && std::find(fills.begin(),fills.end(),key)==fills.end()) {
+      fills.push_back(key);
+      std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_FILL_V253 tex=%ux%u fmt=%u data=%u tev=%u\n",
+                   slot.width(),slot.height(),slot.raw_format(),slot.data?1u:0u,unsigned(state.numTevStages));
+    }
+  }
+  return screen;
 }
 
 void MapArrayBase(std::uint8_t reg, std::uint32_t value) {
@@ -2043,6 +2477,11 @@ bool PrepareRawTextureCopy(std::uint32_t word) {
       g_gxState.texCopySrc.x,g_gxState.texCopySrc.y,g_gxState.texCopySrc.width,
       g_gxState.texCopySrc.height,float(display.x),float(display.y),
       g_camera_copy_epoch.load(std::memory_order_relaxed));
+  g_display_insets.NoteCopy(float(g_gxState.texCopySrc.x),float(g_gxState.texCopySrc.width),
+                            g_display_copy_count);
+  g_copy_provenance.NoteCopy(g_gxState.texCopyDest,float(g_gxState.texCopySrc.x),float(g_gxState.texCopySrc.y),
+                             float(g_gxState.texCopySrc.width),float(g_gxState.texCopySrc.height),
+                             DisplayCanvasWidth(),float(aurora::vi::configured_fb_size().y));
   static unsigned copy_logs=0;
   if(g_trace_gx_copy && copy_logs++<128u)
     std::fprintf(stderr,"GEKKOAOT_TRACE_GX_COPY event=texture-copy width=%u height=%u half=%u format=%u\n",
@@ -2135,6 +2574,35 @@ const aurora::webgpu::TextureWithSampler* XfbPresentSource(const XfbZeroCopySlot
   return slot.frame_buffer.texture ? &slot.frame_buffer : nullptr;
 }
 
+// v358: publish the uniform blocks of the frame this display copy ends.
+void FinishReplayCapture(const XfbZeroCopySlot& slot) {
+  auto capture=std::make_shared<ReplayCapture>(std::move(g_replay_building));
+  g_replay_building={};
+  g_replay_building.blocks.reserve(capture->blocks.size());
+  g_replay_building.bytes.reserve(capture->bytes.size());
+  g_replay_occurrences.clear();
+  capture->frame_id=aurora::gfx::gekkoaot_recording_frame_id();
+  capture->produced=std::chrono::steady_clock::now();
+  if (const auto* source=XfbPresentSource(slot)) capture->present=*source;
+  // Bounding-box draws feed values the guest reads back. (A frame that
+  // loads the previous EFB is restored by Aurora before each replay, v360.)
+  capture->eligible=capture->frame_id!=0 && capture->present.texture && !capture->blocks.empty() &&
+                    !g_replay_frame_bbox;
+  g_replay_frame_bbox=false;
+  g_replay_captures.fetch_add(1,std::memory_order_relaxed);
+  if (capture->eligible) g_replay_eligible.fetch_add(1,std::memory_order_relaxed);
+  static unsigned capture_logs=0;
+  if (capture_logs++<4u)
+    std::fprintf(stderr,"GEKKOAOT_FRAME_REPLAY_CAPTURE_V358 frame=%llu blocks=%zu bytes=%zu present=%u eligible=%u\n",
+                 static_cast<unsigned long long>(capture->frame_id),capture->blocks.size(),capture->bytes.size(),
+                 capture->present.texture ? 1u : 0u,capture->eligible ? 1u : 0u);
+  capture->index.reserve(capture->blocks.size());
+  for (std::uint32_t i=0;i<capture->blocks.size();++i) capture->index.emplace(capture->blocks[i].key,i);
+  std::lock_guard lock{g_replay_mutex};
+  g_replay_previous=std::move(g_replay_current);
+  g_replay_current=std::move(capture);
+}
+
 
 struct PostFxResources {
   wgpu::BindGroupLayout layout;
@@ -2159,7 +2627,7 @@ bool EnsureUniversalPostFxPipeline() {
   resources.format = format;
   wgpu::ShaderSourceWGSL source{};
   source.code = R"WGSL(
-struct Params { primary: vec4<f32>, secondary: vec4<f32>, };
+struct Params { primary: vec4<f32>, secondary: vec4<f32>, grading: vec4<f32>, light: vec4<f32>, flags: vec4<f32>, };
 struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var tex_sampler: sampler;
@@ -2173,6 +2641,9 @@ var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
   out.position = vec4<f32>(pos[idx], 0.0, 1.0);
   out.uv = uvs[idx];
   return out;
+}
+fn sample_source(uv: vec2<f32>) -> vec4<f32> {
+  return textureSampleLevel(source_tex, tex_sampler, uv, 0.0);
 }
 fn aces(x: vec3<f32>) -> vec3<f32> {
   let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
@@ -2188,21 +2659,44 @@ fn hash12(p: vec2<f32>) -> f32 {
   let dims = vec2<f32>(textureDimensions(source_tex));
   let px = vec2<f32>(1.0) / max(dims, vec2<f32>(1.0));
   let uv = clamp(in.uv, vec2<f32>(0.0), vec2<f32>(1.0));
-  let center = textureSample(source_tex, tex_sampler, uv).rgb;
-  let n = textureSample(source_tex, tex_sampler, uv + vec2<f32>(0.0, -px.y)).rgb;
-  let s = textureSample(source_tex, tex_sampler, uv + vec2<f32>(0.0, px.y)).rgb;
-  let e = textureSample(source_tex, tex_sampler, uv + vec2<f32>(px.x, 0.0)).rgb;
-  let w = textureSample(source_tex, tex_sampler, uv + vec2<f32>(-px.x, 0.0)).rgb;
+  let center = sample_source(uv).rgb;
+  let n = sample_source(uv + vec2<f32>(0.0, -px.y)).rgb;
+  let s = sample_source(uv + vec2<f32>(0.0, px.y)).rgb;
+  let e = sample_source(uv + vec2<f32>(px.x, 0.0)).rgb;
+  let w = sample_source(uv + vec2<f32>(-px.x, 0.0)).rgb;
   let local_blur = (center * 4.0 + n + s + e + w) / 8.0;
 
-  var color = center + (center - local_blur) * params.primary.x;
+  var filtered = center;
+  if (params.flags.x > 0.5) {
+    // Directional FXAA, preserving flat areas and high-contrast detail.
+    let nw = sample_source(uv - px).rgb;
+    let ne = sample_source(uv + vec2<f32>(px.x,-px.y)).rgb;
+    let sw = sample_source(uv + vec2<f32>(-px.x,px.y)).rgb;
+    let se = sample_source(uv + px).rgb;
+    let luma = vec3<f32>(0.299,0.587,0.114);
+    let a=dot(nw,luma); let b=dot(ne,luma); let c=dot(sw,luma); let d=dot(se,luma);
+    let m=dot(center,luma);
+    let lo=min(m,min(min(a,b),min(c,d))); let hi=max(m,max(max(a,b),max(c,d)));
+    if (hi-lo > max(0.0312,hi*0.125)) {
+      var dir=vec2<f32>(-((a+b)-(c+d)),(a+c)-(b+d));
+      let reduce=max((a+b+c+d)*0.03125,0.0078125);
+      dir=clamp(dir/(min(abs(dir.x),abs(dir.y))+reduce),vec2<f32>(-8.0),vec2<f32>(8.0))*px;
+      let rgbA=0.5*(sample_source(uv+dir*(-1.0/6.0)).rgb+
+                    sample_source(uv+dir*(1.0/6.0)).rgb);
+      let rgbB=rgbA*0.5+0.25*(sample_source(uv-dir*0.5).rgb+
+                               sample_source(uv+dir*0.5).rgb);
+      let lumB=dot(rgbB,luma);
+      filtered=select(rgbB,rgbA,lumB<lo || lumB>hi);
+    }
+  }
+  var color = filtered + (center - local_blur) * params.primary.x;
   color += (center - local_blur) * params.secondary.y;
 
   let radius = px * 4.0;
-  let b0 = textureSample(source_tex, tex_sampler, uv + vec2<f32>( radius.x, 0.0)).rgb;
-  let b1 = textureSample(source_tex, tex_sampler, uv + vec2<f32>(-radius.x, 0.0)).rgb;
-  let b2 = textureSample(source_tex, tex_sampler, uv + vec2<f32>(0.0,  radius.y)).rgb;
-  let b3 = textureSample(source_tex, tex_sampler, uv + vec2<f32>(0.0, -radius.y)).rgb;
+  let b0 = sample_source(uv + vec2<f32>( radius.x, 0.0)).rgb;
+  let b1 = sample_source(uv + vec2<f32>(-radius.x, 0.0)).rgb;
+  let b2 = sample_source(uv + vec2<f32>(0.0,  radius.y)).rgb;
+  let b3 = sample_source(uv + vec2<f32>(0.0, -radius.y)).rgb;
   let bloom_source = max((b0 + b1 + b2 + b3) * 0.25 - vec3<f32>(0.58), vec3<f32>(0.0));
   color += bloom_source * params.primary.y * 0.75;
 
@@ -2221,6 +2715,13 @@ fn hash12(p: vec2<f32>) -> f32 {
 
   let noise = hash12(uv * dims + vec2<f32>(params.secondary.w, params.secondary.w * 0.618)) - 0.5;
   color += vec3<f32>(noise * params.primary.w);
+  color *= exp2(params.light.x) * params.grading.x;
+  color *= vec3<f32>(1.0+params.light.y*0.15,1.0+params.light.w*0.15,1.0-params.light.y*0.15);
+  color = (color - vec3<f32>(0.5)) * params.grading.y + vec3<f32>(0.5);
+  let luma = dot(color,vec3<f32>(0.2126,0.7152,0.0722));
+  let spread = max(color.r,max(color.g,color.b))-min(color.r,min(color.g,color.b));
+  color = mix(vec3<f32>(luma),color,params.grading.z*(1.0+params.light.z*(1.0-clamp(spread,0.0,1.0))));
+  color = pow(max(color,vec3<f32>(0.0)),vec3<f32>(1.0/params.grading.w));
   return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 )WGSL";
@@ -2252,7 +2753,7 @@ fn hash12(p: vec2<f32>) -> f32 {
       .multisample = wgpu::MultisampleState{.count = 1, .mask = UINT32_MAX}, .fragment = &fragment};
   resources.pipeline = g_device.CreateRenderPipeline(&pipeline_desc);
   const wgpu::BufferDescriptor params_desc{.label = "GekkoAOT v196 post-processing params",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform, .size = 32};
+      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform, .size = 80};
   resources.params = g_device.CreateBuffer(&params_desc);
   return resources.pipeline && resources.layout && resources.params;
 }
@@ -2260,7 +2761,7 @@ fn hash12(p: vec2<f32>) -> f32 {
 bool PresentUniversalPostFx(const aurora::webgpu::TextureWithSampler& source) {
   using namespace aurora;
   using namespace aurora::webgpu;
-  if (!g_post_processing_enabled || !source.texture || !source.view ||
+  if ((!g_post_processing_enabled && !g_video.fxaa) || !source.texture || !source.view ||
       source.size.width == 0 || source.size.height == 0)
     return false;
   if (!gfx::render_worker::is_worker_thread()) {
@@ -2292,13 +2793,18 @@ bool PresentUniversalPostFx(const aurora::webgpu::TextureWithSampler& source) {
   if (!swap_view) return false;
 
   auto& resources = UniversalPostFxResources();
-  const std::array<float, 8> params{
-      g_post_sharpen, g_post_bloom, g_post_vignette, g_post_grain,
-      g_post_tone, g_post_local_contrast, g_post_cinematic,
-      static_cast<float>((g_post_frame++) & 0xffffu)};
+  const float enabled = g_post_processing_enabled ? 1.f : 0.f;
+  const std::array<float, 20> params{
+      g_post_sharpen*enabled, g_post_bloom*enabled, g_post_vignette*enabled, g_post_grain*enabled,
+      g_post_tone*enabled, g_post_local_contrast*enabled, g_post_cinematic*enabled,
+      static_cast<float>((g_post_frame++) & 0xffffu),
+      enabled ? g_video.brightness : 1.f, enabled ? g_video.contrast : 1.f,
+      enabled ? g_video.saturation : 1.f, enabled ? g_video.gamma : 1.f,
+      g_video.exposure*enabled, g_video.temperature*enabled, g_video.vibrance*enabled,
+      g_video.tint*enabled, float(g_video.fxaa),0,0,0};
   g_queue.WriteBuffer(resources.params, 0, params.data(), sizeof(params));
   const std::array bind_entries{
-      wgpu::BindGroupEntry{.binding = 0, .buffer = resources.params, .size = 32},
+      wgpu::BindGroupEntry{.binding = 0, .buffer = resources.params, .size = 80},
       wgpu::BindGroupEntry{.binding = 1, .sampler = source.sampler},
       wgpu::BindGroupEntry{.binding = 2, .textureView = source.view},
   };
@@ -2320,6 +2826,8 @@ bool PresentUniversalPostFx(const aurora::webgpu::TextureWithSampler& source) {
                    viewport.znear, viewport.zfar);
   pass.Draw(3);
   pass.End();
+  GekkoAOT::GX::Hud::Draw(encoder, swap_view, g_graphicsConfig.surfaceConfiguration.format,
+                          g_graphicsConfig.surfaceConfiguration.width, g_graphicsConfig.surfaceConfiguration.height);
   const auto command = encoder.Finish();
   g_queue.Submit(1, &command);
 
@@ -2338,11 +2846,39 @@ bool PresentUniversalPostFx(const aurora::webgpu::TextureWithSampler& source) {
 }
 
 void PresentFinalTexture(const aurora::webgpu::TextureWithSampler& source) {
-  if (g_post_processing_enabled && PresentUniversalPostFx(source)) return;
+  const auto present_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const auto previous_ns=g_last_present_ns.exchange(present_ns,std::memory_order_relaxed);
+  if (previous_ns!=0) {
+    const double ms=double(present_ns-previous_ns)*1e-6;
+    if (ms>0.0 && ms<250.0) {
+      auto& pacing=g_present_pacing;
+      pacing.sum+=ms; pacing.sum_sq+=ms*ms; pacing.worst=std::max(pacing.worst,ms); ++pacing.count;
+    }
+  }
+  if ((g_post_processing_enabled || g_video.fxaa) && PresentUniversalPostFx(source)) return;
   aurora_present_texture(&source);
 }
 
+// v361: the display refresh rate (frames above it are never seen; presenting
+// several per refresh only adds judder and tearing). 60 Hz when unknown.
+double DisplayRefreshHz() {
+  static double cached=60.0;
+  static auto checked=std::chrono::steady_clock::time_point{};
+  const auto now=std::chrono::steady_clock::now();
+  if (now-checked<std::chrono::seconds(2)) return cached;
+  checked=now;
+  if (g_info.window) {
+    const SDL_DisplayID display=SDL_GetDisplayForWindow(g_info.window);
+    if (const SDL_DisplayMode* mode=display ? SDL_GetCurrentDisplayMode(display) : nullptr;
+        mode && mode->refresh_rate>=23.f && mode->refresh_rate<=1000.f)
+      cached=mode->refresh_rate;
+  }
+  return cached;
+}
+
 struct InterpolationBlendResources {
+  aurora::webgpu::TextureWithSampler post_target;
   wgpu::BindGroupLayout layout;
   wgpu::RenderPipeline pipeline;
   wgpu::Buffer params;
@@ -2558,21 +3094,30 @@ bool PresentInterpolationBlend(const aurora::webgpu::TextureWithSampler& previou
   if (!g_surface && !refresh_surface(true)) return false;
   if (!g_surface) return false;
 
+  const bool post = g_post_processing_enabled || g_video.fxaa;
+  auto& resources = BlendResources();
+  aurora::webgpu::TextureWithSampler intermediate;
+  if (post) {
+    if (!resources.post_target.texture || resources.post_target.size.width != current.size.width ||
+        resources.post_target.size.height != current.size.height)
+      resources.post_target = create_render_texture(current.size.width,current.size.height,false);
+    intermediate = resources.post_target;
+    if(!intermediate.texture || !intermediate.view) return false;
+  }
   wgpu::SurfaceTexture surface_texture;
-  {
+  if (!post) {
     window::SurfaceLock surface_lock;
     if (!window::is_presentable() || !g_surface) return false;
     g_surface.GetCurrentTexture(&surface_texture);
   }
-  if (surface_texture.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal || !surface_texture.texture) {
+  if (!post && (surface_texture.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal || !surface_texture.texture)) {
     release_surface();
     return false;
   }
   auto swap_texture = std::move(surface_texture.texture);
-  auto swap_view = swap_texture.CreateView();
+  auto swap_view = post ? intermediate.view : swap_texture.CreateView();
   if (!swap_view) return false;
 
-  auto& resources = BlendResources();
   const std::array<float, 4> params{alpha, float(resources.mode), 0.0f, 0.0f};
   g_queue.WriteBuffer(resources.params, 0, params.data(), sizeof(params));
   const std::array bind_entries{
@@ -2587,9 +3132,10 @@ bool PresentInterpolationBlend(const aurora::webgpu::TextureWithSampler& previou
   const auto bind_group = g_device.CreateBindGroup(&bind_desc);
   constexpr wgpu::CommandEncoderDescriptor encoder_desc{.label = "GekkoAOT v49 interpolation encoder"};
   auto encoder = g_device.CreateCommandEncoder(&encoder_desc);
-  const auto viewport = PresentViewportForAspect(g_graphicsConfig.surfaceConfiguration.width,
+  auto viewport = PresentViewportForAspect(g_graphicsConfig.surfaceConfiguration.width,
                                                  g_graphicsConfig.surfaceConfiguration.height,
                                                  current.size.width, current.size.height);
+  if(post) viewport={0.f,0.f,float(current.size.width),float(current.size.height),0.f,1.f};
   static unsigned aspect_logs = 0u;
   if (aspect_logs++ < 8u) {
     std::fprintf(stderr,
@@ -2614,6 +3160,8 @@ bool PresentInterpolationBlend(const aurora::webgpu::TextureWithSampler& previou
   constexpr wgpu::CommandBufferDescriptor command_desc{.label = "GekkoAOT v49 interpolation command buffer"};
   const auto command = encoder.Finish(&command_desc);
   g_queue.Submit(1, &command);
+
+  if(post) return PresentUniversalPostFx(intermediate);
 
   bool present_ok = false;
   {
@@ -2736,7 +3284,7 @@ void ObservePerspectiveCamera() {
     if (!std::isfinite(vertical) || vertical < 0.00001f) return;
     const float fov = 2.f * std::atan(1.f / vertical) * 57.29577951308232f;
     const float aspect = GekkoAOT::GX::ProjectionAspect(
-        proj.m0[0], proj.m1[1], view.width, view.height);
+        proj.m0[0], proj.m1[1], DisplayViewWidth(view.width), view.height);
     if (!std::isfinite(fov) || fov < 20.f || fov > 150.f ||
         !std::isfinite(aspect) || aspect < .5f || aspect > 5.f) return;
     std::uint32_t fov_bits=0, aspect_bits=0;
@@ -2758,6 +3306,30 @@ void ObservePerspectiveCamera() {
 // v300 GEKKOAOT_RUNTIME_PROFILE: averaged Aurora work per display copy, read
 // from the stats of the last frame the render worker submitted.
 void ReportAuroraFrameStats() {
+  {
+    // v359: frames that really reached the swapchain (what MangoHud counts).
+    static auto last=std::chrono::steady_clock::now();
+    static std::uint64_t last_presents=aurora::gfx::presentation_count();
+    const auto now=std::chrono::steady_clock::now();
+    const double seconds=std::chrono::duration<double>(now-last).count();
+    if (seconds>=5.0) {
+      const auto presents=aurora::gfx::presentation_count();
+      const auto pacing=g_present_pacing;
+      g_present_pacing={};
+      const double mean=pacing.count ? pacing.sum/double(pacing.count) : 0.0;
+      const double jitter=pacing.count ? std::sqrt(std::max(0.0,pacing.sum_sq/double(pacing.count)-mean*mean)) : 0.0;
+      std::fprintf(stderr,"GEKKOAOT_DISPLAY_FPS_V359 display_fps=%.1f interval_ms=%.2f jitter_ms=%.2f worst_ms=%.1f replay_captures=%llu eligible=%llu requests=%llu early=%llu period=%llu busy=%llu queued=%llu\n",
+                   double(presents-last_presents)/seconds,mean,jitter,pacing.worst,
+                   static_cast<unsigned long long>(g_replay_captures.load(std::memory_order_relaxed)),
+                   static_cast<unsigned long long>(g_replay_eligible.load(std::memory_order_relaxed)),
+                   static_cast<unsigned long long>(g_replay_requests.load(std::memory_order_relaxed)),
+                   static_cast<unsigned long long>(g_replay_declined_early.load(std::memory_order_relaxed)),
+                   static_cast<unsigned long long>(g_replay_declined_period.load(std::memory_order_relaxed)),
+                   static_cast<unsigned long long>(g_replay_declined_busy.load(std::memory_order_relaxed)),
+                   static_cast<unsigned long long>(g_replay_queued.load(std::memory_order_relaxed)));
+      last=now; last_presents=presents;
+    }
+  }
   static const bool enabled = EnvBool("GEKKOAOT_RUNTIME_PROFILE", false);
   if (!enabled) return;
   static std::uint64_t frames = 0u, draws = 0u, merged = 0u, verts = 0u, uniforms = 0u,
@@ -2853,6 +3425,9 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
       (g_gxState.pixelFmt == GX_PF_RGB8_Z24 || g_gxState.pixelFmt == GX_PF_RGB565_Z16)
           ? GX_TF_RGB565
           : GX_TF_RGBA8;
+  // v349: CPU EFB peeks observe the finished frame, not the fresh pass the
+  // display copy starts with the guest's clear.
+  aurora::gfx::gekkoaot_capture_peek_snapshot();
   copy_tex(g_gxState.texCopyDest, clear ? GX_TRUE : GX_FALSE);
 
   const auto copied = g_gxState.copyTextures.find(g_gxState.texCopyDest);
@@ -2879,10 +3454,12 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
   slot->address = g_copy_dest_physical;
   slot->stride_bytes = g_copy_stride_bytes != 0u ? g_copy_stride_bytes : copy_width * 2u;
   slot->native_width = copy_width;
+  g_display_copy_width.store(copy_width, std::memory_order_relaxed);
   slot->native_height = copy_height;
   slot->span_bytes = static_cast<std::uint64_t>(slot->stride_bytes) * copy_height;
   slot->generation = ++g_xfb_generation;
   slot->valid = true;
+  slot->force_43 = g_recorded_force_43;
 
   // A GXCopyDisp(clear=1) can clear only selected PE attachments/channels.
   // Preserve only what the guest explicitly left untouched.  In particular:
@@ -2949,7 +3526,24 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
   // producer boundary. The next recording only LOADs attachments which must
   // survive a masked guest clear.
   // VI/host scanout remains read-only.
+  if (const bool replay=g_frame_interpolation_enabled && g_replay_mode;
+      replay!=g_replay_capture_on.load(std::memory_order_relaxed)) {
+    // Switch at a frame boundary; the first captured frame starts next.
+    g_replay_capture_on.store(replay,std::memory_order_relaxed);
+    aurora::gfx::detail::gekkoaot_replay_set_enabled(replay);
+    // v361: replayed frames are presented in step with the display; without
+    // vsync several per refresh tore and judder.
+    aurora_enable_vsync(replay || g_vsync_default);
+    g_replay_building={};
+    g_replay_occurrences.clear();
+    std::lock_guard lock{g_replay_mutex};
+    g_replay_current.reset();
+    g_replay_previous.reset();
+  } else if (replay) {
+    FinishReplayCapture(*slot);
+  }
   aurora_end_frame_no_present();
+  GekkoAOT::GX::Hud::NoteGameFrame();
   ReportAuroraFrameStats();
   CaptureFrameBoundary();
   g_frame_open = false;
@@ -2962,7 +3556,7 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
   // producer frame has been submitted; render-worker queue ordering guarantees
   // that the history copy observes the completed GXCopyDisp result.
   const bool interpolation_ready =
-      g_frame_interpolation_enabled && SnapshotInterpolationFrame(slot->frame_buffer);
+      g_frame_interpolation_enabled && !g_replay_mode && SnapshotInterpolationFrame(slot->frame_buffer);
   if (g_frame_interpolation_enabled) {
     static unsigned interpolation_logs = 0u;
     if (interpolation_logs++ < 64u)
@@ -3299,18 +3893,23 @@ void PresentViXfb(std::uint32_t top, std::uint32_t bottom, bool address_keyed,
       return;
     }
     const auto window_size = aurora::window::get_window_size();
+    // v359: the whole cached copy is presented whichever field VI selects, so
+    // the field origins are not part of the image. Keying on them presented
+    // every interlaced frame twice (30 fps titles showed 60 in MangoHud).
     const GekkoAOT::GX::CachedScanoutKey scanout{
         reinterpret_cast<std::uintptr_t>(source->texture.Get()), slot->generation,
-        top, bottom, window_size.native_fb_width, window_size.native_fb_height,
-        g_aspect_mode.load(std::memory_order_acquire)};
+        0u, 0u, window_size.native_fb_width, window_size.native_fb_height,
+        slot->force_43 ? 0u : g_aspect_mode.load(std::memory_order_acquire)};
     // Cache state belongs exclusively to the render worker. A failed surface
     // acquisition/present is retried at the next VI field; only success allows
     // deduplication. This preserves pipelining without a new CPU/GPU wait.
     slot->presented_generation = slot->generation;
-    aurora::gfx::render_worker::enqueue_work([retained = *source, scanout] {
+    aurora::gfx::render_worker::enqueue_work([retained = *source, scanout, force_43 = slot->force_43] {
       if (g_cached_scanout.Duplicate(scanout)) return;
       const auto before = aurora::gfx::presentation_count();
+      g_present_force_43 = force_43;
       PresentFinalTexture(retained);
+      g_present_force_43 = false;
       if (aurora::gfx::presentation_count() != before)
         g_cached_scanout.Queued(scanout);
     });
@@ -3988,6 +4587,57 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
     }
     if(reg>=0x49u && reg<=0x4Eu) TrackRawCopyRegister(reg,effective_word);
     if(reg==0x52u && ((effective_word>>14)&1u)!=0u) {
+      g_display_insets.EndFrame(g_display_copy_count);
+      {
+        // v363: a pre-rendered backdrop switches the next frames to 4:3 at
+        // once; three frames without one switch back.
+        const bool was_43=g_frame_force_43.load(std::memory_order_relaxed);
+        g_recorded_force_43=was_43;
+        bool force_43=was_43;
+        if (g_frame_prerendered) { force_43=true; g_prerendered_idle=0; }
+        else if (++g_prerendered_idle>=3u) force_43=false;
+        g_frame_prerendered=false;
+        if (force_43!=was_43) {
+          g_frame_force_43.store(force_43,std::memory_order_relaxed);
+          aurora::gx::g_gxState.dirty|=aurora::gx::DirtyUniform;
+          static unsigned prerendered_logs=0;
+          if (prerendered_logs++<16u)
+            std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_PRERENDERED_43_V363 copy=%llu mode=%s\n",
+                         static_cast<unsigned long long>(g_display_copy_count),force_43 ? "4:3" : "widescreen");
+        }
+        const bool was_flat=g_flat_frames.Flat();
+        g_flat_frames.EndFrame(g_frame_depth_draws);
+        g_frame_depth_draws=0;
+        static unsigned flat_logs=0;
+        if (g_wide_perspective_ui && g_flat_frames.Flat()!=was_flat && flat_logs++<16u)
+          std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_PERSPECTIVE_UI_V362 copy=%llu screen=%s\n",
+                       static_cast<unsigned long long>(g_display_copy_count),
+                       g_flat_frames.Flat() ? "2d-cards-ui-scissor" : "3d");
+      }
+      if(g_interp_probe_enabled) {
+        auto& probe=g_interp_probe;
+        std::unordered_multimap<std::uint64_t,std::uint64_t> previous;
+        previous.reserve(probe.previous.size());
+        for(const auto& [sig,mtx] : probe.previous) previous.emplace(sig,mtx);
+        for(const auto& [sig,mtx] : probe.current) {
+          ++probe.draws;
+          const auto it=previous.find(sig);
+          if(it==previous.end()) continue;
+          ++probe.matched;
+          if(it->second!=mtx) ++probe.moved;
+          previous.erase(it);
+        }
+        probe.previous.swap(probe.current);
+        probe.current.clear();
+        if(++probe.frames%120u==0u) {
+          std::fprintf(stderr,"GEKKOAOT_INTERP_PROBE frames=%llu draws_per_frame=%.0f matched=%.1f%% moved_of_matched=%.1f%%\n",
+                       static_cast<unsigned long long>(probe.frames),double(probe.draws)/120.0,
+                       probe.draws ? 100.0*double(probe.matched)/double(probe.draws) : 0.0,
+                       probe.matched ? 100.0*double(probe.moved)/double(probe.matched) : 0.0);
+          probe.draws=probe.matched=probe.moved=0;
+        }
+      }
+      g_copy_provenance.BeginFrame();
       ++g_display_copy_count;
       g_camera_copy_epoch.store(g_display_copy_count,std::memory_order_release);
       consume_intercepted_bp();
@@ -4161,6 +4811,72 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
       else PrimePersistentIndexedArraysV161H(0,*bindings);
     }
     const bool screen_fill=ClassifyScreenFill(p,len,prim,fmt,count);
+    if(g_gxState.projType==GX_PERSPECTIVE) {
+      if(g_gxState.depthCompare && g_gxState.depthUpdate) ++g_frame_depth_draws;
+      g_draw_perspective_ui=g_wide_perspective_ui && !g_gxState.depthUpdate && g_flat_frames.Flat();
+    } else {
+      g_draw_perspective_ui=false;
+    }
+    if(g_interp_probe_enabled) {
+      std::uint64_t sig=1469598103934665603ull, mtx=1469598103934665603ull;
+      const auto mix=[](std::uint64_t& h,std::uint64_t v){ h=(h^v)*1099511628211ull; };
+      mix(sig,unsigned(prim)); mix(sig,count); mix(sig,unsigned(fmt)); mix(sig,unsigned(g_gxState.projType));
+      mix(sig,g_gxState.numTevStages); mix(sig,g_gxState.numTexGens);
+      for(unsigned stage=0;stage<g_gxState.numTevStages && stage<aurora::gx::MaxTevStages;++stage) {
+        const auto map=g_gxState.tevStages[stage].texMapId;
+        mix(sig,map==GX_TEXMAP_NULL ? 0u : reinterpret_cast<std::uintptr_t>(g_gxState.loadedTextures[unsigned(map)&7u].data));
+      }
+      mix(sig,reinterpret_cast<std::uintptr_t>(g_gxState.arrays[GX_VA_POS].data));
+      const unsigned pn=g_gxState.currentPnMtx;
+      for(unsigned r=0;r<3u && pn+r<g_gxState.xfPosRows.size();++r)
+        for(unsigned c=0;c<4u;++c) { std::uint32_t b; std::memcpy(&b,&g_gxState.xfPosRows[pn+r][c],4); mix(mtx,b); }
+      for(unsigned c=0;c<4u;++c) { std::uint32_t b; std::memcpy(&b,&g_gxState.proj.m0[c],4); mix(mtx,b); }
+      g_interp_probe.current.emplace_back(sig,mtx);
+    }
+    if(g_replay_capture_on.load(std::memory_order_relaxed)) {
+      // Stable across frames: what is drawn and with which textures. Vertex
+      // array addresses are left out (CPU-skinned meshes double-buffer them).
+      std::uint64_t sig=1469598103934665603ull;
+      const auto mix=[](std::uint64_t& h,std::uint64_t v){ h=(h^v)*1099511628211ull; };
+      mix(sig,unsigned(prim)); mix(sig,count); mix(sig,unsigned(fmt)); mix(sig,unsigned(g_gxState.projType));
+      mix(sig,g_gxState.numTevStages); mix(sig,g_gxState.numTexGens); mix(sig,g_gxState.currentPnMtx);
+      for(unsigned stage=0;stage<g_gxState.numTevStages && stage<aurora::gx::MaxTevStages;++stage) {
+        const auto map=g_gxState.tevStages[stage].texMapId;
+        mix(sig,map==GX_TEXMAP_NULL ? 0u : reinterpret_cast<std::uintptr_t>(g_gxState.loadedTextures[unsigned(map)&7u].data));
+      }
+      g_replay_draw_sig=sig;
+      g_replay_draw_pnmtx=g_gxState.currentPnMtx;
+      if(GekkoAOT::GX::NativeBoundingBoxActive() && GekkoAOT::GX::NativeBoundingBoxRead()) g_replay_frame_bbox=true;
+    }
+    if(g_ui_insets && RecordAspectMode()==1u && !aurora::gfx::is_offscreen()) {
+      const float canvas=DisplayCanvasWidth();
+      const auto& view=g_gxState.logicalViewport;
+      const auto& clip=g_gxState.logicalScissor;
+      if(GekkoAOT::GX::IsInsetSpan(view.left,view.width,canvas))
+        g_display_insets.NoteDraw(view.left,view.width,g_display_copy_count);
+      if(GekkoAOT::GX::IsInsetSpan(float(clip.x),float(clip.width),canvas))
+        g_display_insets.NoteDraw(float(clip.x),float(clip.width),g_display_copy_count);
+    }
+    if(g_wide_span_trace && g_gxState.projType==GX_ORTHOGRAPHIC) {
+      // Diagnostic: textures sampled by orthographic draws and their EFB-copy provenance.
+      static std::vector<std::uint64_t> seen_ortho;
+      for(unsigned stage=0;stage<g_gxState.numTevStages && stage<aurora::gx::MaxTevStages;++stage) {
+        const auto map=g_gxState.tevStages[stage].texMapId;
+        if(map==GX_TEXMAP_NULL) continue;
+        const auto& slot=g_gxState.loadedTextures[unsigned(map)&7u];
+        const auto copy=g_gxState.copyTextures.find(slot.data);
+        const bool is_copy=slot.data && copy!=g_gxState.copyTextures.end();
+        const int sw=is_copy?copy->second.guestSource.width:0, sh=is_copy?copy->second.guestSource.height:0;
+        const std::uint64_t key=(std::uint64_t(slot.width())<<40)^(std::uint64_t(slot.height())<<28)^
+            (std::uint64_t(is_copy)<<27)^(std::uint64_t(sw)<<14)^std::uint64_t(sh);
+        if(seen_ortho.size()<64u && std::find(seen_ortho.begin(),seen_ortho.end(),key)==seen_ortho.end()) {
+          seen_ortho.push_back(key);
+          std::fprintf(stderr,"GEKKOAOT_WIDESCREEN_ORTHO_TEX_TRACE tex=%ux%u fmt=%u copy=%u source=%dx%d view=%.0fx%.0f count=%u\n",
+                       slot.width(),slot.height(),slot.raw_format(),is_copy?1u:0u,sw,sh,
+                       g_gxState.logicalViewport.width,g_gxState.logicalViewport.height,unsigned(count));
+        }
+      }
+    }
     if (screen_fill!=g_screen_fill_draw) {
       g_screen_fill_draw=screen_fill;
       g_gxState.dirty|=aurora::gx::DirtyUniform;
@@ -4392,6 +5108,49 @@ bool RuntimeWindowIsEmbedded() {
   return parent && *parent;
 }
 
+#ifdef _WIN32
+// The Qt host owns fullscreen and lifetime. The SDL renderer keeps its HWND
+// and Vulkan surface, but becomes a child of the persistent game viewport.
+HWND g_embed_parent = nullptr;
+int g_embed_width = 0, g_embed_height = 0;
+void ResizeWindowsEmbed() {
+  if (!g_embed_parent || !g_info.window || !IsWindow(g_embed_parent)) return;
+  RECT bounds{};
+  if (!GetClientRect(g_embed_parent, &bounds)) return;
+  const int w = bounds.right - bounds.left, h = bounds.bottom - bounds.top;
+  if (w <= 0 || h <= 0 || (w == g_embed_width && h == g_embed_height)) return;
+  g_embed_width = w; g_embed_height = h;
+  (void)SDL_SetWindowSize(g_info.window, w, h);
+}
+bool EmbedWindows() {
+  const char* text = std::getenv("GEKKOAOT_EMBED_WINDOW");
+  if (!text || !*text) return true;
+  char* end = nullptr;
+  const auto value = std::strtoull(text, &end, 0);
+  const HWND parent = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(value));
+  if (end == text || *end || !IsWindow(parent) || !g_info.window) return false;
+  const HWND child = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(g_info.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+  if (!child || child == parent) return false;
+  const auto style = GetWindowLongPtrW(child, GWL_STYLE);
+  SetWindowLongPtrW(child, GWL_STYLE, (style & ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_BORDER)) | WS_CHILD | WS_CLIPSIBLINGS);
+  SetLastError(0);
+  if (!SetParent(child, parent) && GetLastError() != 0) return false;
+  g_embed_parent = parent; g_embed_width = 0; g_embed_height = 0;
+  ResizeWindowsEmbed();
+  SetWindowPos(child, nullptr, 0, 0, g_embed_width, g_embed_height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+  std::fprintf(stderr, "GEKKOAOT_NATIVE_GX_SINGLE_WINDOW=1 backend=win32 parent=%llu\n", value);
+  return true;
+}
+#endif
+void ApplyWindowIdentity() {
+  if (!g_info.window) return;
+  if (const char* path = std::getenv("GEKKOAOT_WINDOW_ICON"); path && *path) {
+    if (SDL_Surface* icon = SDL_LoadBMP(path)) {
+      (void)SDL_SetWindowIcon(g_info.window, icon); SDL_DestroySurface(icon);
+    }
+  }
+}
+
 void PollFullscreenShortcut() {
   // The Qt frontend has its own Alt+Enter shortcut, but match-GDB/standalone
   // mode gives keyboard focus to Aurora's SDL window. Handle the shortcut in
@@ -4430,6 +5189,9 @@ void PollFullscreenShortcut() {
 }
 
 void PollEvents() {
+#ifdef _WIN32
+  ResizeWindowsEmbed();
+#endif
   const AuroraEvent* ev=aurora_update();
   while(ev && ev->type!=AURORA_NONE) {
     if(ev->type==AURORA_EXIT) g_quit=true;
@@ -4575,6 +5337,18 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   g_persistent_array_fallbacks=0;
   g_adaptive_array_fallbacks=0;
   g_compact_array_windows=EnvBool("GEKKOAOT_NATIVE_GX_COMPACT_ARRAY_WINDOWS",true);
+  g_wide_solid_spans=EnvBool("GEKKOAOT_WIDESCREEN_SOLID_SPANS",true);
+  g_ui_insets=EnvBool("GEKKOAOT_WIDESCREEN_UI_INSETS",true);
+  g_copy_provenance_enabled=EnvBool("GEKKOAOT_WIDESCREEN_COPY_PROVENANCE",true);
+  g_wide_perspective_fills=EnvBool("GEKKOAOT_WIDESCREEN_PERSPECTIVE_FILLS",true);
+  g_wide_perspective_ui=EnvBool("GEKKOAOT_WIDESCREEN_PERSPECTIVE_UI",true);
+  g_wide_prerendered_43=EnvBool("GEKKOAOT_WIDESCREEN_PRERENDERED_43",true);
+  g_interp_probe_enabled=EnvBool("GEKKOAOT_INTERP_PROBE",false);
+  g_copy_provenance.Reset();
+  g_display_insets.Reset();
+  g_flat_frames.Reset(); g_frame_depth_draws=0; g_draw_perspective_ui=false;
+  g_frame_prerendered=false; g_prerendered_idle=0; g_frame_force_43.store(false,std::memory_order_relaxed);
+  g_wide_span_trace=EnvBool("GEKKOAOT_WIDESCREEN_SPAN_TRACE",false);
   g_native_index_range_cache=EnvBool("GEKKOAOT_NATIVE_GX_INDEX_RANGE_CACHE",false);
   g_native_index_ranges.Clear();
   std::fprintf(stderr,"GEKKOAOT_NATIVE_INDEX_RANGES_V307=%u payload_limit=512 exact=layout+draw fallback=rescan\n",
@@ -4616,7 +5390,19 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   g_efb_poke_writes=0;
   g_efb_poke_draws=0;
   g_alt_enter_latched=false;
-  g_frame_interpolation_enabled=false;
+  g_interpolation_requested=EnvBool("GEKKOAOT_FRAME_INTERPOLATION",false);
+  g_frame_interpolation_enabled=g_interpolation_requested;
+  {
+    // v358: frame interpolation re-renders geometry; the image blends stay
+    // available as GEKKOAOT_INTERPOLATION_MODE=motion|blend|repeat.
+    const char* mode=std::getenv("GEKKOAOT_INTERPOLATION_MODE");
+    g_replay_mode=!mode || !*mode || EqualNoCase(mode,"replay");
+  }
+  g_video=GekkoAOT::GX::GraphicsSettingsFromEnvironment();
+  GekkoAOT::GX::Hud::Configure(g_video.hud!=0,g_video.hud_items);
+  g_replay_interpolate=g_video.unlock_predict==0;
+  g_render_percent.store(g_video.render_percent);
+  g_render_width.store(g_video.render_width); g_render_height.store(g_video.render_height);
   g_interp_previous={}; g_interp_current={};
   g_interp_previous_valid=false; g_interp_current_valid=false; g_interp_snapshot_count=0;
   g_texture_bind_cache=EnvBool("GEKKOAOT_NATIVE_GX_FIFO_TEXTURE_CACHE",true);
@@ -4680,7 +5466,18 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
   AuroraConfig config{};
   config.appName="GekkoAOT " GEKKOAOT_VERSION;
   config.desiredBackend=BackendFromEnv();
+#if defined(__linux__)
+  // Mesa may otherwise infer Wayland from WAYLAND_DISPLAY even while SDL/Qt
+  // supplies an Xlib surface. An XID then reaches the Wayland EGL path as a
+  // wl_surface pointer and crashes inside eglCreateWindowSurface.
+  if (config.desiredBackend == BACKEND_OPENGL || config.desiredBackend == BACKEND_OPENGLES) {
+    const char* driver = std::getenv("SDL_VIDEODRIVER");
+    if (driver && EqualNoCase(driver, "x11")) ::setenv("EGL_PLATFORM", "x11", 1);
+    else if (driver && EqualNoCase(driver, "wayland")) ::setenv("EGL_PLATFORM", "wayland", 1);
+  }
+#endif
   config.vsync=EnvBool("GEKKOAOT_NATIVE_GX_VSYNC",false);
+  g_vsync_default=config.vsync;
   config.startFullscreen=EnvBool("GEKKOAOT_NATIVE_GX_FULLSCREEN",false);
   // Aurora reports framebuffer pixels after DPI scaling. A 1280x720 logical
   // default becomes 1920x1080 at Windows 150% scaling, which is unnecessarily
@@ -4713,6 +5510,20 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
 #endif
   int argc=1; char arg0[]="gekkoaot"; char* argv[]={arg0,nullptr};
   g_info=aurora_initialize(argc,argv,&config);
+  ApplyWindowIdentity();
+#ifdef _WIN32
+  if (!EmbedWindows()) {
+    std::fprintf(stderr,"GEKKOAOT_NATIVE_GX_SINGLE_WINDOW=0 reason=win32-embed-failed\n");
+    aurora_shutdown(); return false;
+  }
+#endif
+  std::fprintf(stderr,"GEKKOAOT_GRAPHICS_API requested=%u actual=%u match=%u\n",
+               unsigned(config.desiredBackend),unsigned(g_info.backend),
+               config.desiredBackend==BACKEND_AUTO || config.desiredBackend==g_info.backend);
+  if (config.desiredBackend != BACKEND_AUTO && config.desiredBackend != g_info.backend) {
+    std::fprintf(stderr,"GEKKOAOT_GRAPHICS_API_ERROR requested API unavailable; refusing silent fallback\n");
+    aurora_shutdown(); return false;
+  }
   for(auto& slot : g_xfb_slots) slot = {};
   g_xfb_generation=0;
   g_ram_xfb_texture.reset();
@@ -4802,6 +5613,14 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* use
                "GEKKOAOT_NATIVE_GX_WIDESCREEN_V158=1 projection=perspective+ui-ortho "
                "ortho-efb-copy=retail-preserved interpolation=%u\n",
                g_frame_interpolation_enabled ? 1u : 0u);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_WIDESCREEN_SOLID_SPANS_V343=%u ortho=untextured-full-width "
+               "action=host-width env=GEKKOAOT_WIDESCREEN_SOLID_SPANS\n",
+               g_wide_solid_spans ? 1u : 0u);
+  std::fprintf(stderr,
+               "GEKKOAOT_NATIVE_GX_WIDESCREEN_UI_INSETS_V348=%u span=inner+narrow confirm=displayed-uncopied "
+               "action=ui-viewport+scissor env=GEKKOAOT_WIDESCREEN_UI_INSETS\n",
+               g_ui_insets ? 1u : 0u);
   return true;
 }
 
@@ -4947,11 +5766,93 @@ bool AppendNativeCommands(const std::uint8_t* bytes,std::size_t size,std::uint32
 // Aurora shader/presentation overlays query these live values. Keeping aspect
 // outside ShaderConfig means resizing/switching modes only rebuilds uniforms,
 // not GX pipelines or shaders.
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_render_extent(int* width, int* height) noexcept {
+  const auto w = g_render_width.load(std::memory_order_relaxed);
+  const auto h = g_render_height.load(std::memory_order_relaxed);
+  if (w && h) { *width = int(w); *height = int(h); }
+}
+GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_render_scale() noexcept {
+  return float(g_render_percent.load(std::memory_order_relaxed))/100.f;
+}
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_get_graphics_state(
+    GekkoAOT::GX::GraphicsSettings* value, std::uint32_t bytes,
+    std::uint32_t* extent) {
+  if (!g_ready || !value || bytes != sizeof(*value) || !extent) return false;
+  *value = g_video;
+  extent[0] = aurora::webgpu::g_frameBuffer.size.width;
+  extent[1] = aurora::webgpu::g_frameBuffer.size.height;
+  extent[2] = aurora::webgpu::g_frameBuffer.texture.GetSampleCount();
+  extent[3] = aurora::webgpu::g_graphicsConfig.textureAnisotropy;
+  return true;
+}
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_apply_graphics_settings(
+    const GekkoAOT::GX::GraphicsSettings* value, std::uint32_t bytes) {
+  // v359: older runtimes send the layout without the HUD fields.
+  if(!g_ready || !value || (bytes!=sizeof(*value) && bytes!=GekkoAOT::GX::GraphicsSettingsPreHudSize &&
+                            bytes!=GekkoAOT::GX::GraphicsSettingsPreUnlockSize))
+    return false;
+  auto next=g_video;
+  std::memcpy(&next,value,bytes);
+  if(next.render_percent<25 || next.render_percent>400 ||
+     (next.msaa!=1 && next.msaa!=4) || next.anisotropy<1 || next.anisotropy>16 ||
+     (next.anisotropy & (next.anisotropy-1))) return false;
+  const bool quality=next.render_percent!=g_video.render_percent || next.render_width!=g_video.render_width ||
+                     next.render_height!=g_video.render_height || next.msaa!=g_video.msaa ||
+                     next.anisotropy!=g_video.anisotropy;
+  const bool resume_frame = g_frame_open && quality;
+  if(g_frame_open && quality) { aurora_end_frame_no_present(); g_frame_open=false; }
+  // HostBridge has drained the parser queue. Retire render-worker packets before
+  // changing their attachment/sample or sampler contracts. Never on draw paths.
+  aurora::gfx::render_worker::synchronize();
+  g_render_percent.store(next.render_percent,std::memory_order_relaxed);
+  g_render_width.store(next.render_width); g_render_height.store(next.render_height);
+  if(quality) {
+    aurora::webgpu::g_graphicsConfig.msaaSamples=next.msaa;
+    aurora::webgpu::g_graphicsConfig.textureAnisotropy=next.anisotropy;
+    aurora::gfx::clear_caches();
+    aurora::webgpu::refresh_surface(false);
+    aurora::gx::g_gxState.dirty=aurora::gx::DirtyAll;
+  }
+  if(g_interpolation_requested!=bool(next.interpolation) || quality) {
+    g_interp_previous={}; g_interp_current={};
+    g_interp_previous_valid=g_interp_current_valid=false;
+    g_interp_snapshot_count=0;
+  }
+  g_interpolation_requested=next.interpolation!=0;
+  g_frame_interpolation_enabled=g_interpolation_requested;
+  const bool fullscreen_changed=next.fullscreen!=g_video.fullscreen;
+  const bool output_changed=next.output_width!=g_video.output_width || next.output_height!=g_video.output_height;
+  g_video=next;
+  GekkoAOT::GX::Hud::Configure(next.hud!=0,next.hud_items);
+  g_replay_interpolate=next.unlock_predict==0;
+  g_post_processing_enabled=next.post!=0;
+  g_post_sharpen=next.sharpen;g_post_bloom=next.bloom;
+  g_post_vignette=next.vignette;g_post_grain=next.grain;
+  g_post_tone=next.tone;g_post_local_contrast=next.local_contrast;g_post_cinematic=next.cinematic;
+  const char* embed=std::getenv("GEKKOAOT_EMBED_WINDOW");
+  if((!embed || !*embed) && g_info.window) {
+    if(output_changed && next.output_width && next.output_height &&
+       (next.output_width!=g_info.windowSize.width || next.output_height!=g_info.windowSize.height)) {
+      aurora::window::set_window_size(next.output_width,next.output_height);
+      g_info.windowSize=aurora::window::get_window_size();
+    }
+    if(fullscreen_changed && aurora::window::get_fullscreen()!=bool(next.fullscreen))
+      aurora::window::set_fullscreen(next.fullscreen!=0);
+  }
+  // The FIFO may immediately deliver XF viewport/scissor or draw commands.
+  // Their GX helpers require a live recorder, even before the next GXCopyDisp.
+  if (resume_frame && !g_quit && aurora_begin_frame()) g_frame_open = true;
+  std::fprintf(stderr,"GEKKOAOT_GRAPHICS_LIVE render=%u msaa=%u aniso=%u post=%u fxaa=%u generation=%u efb=%ux%u\n",
+      next.render_percent,next.msaa,next.anisotropy,next.post,next.fxaa,next.interpolation,
+      aurora::webgpu::g_frameBuffer.size.width,aurora::webgpu::g_frameBuffer.size.height);
+  return true;
+}
+
 GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_widescreen_x_scale() noexcept {
-  return ProjectionXScaleForMode(g_aspect_mode.load(std::memory_order_acquire));
+  return ProjectionXScaleForMode(RecordAspectMode());
 }
 GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_widescreen_target_aspect() noexcept {
-  return TargetAspectForMode(g_aspect_mode.load(std::memory_order_acquire));
+  return TargetAspectForMode(g_present_force_43 ? 0u : g_aspect_mode.load(std::memory_order_acquire));
 }
 
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_camera_signature(
@@ -4970,8 +5871,8 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_camera_signature(
 
 GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_widescreen_projection_scale(
     float horizontal, float vertical, float width, float height) noexcept {
-  if (g_aspect_mode.load(std::memory_order_relaxed) != 1u) return 1.f;
-  return GekkoAOT::GX::PerspectiveXScale(horizontal, vertical, width,
+  if (RecordAspectMode() != 1u) return 1.f;
+  return GekkoAOT::GX::PerspectiveXScale(horizontal, vertical, DisplayViewWidth(width),
                                          height, HostWindowAspect());
 }
 
@@ -4990,6 +5891,27 @@ GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_ui_clip_x(
   return GekkoAOT::GX::UiClipX(x,left,width,scale);
 }
 
+// v348: Aurora asks per draw whether a viewport/scissor span is a confirmed
+// HUD inset, then maps its edges about the canvas centre like the UI.
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_ui_inset(float left, float width) noexcept {
+  return g_ui_insets && RecordAspectMode() == 1u &&
+         GekkoAOT::GX::IsInsetSpan(left, width, DisplayCanvasWidth()) &&
+         g_display_insets.IsInset(left, width, g_display_copy_count);
+}
+// v362: the current perspective draw is a card of a 2D screen (UI scissor).
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_perspective_ui() noexcept {
+  return g_draw_perspective_ui && RecordAspectMode() == 1u;
+}
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_ui_full_view(float left, float width) noexcept {
+  const float canvas = DisplayCanvasWidth();
+  return canvas > 0.f && left <= canvas * .02f && left + width >= canvas * .98f;
+}
+GEKKOAOT_GX_EXPORT float gekkoaot_native_gx_ui_canvas_x(float x) noexcept {
+  const float canvas = DisplayCanvasWidth();
+  return GekkoAOT::GX::UiClipX(x, 0.f, canvas,
+                               ProjectionXScaleForMode(RecordAspectMode()));
+}
+
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_screen_copy(
     int width, int height, float view_width, float view_height) noexcept {
   return GekkoAOT::GX::IsScreenCopy(width, height, view_width, view_height);
@@ -5002,20 +5924,25 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_widescreen_diag(
   // Called for every uniform build: resolve the diagnostic switch once.
   static const bool enabled = EnvBool("GEKKOAOT_DIAG_WIDESCREEN", false);
   if (!enabled) return;
-  char state[256]{};
+  char state[320]{};
+  const auto& gx=aurora::gx::g_gxState;
+  const auto& tex0=gx.loadedTextures[0];
   std::snprintf(state, sizeof(state),
-                "projection=%d guest=1.333333 host=%.6f viewport=%.1f,%.1f,%.1f,%.1f scissor=%d,%d,%d,%d offscreen=%u efb-sample=%u correction=%.6f",
+                "projection=%d guest=1.333333 host=%.6f viewport=%.1f,%.1f,%.1f,%.1f scissor=%d,%d,%d,%d offscreen=%u efb-sample=%u correction=%.6f fill=%u ztex=%u tev=%u blend=%u tex0=%ux%u:%u",
                 projection_type, HostWindowAspect(), view_left, view_top,
                 view_width, view_height, scissor_x, scissor_y,
                 scissor_width, scissor_height, offscreen ? 1u : 0u,
-                samples_screen_copy ? 1u : 0u, correction);
-  static std::string previous;
-  if (previous != state) {
-    previous = state;
+                samples_screen_copy ? 1u : 0u, correction, g_screen_fill_draw ? 1u : 0u,
+                unsigned(gx.zTexOp), unsigned(gx.numTevStages), unsigned(gx.blendMode),
+                tex0.width(), tex0.height(), unsigned(tex0.raw_format()));
+  static std::vector<std::string> seen;
+  if (seen.size() < 4096u && std::find(seen.begin(), seen.end(), std::string(state)) == seen.end()) {
+    seen.emplace_back(state);
     std::fprintf(stderr, "GEKKOAOT_DIAG_WIDESCREEN %s\n", state);
   }
 }
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_set_aspect_mode(std::uint32_t mode) {
+  aurora::gfx::render_worker::synchronize();
   ApplyAspectMode(mode, true);
 }
 
@@ -5201,10 +6128,135 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_consume_frame_ready_async(std::uint32
   if (xfb_address) *xfb_address = xfb;
   return xfb != 0;
 }
+// v358: extrapolate the current frame's uniform blocks from the previous
+// frame (alpha = elapsed time over the last frame interval) and re-render it.
+// Runs on the render worker, after the frame it replays was submitted.
+void ReplayFrame(const ReplayCapture& current, const ReplayCapture& previous, float alpha) {
+  std::vector<std::uint8_t> bytes(current.bytes);
+  std::vector<aurora::gfx::detail::GekkoaotReplayWrite> writes;
+  writes.reserve(current.blocks.size());
+  std::uint64_t matched=0, moved=0, cuts=0;
+  for (const auto& block : current.blocks) {
+    writes.push_back({block.offset,block.size,block.data});
+    const auto it=previous.index.find(block.key);
+    if (it==previous.index.end()) continue;
+    const auto& prior=previous.blocks[it->second];
+    if (prior.size!=block.size || prior.proj!=block.proj) continue;
+    ++matched;
+    const auto motion=GekkoAOT::GX::ExtrapolateUniformBlock(
+        current.bytes.data()+block.data,previous.bytes.data()+prior.data,block.size,block.proj,block.pnmtx,
+        aurora::gx::MaxXfPosUniformRows,alpha,bytes.data()+block.data);
+    if (motion!=GekkoAOT::GX::ReplayMotion::Unchanged) ++moved;
+    if (motion==GekkoAOT::GX::ReplayMotion::Cut) ++cuts;
+  }
+  auto& stats=g_replay_stats;
+  stats.blocks+=current.blocks.size(); stats.matched+=matched; stats.moved+=moved; stats.cuts+=cuts;
+  // Mostly unmatched or mostly cut: a different scene, not the next pose.
+  const bool frame_cut=matched*2u<current.blocks.size() || (moved>=8u && cuts*2u>moved);
+  if (frame_cut) ++stats.frame_cuts;
+  bool presented=false;
+  if (!frame_cut && aurora::gfx::detail::gekkoaot_replay_submit(current.frame_id,bytes.data(),writes.data(),writes.size())) {
+    PresentFinalTexture(current.present);
+    presented=true;
+    ++stats.replays; stats.alpha+=alpha;
+  } else {
+    ++stats.skipped;
+  }
+  const auto total=stats.replays+stats.skipped;
+  if (presented && (total==30u || total%600u==0u))
+    std::fprintf(stderr,"GEKKOAOT_FRAME_REPLAY_V358 replays=%llu skipped=%llu frame_cuts=%llu blocks/frame=%.0f matched=%.1f%% moved=%.1f%% cuts=%.1f%% alpha=%.2f\n",
+                 static_cast<unsigned long long>(stats.replays),static_cast<unsigned long long>(stats.skipped),
+                 static_cast<unsigned long long>(stats.frame_cuts),double(stats.blocks)/double(total),
+                 stats.blocks ? 100.0*double(stats.matched)/double(stats.blocks) : 0.0,
+                 stats.matched ? 100.0*double(stats.moved)/double(stats.matched) : 0.0,
+                 stats.moved ? 100.0*double(stats.cuts)/double(stats.moved) : 0.0,
+                 stats.replays ? stats.alpha/double(stats.replays) : 0.0);
+}
+
+bool ReplayReady() {
+  std::lock_guard lock{g_replay_mutex};
+  return g_replay_current && g_replay_previous && g_replay_current->eligible;
+}
+
+bool PresentReplay() {
+  std::shared_ptr<const ReplayCapture> current, previous;
+  {
+    std::lock_guard lock{g_replay_mutex};
+    current=g_replay_current; previous=g_replay_previous;
+  }
+  g_replay_requests.fetch_add(1,std::memory_order_relaxed);
+  if (!current || !previous || !current->eligible) return false;
+  const auto now=std::chrono::steady_clock::now();
+  const double period=std::chrono::duration<double>(current->produced-previous->produced).count();
+  if (!(period>0.004 && period<0.25)) {
+    g_replay_declined_period.fetch_add(1,std::memory_order_relaxed);
+    return false;
+  }
+  // Never predict past the next real frame: a late frame holds the last pose.
+  double alpha=std::min(std::chrono::duration<double>(now-current->produced).count()/period,1.0);
+  // Interpolation shows the previous pose when the newest frame arrives, so
+  // a direct present of that frame would jump ahead and back: while replays
+  // run, a declined tick still counts as presented.
+  const bool hold=g_replay_interpolate;
+  if (g_replay_interpolate) alpha-=1.0;
+  else if (alpha<0.05) {
+    g_replay_declined_early.fetch_add(1,std::memory_order_relaxed);
+    return false;
+  }
+  // At most one present per display refresh.
+  const auto now_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+  if (double(now_ns-g_last_present_ns.load(std::memory_order_relaxed))<0.9e9/DisplayRefreshHz()) {
+    g_replay_declined_period.fetch_add(1,std::memory_order_relaxed);
+    return hold;
+  }
+  if (g_replay_busy.exchange(true,std::memory_order_acq_rel)) {
+    g_replay_declined_busy.fetch_add(1,std::memory_order_relaxed);
+    return hold;
+  }
+  g_replay_queued.fetch_add(1,std::memory_order_relaxed);
+  aurora::gfx::render_worker::enqueue_work([current=std::move(current),previous=std::move(previous),alpha] {
+    ReplayFrame(*current,*previous,static_cast<float>(alpha));
+    g_replay_busy.store(false,std::memory_order_release);
+  });
+  return true;
+}
+
+// v359: live runtime values for the performance HUD (Hud::RuntimeValue order).
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_publish_perf(const float* values, std::uint32_t count) {
+  GekkoAOT::GX::Hud::PublishRuntime(values,count);
+}
+// Aurora's own scanout/blend presents draw the HUD through this hook.
+void gekkoaot_native_gx_draw_overlay(const wgpu::CommandEncoder& encoder, const wgpu::TextureView& view,
+                                     std::uint32_t width, std::uint32_t height) noexcept {
+  GekkoAOT::GX::Hud::Draw(encoder,view,aurora::webgpu::g_graphicsConfig.surfaceConfiguration.format,width,height);
+}
+
+GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_replay_capture() noexcept {
+  return g_replay_capture_on.load(std::memory_order_relaxed);
+}
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_replay_uniform(std::uint32_t offset, const std::uint8_t* data,
+                                                         std::uint32_t size, std::uint32_t proj) noexcept {
+  auto& capture=g_replay_building;
+  if (!data || proj+64u>size || capture.bytes.size()+size>(64u<<20)) return;
+  // The n-th block a draw signature builds in a frame pairs with its n-th
+  // block in the previous frame.
+  std::uint64_t key=g_replay_draw_sig;
+  key=(key^g_replay_occurrences[g_replay_draw_sig]++)*1099511628211ull;
+  capture.blocks.push_back({key,offset,size,proj,static_cast<std::uint32_t>(capture.bytes.size()),
+                            std::min<std::uint32_t>(g_replay_draw_pnmtx,aurora::gx::MaxXfPosRows-3u)});
+  capture.bytes.insert(capture.bytes.end(),data,data+size);
+}
+
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_frame_interpolation_ready() {
+  if (g_ready && g_frame_interpolation_enabled && g_replay_mode) return ReplayReady();
   return g_ready && g_frame_interpolation_enabled && g_interp_previous_valid && g_interp_current_valid;
 }
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_present_interpolated(float alpha) {
+  if (g_ready && g_frame_interpolation_enabled && g_replay_mode) {
+    const bool presented=PresentReplay();
+    PollEvents();
+    return presented;
+  }
   if(!g_ready || !g_frame_interpolation_enabled || !g_interp_previous_valid || !g_interp_current_valid)
     return false;
   const bool presented =
@@ -5213,6 +6265,18 @@ GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_present_interpolated(float alpha) {
   return presented;
 }
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_should_quit(){ PollEvents(); return g_quit; }
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_set_paused(bool paused) {
+  if (!g_ready) return;
+  // Retire the current recorder before processing resize/surface events while
+  // paused. Resume with a fresh recorder, preserving the guest GX state/EFB.
+  if (paused && g_frame_open) {
+    aurora_end_frame_no_present();
+    g_frame_open = false;
+    aurora::gfx::render_worker::synchronize();
+  } else if (!paused && !g_frame_open && !g_quit && aurora_begin_frame()) {
+    g_frame_open = true;
+  }
+}
 GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_shutdown(){
   if(!g_ready) return;
   if(g_native_vertex_gather)
@@ -5360,6 +6424,10 @@ GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_shutdown(){
   for(auto& slot : g_xfb_slots) slot = {};
   g_xfb_generation=0;
   g_display_copy_count=0;
+  g_display_insets.Reset();
+  g_flat_frames.Reset(); g_frame_depth_draws=0; g_draw_perspective_ui=false;
+  g_frame_prerendered=false; g_prerendered_idle=0; g_frame_force_43.store(false,std::memory_order_relaxed);
+  g_copy_provenance.Reset();
   g_camera_signature.store(0,std::memory_order_relaxed);
   g_camera_observed_copy.store(0,std::memory_order_relaxed);
   g_camera_copy_epoch.store(0,std::memory_order_relaxed);

@@ -98,7 +98,7 @@ void RemapModuleTextToHugePages(void* handle) {
   constexpr std::uintptr_t kHuge = std::uintptr_t{2} << 20;
   const std::uintptr_t begin = (segment.start + kHuge - 1u) & ~(kHuge - 1u);
   const std::uintptr_t end = segment.end & ~(kHuge - 1u);
-  // Small modules (REL side modules, test fixtures) gain nothing.
+  // Small modules (test fixtures) gain nothing.
   if (segment.start == 0u || end <= begin || end - begin < 4u * kHuge) return;
   const std::size_t bytes = end - begin;
 
@@ -247,7 +247,8 @@ ModuleStatus ValidateModule(const GekkoAOTModuleDesc* d, const char* expected_ga
 
 ModuleLibrary::~ModuleLibrary() { Close(); }
 
-ModuleStatus ModuleLibrary::Open(const std::filesystem::path& path, const char* expected_game_id) {
+ModuleStatus ModuleLibrary::Open(const std::filesystem::path& path, const char* expected_game_id,
+                                 bool huge_text) {
   Close();
   last_error_.clear();
 #ifdef _WIN32
@@ -289,7 +290,9 @@ ModuleStatus ModuleLibrary::Open(const std::filesystem::path& path, const char* 
     return status;
   }
 #if defined(__linux__)
-  RemapModuleTextToHugePages(handle_);
+  if (huge_text) RemapModuleTextToHugePages(handle_);
+#else
+  (void)huge_text;
 #endif
   using CapabilitiesFn = std::uint32_t (*)();
 #ifdef _WIN32

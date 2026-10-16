@@ -147,6 +147,32 @@ int main() {
     return probe.Run(e,0x204,0x200,0x100,v,false,false,equal)==SpinProbe::Outcome::Continue;
   }));
   ++cases;
+  // v346 fixed point: Nemo's frame pacing `do { now = VIGetRetraceCount();
+  // g_now = now; } while (g_now - start < g_interval);` with a getter leaf.
+  Memory pacing;
+  pacing.words={{0x400,0x48000101u},  // bl 0x500
+                {0x404,0x907e0000u},  // stw r3,0(r30)
+                {0x408,0x813e0004u},  // lwz r9,4(r30)
+                {0x40c,0x801e0000u},  // lwz r0,0(r30)
+                {0x410,0x7c1f0050u},  // subf r0,r31,r0
+                {0x414,0x7c004800u},  // cmpw r0,r9
+                {0x418,0x4180ffe8u},  // blt 0x400
+                {0x500,0x807e0008u},  // lwz r3,8(r30)  (retrace count)
+                {0x504,0x4e800020u},  // blr
+                {0x1000,10u},{0x1004,2u},{0x1008,10u}};
+  SpinProbeState wait;
+  wait.gpr[1]=0x8000u;wait.gpr[30]=0x1000u;wait.gpr[31]=9u;
+  wait.gpr[3]=10u;wait.gpr[9]=2u;wait.gpr[0]=1u;wait.cr=0x80000000u;wait.lr=0x404u;
+  check(probe.FixedPoint(wait,0x400,pacing));
+  auto unstored=pacing; unstored.words[0x1000]=9u;   // first iteration still publishes
+  check(!probe.FixedPoint(wait,0x400,unstored));
+  auto ticked=pacing; ticked.words[0x1008]=11u;      // the awaited retrace arrived
+  check(!probe.FixedPoint(wait,0x400,ticked));
+  auto entered=wait; entered.gpr[0]=0u;              // registers not yet at the fixed point
+  check(!probe.FixedPoint(entered,0x400,pacing));
+  pacing.foreign=0x500u;                             // an HLE getter is never interpreted
+  check(!probe.FixedPoint(wait,0x400,pacing));
+  cases+=5;
   std::cout << "native spin probe PASS cases=" << cases
             << " sandbox=overlay-only exit=verified-threshold equality=aot\n";
 }

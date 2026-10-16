@@ -23,11 +23,23 @@ inline bool MatchRelImportProofs(std::span<const std::uint8_t> ram,
   };
   if (!count) return read(header + 0x2cu) == 0u;
   const auto table = physical(read(header + 0x28u));
-  if (read(header + 0x2cu) != std::uint64_t(count) * 8u ||
-      table + std::uint64_t(count) * 8u > ram.size()) return false;
-  for (std::uint32_t i = 0; i < count; ++i) {
+  const std::uint64_t live_count = read(header + 0x2cu) / 8u;
+  // OSLinkFixed (REL v3+, Wind Waker's DynamicModuleControl) applies the
+  // module's self and main-program (id 0) imports, then trims them from the
+  // import table: their streams lie past fixSize and the game frees that tail.
+  // Accept exactly that trimmed form; every retained import must still match.
+  const std::uint32_t self_id = read(header);
+  std::uint32_t trimmed = 0u;
+  for (std::uint32_t i = 0; i < count; ++i)
+    if (proofs[i].module_id == 0u || proofs[i].module_id == self_id) ++trimmed;
+  const bool fixed_link = live_count != count && read(header + 0x1cu) >= 3u &&
+                          live_count == std::uint64_t(count - trimmed);
+  if ((live_count != count && !fixed_link) || (read(header + 0x2cu) & 7u) ||
+      table + live_count * 8u > ram.size()) return false;
+  for (std::uint32_t i = 0, live = 0; i < count; ++i) {
     const auto& proof = proofs[i];
-    const auto entry = table + std::uint64_t(i) * 8u;
+    if (fixed_link && (proof.module_id == 0u || proof.module_id == self_id)) continue;
+    const auto entry = table + std::uint64_t(live++) * 8u;
     if (read(entry) != proof.module_id || !proof.stream_bytes || (proof.stream_bytes & 7u))
       return false;
     const auto stream = physical(read(entry + 4u));

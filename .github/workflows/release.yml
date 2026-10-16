@@ -60,6 +60,7 @@ jobs:
           python tools/release_notes.py --version "$VERSION" --check
           python tools/check_release_tree.py
           python tests/hardware/test_release_tree.py
+          python tests/hardware/test_discord_packaging.py
 
           TAG="v${VERSION}"
           RELEASE_EXISTS=false
@@ -102,10 +103,18 @@ jobs:
             arch: x86_64
 
     runs-on: ${{ matrix.os }}
+    env:
+      GEKKOAOT_DISCORD_SDK_ROOT: ${{ github.workspace }}/.deps/discord_social_sdk
 
     steps:
       - name: Checkout release commit
         uses: actions/checkout@v7
+
+      - name: Prepare official Discord SDK
+        uses: ./.github/actions/discord-sdk
+        with:
+          deploy-key: ${{ secrets.GEKKOAOT_DISCORD_SDK_DEPLOY_KEY }}
+          platform: ${{ runner.os }}
 
       - name: Install Qt (Linux)
         if: runner.os == 'Linux'
@@ -503,6 +512,7 @@ jobs:
           -DGEKKOAOT_BUILD_NATIVE_HOST=ON
           -DGEKKOAOT_NATIVE_NOD=ON
           -DGEKKOAOT_NATIVE_PORTABLE=ON
+          -DGEKKOAOT_DISCORD_SDK=ON
 
       - name: Configure Windows release
         if: runner.os == 'Windows'
@@ -512,7 +522,8 @@ jobs:
             -DGEKKOAOT_BUILD_GUI=ON `
             -DGEKKOAOT_BUILD_NATIVE_HOST=ON `
             -DGEKKOAOT_NATIVE_NOD=ON `
-            -DGEKKOAOT_NATIVE_PORTABLE=ON
+            -DGEKKOAOT_NATIVE_PORTABLE=ON `
+            -DGEKKOAOT_DISCORD_SDK=ON
 
       - name: Build Linux release
         if: runner.os == 'Linux'
@@ -738,6 +749,9 @@ jobs:
       - name: Validate packaged release contents
         run: python tools/check_release_tree.py --package package
 
+      - name: Validate packaged Discord SDK and launcher assets
+        run: python tools/check_discord_package.py --package package --platform "${{ runner.os }}"
+
       - name: Package Linux release
         if: runner.os == 'Linux'
         shell: bash
@@ -822,7 +836,9 @@ jobs:
           if [[ -f "$APPDIR/usr/share/gekkoaot/toolchain/bin/libgekkoaot-native-gx.so" ]]; then
             args+=(--library "$APPDIR/usr/share/gekkoaot/toolchain/bin/libgekkoaot-native-gx.so")
           fi
+          args+=(--library "$APPDIR/usr/bin/libdiscord_partner_sdk.so")
           ./linuxdeploy-x86_64.AppImage --appimage-extract-and-run "${args[@]}"
+          "./$OUTPUT" --appimage-extract-and-run --check-discord-sdk
           sha256sum "$OUTPUT" > "$OUTPUT.sha256"
 
       - name: Package Windows release

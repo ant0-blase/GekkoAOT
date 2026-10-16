@@ -92,6 +92,54 @@ public:
     return Outcome::Exit;
   }
 
+  // v346: one iteration of a loop entered at `entry` that changes nothing:
+  // it comes back to `entry` in the same frame with every register equal and
+  // stores only bytes RAM already holds (Nemo's `while (VIGetRetraceCount() -
+  // start < n)` re-stores the count it just read). Such a loop can only stop
+  // when an interrupt, DMA or another thread changes memory. Calls are
+  // followed; HLE entries, MMIO, SPRs other than LR/CTR/XER and FP end it.
+  // `why` (optional) receives the failing PC/word: {pc, word, reason} with
+  // reason 1 fetch, 2 unsupported/fault, 3 HLE call, 4 registers, 5 store, 6 budget.
+  template<class Memory>
+  bool FixedPoint(const SpinProbeState& start, std::uint32_t entry, Memory& memory,
+                  std::array<std::uint32_t,3>* why=nullptr) {
+    state_=start;
+    overlay_.clear();
+    std::uint32_t pc=entry;
+    const auto fail=[&](std::uint32_t at,std::uint32_t word,std::uint32_t reason) {
+      if(why) *why={at,word,reason};
+      return false;
+    };
+    // A wait iteration is short; anything longer is real work (and the probe
+    // runs at boundaries, so it must stay cheap).
+    constexpr unsigned kFixedPointBudget=512u;
+    for(unsigned step=0;step<kFixedPointBudget;++step) {
+      std::uint32_t w;
+      if(!memory.Fetch(pc,&w)) return fail(pc,0u,1u);
+      std::uint32_t next=pc+4u;
+      const auto result=Execute(w,pc,&next,memory);
+      if(result==Step::Fault) return fail(pc,w,2u);
+      if(result==Step::Call && memory.Foreign(next)) return fail(pc,next,3u);
+      pc=next;
+      if(pc!=entry || state_.gpr[1]!=start.gpr[1]) continue;
+      if(state_.gpr!=start.gpr || state_.cr!=start.cr || state_.lr!=start.lr ||
+         state_.ctr!=start.ctr || state_.xer!=start.xer || overlay_.size()>256u) {
+        std::uint32_t reg=0u;
+        while(reg<32u && state_.gpr[reg]==start.gpr[reg]) ++reg;
+        return fail(reg,state_.cr^start.cr,4u);
+      }
+      for(std::size_t i=overlay_.size();i-->0;) {
+        bool later=false;  // only the last store to a byte is visible
+        for(std::size_t j=i+1;j<overlay_.size() && !later;++j) later=overlay_[j].ea==overlay_[i].ea;
+        std::uint32_t value;
+        if(!later && (!memory.Read(overlay_[i].ea,1u,&value) || value!=overlay_[i].value))
+          return fail(overlay_[i].ea,value,5u);
+      }
+      return true;
+    }
+    return fail(pc,0u,6u);
+  }
+
   // First clock value after `now` whose evaluation stops waiting: an
   // exponential bracket (every probed value before it waits), a binary
   // search, then threshold samples after it. Nothing when the wait does not

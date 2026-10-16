@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <ctime>
 #include <limits>
 
 #if defined(__linux__)
@@ -129,11 +130,15 @@ bool HostBridge::Open(const std::filesystem::path& path, Native::AddressSpace& m
       FindSymbol("gekkoaot_native_gx_frame_interpolation_ready"));
   set_aspect_mode_ = reinterpret_cast<SetAspectModeFn>(
       FindSymbol("gekkoaot_native_gx_set_aspect_mode"));
+  apply_graphics_settings_ = reinterpret_cast<ApplyGraphicsSettingsFn>(
+      FindSymbol("gekkoaot_native_gx_apply_graphics_settings"));
+  publish_perf_ = reinterpret_cast<PublishPerfFn>(FindSymbol("gekkoaot_native_gx_publish_perf"));
   target_aspect_ = reinterpret_cast<TargetAspectFn>(
       FindSymbol("gekkoaot_native_gx_widescreen_target_aspect"));
   camera_signature_ = reinterpret_cast<CameraSignatureFn>(
       FindSymbol("gekkoaot_native_gx_camera_signature"));
   should_quit_ = reinterpret_cast<ShouldQuitFn>(FindSymbol("gekkoaot_native_gx_should_quit"));
+  set_paused_ = reinterpret_cast<SetPausedFn>(FindSymbol("gekkoaot_native_gx_set_paused"));
   shutdown_ = reinterpret_cast<ShutdownFn>(FindSymbol("gekkoaot_native_gx_shutdown"));
   set_pe_callback_ = reinterpret_cast<SetPeCallbackFn>(
       FindSymbol("gekkoaot_native_gx_set_pe_callback"));
@@ -257,9 +262,12 @@ void HostBridge::Close() {
   present_interpolated_ = nullptr;
   interpolation_ready_ = nullptr;
   set_aspect_mode_ = nullptr;
+  apply_graphics_settings_ = nullptr;
+  publish_perf_ = nullptr;
   target_aspect_ = nullptr;
   camera_signature_ = nullptr;
   should_quit_ = nullptr;
+  set_paused_ = nullptr;
   shutdown_ = nullptr;
   set_pe_callback_ = nullptr;
   pe_event_sink_ = nullptr;
@@ -948,6 +956,16 @@ void HostBridge::Present() {
   if (should_quit_ && should_quit_()) quit_requested_ = true;
 }
 
+void HostBridge::PollEvents() {
+  if (!ready_ || !should_quit_ || !FlushWrites()) return;
+  if (should_quit_()) quit_requested_ = true;
+}
+
+void HostBridge::SetPaused(bool paused) {
+  if (!ready_ || !FlushWrites() || !set_paused_) return;
+  set_paused_(paused);
+}
+
 void HostBridge::PresentNow(std::uint32_t xfb_top, std::uint32_t xfb_bottom,
                             std::uint32_t width, std::uint32_t stride_bytes,
                             std::uint32_t field_height) {
@@ -1018,8 +1036,14 @@ bool HostBridge::PresentInterpolated(float alpha) {
   return presented;
 }
 
+bool HostBridge::ApplyGraphicsSettings(const GraphicsSettings& settings) {
+  // This is an infrequent UI transaction, ordered after all producer work.
+  if (!ready_ || !apply_graphics_settings_ || !FlushWrites()) return false;
+  return apply_graphics_settings_(&settings, sizeof(settings));
+}
+
 void HostBridge::SetAspectMode(const std::string& mode) {
-  if (!ready_ || !set_aspect_mode_) return;
+  if (!ready_ || !set_aspect_mode_ || !FlushWrites()) return;
   // v128b exposes only exact 4:3 and live Stretched-to-Window. Accept the old
   // fixed-wide strings as stretch so existing settings migrate harmlessly.
   const bool stretch = mode == "stretch" || mode == "16:9" || mode == "16:10" ||
@@ -1066,6 +1090,21 @@ void HostBridge::AdvanceCycles(std::uint64_t cycles) {
   }
   if (catch_up == 4 && pending_cycles_ >= present_cycles_)
     pending_cycles_ %= present_cycles_;
+}
+
+double CurrentThreadCpuSeconds() noexcept {
+#ifdef _WIN32
+  FILETIME create{}, exit{}, kernel{}, user{};
+  if (!GetThreadTimes(GetCurrentThread(), &create, &exit, &kernel, &user)) return -1.0;
+  const auto ticks = [](const FILETIME& t) {
+    return (static_cast<std::uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
+  };
+  return static_cast<double>(ticks(kernel) + ticks(user)) * 1e-7;
+#else
+  timespec ts{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return -1.0;
+  return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+#endif
 }
 
 } // namespace GekkoAOT::GX
