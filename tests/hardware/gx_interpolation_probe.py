@@ -11,8 +11,10 @@ os.environ.setdefault("GEKKOAOT_ASPECT_MODE", "4:3")
 os.environ.setdefault("GEKKOAOT_INTERPOLATION_MODE", "motion")
 
 
-def main():
+def main(verify=None):
     root=Path(__file__).resolve().parents[2]
+    if os.environ.get('GEKKOAOT_GRAPHICS_BACKEND') in ('OGL','OpenGL') and os.environ.get('SDL_VIDEODRIVER') in ('x11','wayland'):
+        os.environ['EGL_PLATFORM']=os.environ['SDL_VIDEODRIVER']
     if sdl:=ctypes.util.find_library('SDL3'): c.CDLL(sdl,mode=c.RTLD_GLOBAL)
     gx=c.CDLL(str(root/'.gekkoaot/build/NativeGX-Aurora/libgekkoaot-native-gx.so'))
     memory=(c.c_uint8*(24*1024*1024))()
@@ -80,6 +82,21 @@ def main():
     x11.XDestroyImage.argtypes=[c.c_void_p]
     display=x11.XOpenDisplay(None);assert display
     def pixel(x,y):
+        if os.environ.get('GAMESCOPE_WAYLAND_DISPLAY'):
+            from PIL import Image
+            import tempfile,subprocess
+            with tempfile.TemporaryDirectory(prefix='gekkoaot-pixel-') as directory:
+                target=Path(directory)/'screen.png'
+                subprocess.run(['gamescopectl','screenshot',str(target)],check=True,capture_output=True,
+                               env={**os.environ,'WAYLAND_DISPLAY':os.environ['GAMESCOPE_WAYLAND_DISPLAY']})
+                deadline=time.monotonic()+2
+                while not target.is_file() and time.monotonic()<deadline:time.sleep(.01)
+                image=Image.open(target).convert('RGB')
+                if os.environ.get('GEKKOAOT_GPU_CAPTURE_DIR'):
+                    image.save(Path(os.environ['GEKKOAOT_GPU_CAPTURE_DIR'])/'latest-gpu.png')
+                w,h=image.size;vw=min(w,int(h*4/3));vh=min(h,int(w*3/4))
+                r,g,b=image.getpixel(((w-vw)//2+int((x+.5)*vw/64),(h-vh)//2+int((y+.5)*vh/64)))
+                return r<<16|g<<8|b
         viewport_width=min(width.value,int(height.value*4/3))
         viewport_height=min(height.value,int(width.value*3/4))
         left=(width.value-viewport_width)//2;top=(height.value-viewport_height)//2
@@ -87,6 +104,10 @@ def main():
         assert image
         value=x11.XGetPixel(image,0,0)&0xffffff;x11.XDestroyImage(image)
         return value
+    if verify is not None:
+        verify(gx,rect,frame,pixel,memory)
+        gx.gekkoaot_native_gx_shutdown()
+        return
     def check(expected,samples):
         deadline=time.monotonic()+5
         values=[]

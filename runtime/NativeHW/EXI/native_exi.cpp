@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "NativeHW/EXI/native_exi.h"
+#include "NativeHW/EXI/ipl_font.h"
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +70,29 @@ void HostService::LoadRom() {
     }
     rom_.clear();
   }
+}
+
+bool HostService::RomReadable(std::uint32_t address) {
+  if (!rom_.empty() && !rom_replacement_) return true;
+  // OSInitFont/OSLoadFont read the boot ROM font. Without a user IPL, build
+  // GekkoAOT's replacement on first use; the rest of the ROM stays absent.
+  if (address < IplFont::kAnsiRomOffset || address - IplFont::kAnsiRomOffset >= IplFont::kAnsiRomSize)
+    return false;
+  if (rom_.empty() && !rom_replacement_failed_) {
+    if (const char* knob = std::getenv("GEKKOAOT_ROM_FONT"); knob && knob[0] == '0' && knob[1] == '\0') {
+      rom_replacement_failed_ = true;
+      return false;
+    }
+    rom_.assign(kRomSize, 0u);
+    if (IplFont::InstallReplacementFonts(rom_)) {
+      rom_replacement_ = true;
+      std::fprintf(stderr, "GEKKOAOT_NATIVE_EXI_ROM_FONT_V366=1 source=gekkoaot-replacement encode=ansi policy=no-user-ipl\n");
+    } else {
+      rom_.clear();
+      rom_replacement_failed_ = true;
+    }
+  }
+  return rom_replacement_;
 }
 
 void HostService::Enable() {
@@ -158,7 +182,7 @@ bool HostService::Immediate(std::uint32_t channel, std::uint8_t chip_select,
     if (address >= kSramBase && address < kSramBase + kSramSize) {
       region_ = Region::Sram;
       cursor_ = address - kSramBase;
-    } else if (address < kRomSize && !rom_.empty() && !(command_ & 0x80000000u)) {
+    } else if (address < kRomSize && !(command_ & 0x80000000u) && RomReadable(address)) {
       region_ = Region::Rom;
       cursor_ = address;
     } else {

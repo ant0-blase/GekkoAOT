@@ -40,7 +40,10 @@ public:
   ModuleLibrary(const ModuleLibrary&) = delete;
   ModuleLibrary& operator=(const ModuleLibrary&) = delete;
 
-  ModuleStatus Open(const std::filesystem::path& path, const char* expected_game_id = nullptr);
+  // huge_text: move the executable segment onto transparent huge pages
+  // (Linux, v326). Secondary REL modules pass false by default (v367).
+  ModuleStatus Open(const std::filesystem::path& path, const char* expected_game_id = nullptr,
+                    bool huge_text = true);
   // Flush compiler-rt PGO counters from an instrumented game module.
   // Returns 0 on success, -1 when the module does not expose the hook.
   int FlushProfile() const;

@@ -1,0 +1,62 @@
+name: Prepare official Discord Social SDK
+description: Read the pinned SDK from private build dependencies and verify it before extraction
+inputs:
+  deploy-key:
+    description: Read-only deploy key for the private build dependencies repository
+    required: true
+  platform:
+    description: Target platform (Linux, Windows, macOS or Android)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Require private dependency access
+      shell: bash
+      env:
+        SDK_KEY: ${{ inputs.deploy-key }}
+      run: |
+        if [[ -z "$SDK_KEY" ]]; then
+          echo 'Missing GEKKOAOT_DISCORD_SDK_DEPLOY_KEY: releases require the private SDK input.' >&2
+          exit 1
+        fi
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.13'
+    - name: Read immutable SDK pin
+      id: pin
+      shell: bash
+      run: |
+        python - <<'PY'
+        import json, os
+        from pathlib import Path
+        pin = json.loads(Path('cmake/discord-sdk-pin.json').read_text())
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+            output.write(f'repository={pin["repository"]}\nrevision={pin["revision"]}\narchive={pin["archive"]}\n')
+        PY
+    - name: Read private SDK input
+      uses: actions/checkout@v7
+      with:
+        repository: ${{ steps.pin.outputs.repository }}
+        ref: ${{ steps.pin.outputs.revision }}
+        path: .deps/discord-sdk-input
+        ssh-key: ${{ inputs.deploy-key }}
+        persist-credentials: false
+    - name: Verify and stage target SDK
+      shell: bash
+      env:
+        SDK_ARCHIVE: ${{ steps.pin.outputs.archive }}
+        SDK_PLATFORM: ${{ inputs.platform }}
+      run: |
+        python tools/prepare_discord_sdk.py \
+          --archive ".deps/discord-sdk-input/$SDK_ARCHIVE" \
+          --destination .deps/discord_social_sdk \
+          --platform "$SDK_PLATFORM"
+        python - <<'PY'
+        import os, shutil, stat
+        # Git object files are read-only; Windows refuses to unlink them.
+        def retry_writable(function, path, _error):
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        shutil.rmtree('.deps/discord-sdk-input', onexc=retry_writable)
+        PY

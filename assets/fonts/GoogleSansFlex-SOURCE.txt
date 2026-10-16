@@ -1,0 +1,5 @@
+Google Sans Flex, official Google Fonts distribution
+Source: https://github.com/google/fonts/tree/main/ofl/googlesansflex
+Upstream: https://github.com/googlefonts/googlesans-flex
+License: SIL Open Font License 1.1 (GoogleSansFlex-OFL.txt)
+The original font is bundled unmodified. The UI selects weight 500 (Medium).

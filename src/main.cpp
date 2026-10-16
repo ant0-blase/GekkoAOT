@@ -1,4 +1,9 @@
 #include "MainWindow.hpp"
+#include "DiscordPresence.hpp"
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTextStream>
+#include "ShellStyle.hpp"
 
 #include <QApplication>
 #include <QByteArray>
@@ -7,6 +12,15 @@
 
 int main(int argc, char** argv)
 {
+    // Deployment smoke check: load the real SDK without a display, creating a
+    // Discord client, or publishing anything from a CI runner.
+    if (argc == 2 && QByteArray(argv[1]) == "--check-discord-sdk") {
+        QCoreApplication probe(argc, argv);
+        const bool available = makeDiscordPresenceBackend()->available();
+        const QString id = DiscordPresence::defaultApplicationId();
+        QTextStream(stdout) << QJsonDocument(QJsonObject{{"available", available}, {"applicationId", id}}).toJson(QJsonDocument::Compact) << '\n';
+        return available && DiscordPresence::validApplicationId(id) ? 0 : 1;
+    }
     // Native lowering and bounded FIFO publication are the normal launch policy.
     // Keep explicit environment overrides, including "0", authoritative.
     for (const char* option : {
@@ -50,12 +64,17 @@ int main(int argc, char** argv)
     }
 #endif
 
+    // The platform portal must see the final identity during initialization,
+    // before any platform service registers the application on D-Bus.
+    QCoreApplication::setApplicationName("GekkoAOT");
+    QCoreApplication::setOrganizationName("GekkoAOT");
+    QGuiApplication::setDesktopFileName("io.github.ant0_blase.GekkoAOT");
     QApplication app(argc, argv);
-    app.setApplicationName("GekkoAOT");
-    app.setOrganizationName("GekkoAOT");
     app.setStyle(QStyleFactory::create("Fusion"));
 
+    app.setWindowIcon(shellProjectIcon());
     MainWindow window;
     window.show();
+    if (app.arguments().contains("--tv")) window.openLivingRoom();
     return app.exec();
 }

@@ -7,6 +7,9 @@ if(NOT GEKKOAOT_VERSION MATCHES "^[0-9]+[.][0-9]+[.][0-9]+([.-][0-9A-Za-z.-]+)?$
 endif()
 
 project(GekkoAOT VERSION ${GEKKOAOT_VERSION} LANGUAGES C CXX)
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -74,6 +77,8 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(gekkoaot-test-graphics-settings tests/hardware/test_graphics_settings.cpp)
+    add_test(NAME graphics.settings COMMAND gekkoaot-test-graphics-settings)
     add_executable(gekkoaot-test-controller-process tests/hardware/test_controller_process.cpp)
     target_compile_definitions(gekkoaot-test-controller-process PRIVATE
         GEKKOAOT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -139,7 +144,28 @@ endif()
 
 if(GEKKOAOT_BUILD_GUI)
     set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
     find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets)
+    include(cmake/DiscordSocialSDK.cmake)
+    add_library(gekkoaot-launcher-style STATIC src/ShellStyle.cpp src/ShellStyle.hpp src/ShellMenu.cpp src/ShellMenu.hpp src/ShellKeyboard.cpp src/ShellKeyboard.hpp src/ShellNavigation.cpp src/ShellNavigation.hpp src/ShellIdentity.cpp src/launcher_assets.qrc)
+    target_link_libraries(gekkoaot-launcher-style PUBLIC Qt6::Widgets)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(X11 QUIET)
+        if(TARGET X11::X11)
+            target_link_libraries(gekkoaot-launcher-style PRIVATE X11::X11)
+            target_compile_definitions(gekkoaot-launcher-style PRIVATE GEKKOAOT_SHELL_X11=1)
+        endif()
+    endif()
+    find_package(SDL3 QUIET CONFIG)
+    add_library(gekkoaot-launcher-input STATIC src/ShellGamepad.cpp src/ShellGamepad.hpp)
+    target_link_libraries(gekkoaot-launcher-input PUBLIC Qt6::Core)
+    if(TARGET SDL3::SDL3-static)
+        target_link_libraries(gekkoaot-launcher-input PUBLIC SDL3::SDL3-static)
+        target_compile_definitions(gekkoaot-launcher-input PUBLIC GEKKOAOT_LAUNCHER_SDL3=1)
+    elseif(TARGET SDL3::SDL3)
+        target_link_libraries(gekkoaot-launcher-input PUBLIC SDL3::SDL3)
+        target_compile_definitions(gekkoaot-launcher-input PUBLIC GEKKOAOT_LAUNCHER_SDL3=1)
+    endif()
 
     if(TARGET WrapVulkanHeaders::WrapVulkanHeaders)
         get_target_property(_gekkoaot_vulkan_includes
@@ -156,16 +182,103 @@ if(GEKKOAOT_BUILD_GUI)
         endif()
     endif()
 
-    qt_add_executable(gekkoaot
-        src/main.cpp
+    add_library(gekkoaot-memory-card STATIC src/MemoryCard.cpp src/MemoryCard.hpp src/memory_card_assets.qrc)
+    target_link_libraries(gekkoaot-memory-card PUBLIC Qt6::Gui)
+
+    set(GEKKOAOT_GUI_SOURCES
+        src/MemoryCardManager.cpp
+        src/MemoryCardManager.hpp
+        src/ShellTitleBar.cpp
+        src/ShellTitleBar.hpp
+        src/LivingRoomView.cpp
+        src/LivingRoomView.hpp
+        src/CompilationQueue.cpp
+        src/CompilationQueue.hpp
+        src/CompilationSidebar.cpp
+        src/CompilationSidebar.hpp
+        src/DiscMetadata.cpp
+        src/DiscMetadata.hpp
+        src/GameLibrary.cpp
+        src/GameLibrary.hpp
         src/MainWindow.cpp
         src/MainWindow.hpp
+        src/GraphicsConfigDialog.cpp
+        src/GraphicsConfigDialog.hpp
+        src/InputConfigDialog.cpp
+        src/InputConfigDialog.hpp
         src/InputProfile.cpp
         src/InputProfile.hpp
         src/BuildController.cpp
         src/BuildController.hpp
     )
-    target_link_libraries(gekkoaot PRIVATE Qt6::Widgets)
+    qt_add_executable(gekkoaot src/main.cpp ${GEKKOAOT_GUI_SOURCES})
+    if(WIN32)
+        target_sources(gekkoaot PRIVATE assets/platform/gekkoaot.rc)
+        target_include_directories(gekkoaot PRIVATE assets/platform)
+        set_source_files_properties(assets/platform/gekkoaot.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/platform/gekkoaot.ico")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        install(FILES assets/platform/io.github.ant0_blase.GekkoAOT.desktop DESTINATION share/applications)
+        install(FILES assets/platform/gekkoaot.png DESTINATION share/icons/hicolor/256x256/apps)
+    endif()
+    target_link_libraries(gekkoaot PRIVATE Qt6::Widgets gekkoaot-launcher-input gekkoaot-launcher-style gekkoaot-discord gekkoaot-memory-card)
+    gekkoaot_deploy_discord(gekkoaot)
+    if(BUILD_TESTING)
+        add_executable(gekkoaot-test-memory-card tests/hardware/test_memory_card.cpp)
+        target_link_libraries(gekkoaot-test-memory-card PRIVATE gekkoaot-memory-card)
+        add_test(NAME launcher.memory-card COMMAND gekkoaot-test-memory-card)
+        add_executable(gekkoaot-test-memory-card-manager tests/hardware/test_memory_card_manager.cpp src/MemoryCardManager.cpp)
+        target_link_libraries(gekkoaot-test-memory-card-manager PRIVATE gekkoaot-memory-card gekkoaot-launcher-style)
+        add_test(NAME launcher.memory-card-manager COMMAND gekkoaot-test-memory-card-manager)
+        set_tests_properties(launcher.memory-card-manager PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        add_executable(gekkoaot-test-shell-pointer tests/hardware/test_shell_pointer.cpp src/ShellTitleBar.cpp src/GraphicsConfigDialog.cpp)
+        target_link_libraries(gekkoaot-test-shell-pointer PRIVATE Qt6::Widgets gekkoaot-launcher-style)
+        add_test(NAME launcher.pointer COMMAND gekkoaot-test-shell-pointer)
+        set_tests_properties(launcher.pointer PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
+        add_executable(gekkoaot-test-discord-presence tests/hardware/test_discord_presence.cpp)
+        target_link_libraries(gekkoaot-test-discord-presence PRIVATE gekkoaot-discord)
+        gekkoaot_deploy_discord(gekkoaot-test-discord-presence)
+        add_test(NAME launcher.discord-presence COMMAND gekkoaot-test-discord-presence)
+        qt_add_executable(gekkoaot-test-living-room tests/hardware/test_living_room.cpp
+            src/LivingRoomView.cpp src/LivingRoomView.hpp)
+        target_link_libraries(gekkoaot-test-living-room PRIVATE Qt6::Widgets gekkoaot-launcher-style)
+        target_compile_definitions(gekkoaot-test-living-room PRIVATE GEKKOAOT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME launcher.living-room COMMAND gekkoaot-test-living-room)
+        set_tests_properties(launcher.living-room PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        if(TARGET SDL3::SDL3 OR TARGET SDL3::SDL3-static)
+            qt_add_executable(gekkoaot-test-shell-gamepad tests/hardware/test_shell_gamepad.cpp)
+            target_link_libraries(gekkoaot-test-shell-gamepad PRIVATE gekkoaot-launcher-input)
+            add_test(NAME launcher.shell-gamepad COMMAND gekkoaot-test-shell-gamepad)
+            set_tests_properties(launcher.shell-gamepad PROPERTIES TIMEOUT 15)
+        endif()
+        add_executable(gekkoaot-compilation-fixture tests/hardware/compilation_fixture.cpp)
+        target_link_libraries(gekkoaot-compilation-fixture PRIVATE Qt6::Core)
+        qt_add_executable(gekkoaot-test-compilation-queue tests/hardware/test_compilation_queue.cpp
+            src/BuildController.cpp src/BuildController.hpp
+            src/CompilationQueue.cpp src/CompilationQueue.hpp
+            src/CompilationSidebar.cpp src/CompilationSidebar.hpp src/DiscMetadata.cpp src/DiscMetadata.hpp)
+        target_link_libraries(gekkoaot-test-compilation-queue PRIVATE Qt6::Widgets gekkoaot-launcher-style)
+        add_dependencies(gekkoaot-test-compilation-queue gekkoaot-compilation-fixture)
+        add_test(NAME launcher.compilation-queue COMMAND gekkoaot-test-compilation-queue
+            $<TARGET_FILE:gekkoaot-compilation-fixture>)
+        set_tests_properties(launcher.compilation-queue PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+        add_executable(gekkoaot-test-graphics-dialog tests/hardware/test_graphics_dialog.cpp src/GraphicsConfigDialog.cpp)
+        target_link_libraries(gekkoaot-test-graphics-dialog PRIVATE Qt6::Widgets gekkoaot-launcher-style)
+        add_test(NAME graphics.dialog COMMAND gekkoaot-test-graphics-dialog)
+        set_tests_properties(graphics.dialog PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(gekkoaot-test-input-dialog tests/hardware/test_input_dialog.cpp src/InputConfigDialog.cpp src/InputProfile.cpp)
+        target_link_libraries(gekkoaot-test-input-dialog PRIVATE Qt6::Widgets gekkoaot-launcher-style)
+        add_test(NAME input.dialog COMMAND gekkoaot-test-input-dialog)
+        set_tests_properties(input.dialog PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        if(TARGET gekkoaot-native-disc)
+            qt_add_executable(gekkoaot-test-launcher-ui tests/hardware/test_launcher_ui.cpp ${GEKKOAOT_GUI_SOURCES})
+            target_link_libraries(gekkoaot-test-launcher-ui PRIVATE Qt6::Widgets gekkoaot-launcher-input gekkoaot-launcher-style gekkoaot-discord gekkoaot-memory-card)
+            gekkoaot_deploy_discord(gekkoaot-test-launcher-ui)
+            target_compile_definitions(gekkoaot-test-launcher-ui PRIVATE GEKKOAOT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}" GEKKOAOT_VERSION="${PROJECT_VERSION}")
+            add_dependencies(gekkoaot-test-launcher-ui gekkoaot-native-disc)
+            add_test(NAME launcher.ui COMMAND gekkoaot-test-launcher-ui)
+            set_tests_properties(launcher.ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        endif()
+    endif()
     target_compile_definitions(gekkoaot PRIVATE
         GEKKOAOT_VERSION="${PROJECT_VERSION}"
         GEKKOAOT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
@@ -184,6 +297,9 @@ if(GEKKOAOT_BUILD_GUI)
     endif()
 
     install(TARGETS gekkoaot RUNTIME DESTINATION bin BUNDLE DESTINATION .)
+    install(FILES assets/fonts/GoogleSansFlex-OFL.txt assets/fonts/OFL.txt assets/fonts/GoogleSansFlex-TRADEMARKS.md
+        assets/fonts/GoogleSansFlex-SOURCE.txt assets/fonts/Doto-OFL.txt
+        DESTINATION share/licenses/GekkoAOT/fonts)
 
     if(WIN32)
         # Keep Qt plugins beside the Windows executable in their standard
@@ -217,6 +333,8 @@ install(DIRECTORY game-packs crossgame-db DESTINATION share/gekkoaot
     FILES_MATCHING PATTERN "*.json" PATTERN "README.md")
 install(DIRECTORY docs DESTINATION share/gekkoaot FILES_MATCHING PATTERN "*.md")
 install(DIRECTORY assets DESTINATION share/gekkoaot FILES_MATCHING PATTERN "*.png")
+install(FILES assets/fonts/Doto-OFL.txt DESTINATION share/licenses/GekkoAOT)
+install(FILES assets/icons/lucide/LICENSE DESTINATION share/licenses/GekkoAOT RENAME Lucide-LICENSE)
 install(PROGRAMS
     tools/adaptive_pgo.py
     tools/crossgame_db.py

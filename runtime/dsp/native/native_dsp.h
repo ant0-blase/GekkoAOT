@@ -69,6 +69,9 @@ public:
   std::uint32_t AramDmaMainAddress() const { return aram_dma_mmaddr_; }
   std::uint32_t AramDmaAramAddress() const { return aram_dma_araddr_; }
   std::uint32_t AudioDmaSource() const { return audio_dma_source_; }
+  std::uint16_t AudioDmaControl() const { return audio_dma_control_; }
+  std::uint64_t AudioDmaPendingBlocks() const { return audio_dma_pending_blocks_; }
+  std::uint64_t AidInterruptCount() const { return aid_interrupts_; }
   bool SdkBootstrapLoaded() const { return sdk_bootstrap_loaded_; }
   bool SdkBootstrapRunning() const { return sdk_bootstrap_running_; }
   bool SdkBootstrapCompleted() const { return sdk_bootstrap_completed_; }
@@ -176,6 +179,7 @@ private:
   std::uint64_t audio_dma_pending_blocks_ = 0;
   bool audio_dma_event_mode_reported_ = false;
   std::uint64_t audio_blocks_submitted_ = 0;
+  std::uint64_t aid_interrupts_ = 0;
 
   std::uint64_t init_code_clear_cycles_ = 0;
   std::uint64_t aid_interrupt_cycles_ = 0;

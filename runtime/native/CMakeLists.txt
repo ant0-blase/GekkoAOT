@@ -89,6 +89,7 @@ add_library(gekkoaot_native_runtime STATIC
     ../NativeHW/native_hw.cpp
     ../NativeHW/EXI/native_exi.cpp
     ../NativeHW/EXI/native_card.cpp
+    ../NativeHW/EXI/ipl_font.cpp
     sdk_autoresolver.cpp
     ../gx/host/host_bridge.cpp
     ../hw/cp/native_cp.cpp
@@ -386,6 +387,9 @@ if(BUILD_TESTING)
   add_executable(gekkoaot-test-vi-timing ../../tests/hardware/test_vi_timing.cpp)
   add_executable(gekkoaot-test-sdk-idle-poll ../../tests/hardware/test_sdk_idle_poll.cpp)
   add_executable(gekkoaot-test-widescreen ../../tests/hardware/test_widescreen.cpp)
+  add_executable(gekkoaot-test-frame-replay ../../tests/hardware/test_frame_replay.cpp)
+  target_compile_features(gekkoaot-test-frame-replay PRIVATE cxx_std_20)
+  add_test(NAME hardware.frame-replay COMMAND gekkoaot-test-frame-replay)
   add_executable(gekkoaot-test-array-upload-policy ../../tests/hardware/test_array_upload_policy.cpp)
   add_test(NAME hardware.array-upload-policy COMMAND gekkoaot-test-array-upload-policy)
   add_executable(gekkoaot-test-compact-array-window ../../tests/hardware/test_compact_array_window.cpp)
@@ -400,9 +404,13 @@ if(BUILD_TESTING)
   add_executable(gekkoaot-test-native-hw ../../tests/hardware/test_native_hw.cpp
     guest_address_window.cpp
     ../NativeHW/native_hw.cpp ../NativeHW/EXI/native_exi.cpp
-    ../NativeHW/EXI/native_card.cpp)
+    ../NativeHW/EXI/native_card.cpp ../NativeHW/EXI/ipl_font.cpp)
   target_include_directories(gekkoaot-test-native-hw PRIVATE ${CMAKE_CURRENT_LIST_DIR}/..)
   add_test(NAME hardware.native-hw COMMAND gekkoaot-test-native-hw)
+  add_executable(gekkoaot-test-ipl-font ../../tests/hardware/test_ipl_font.cpp ../NativeHW/EXI/ipl_font.cpp)
+  target_include_directories(gekkoaot-test-ipl-font PRIVATE ${CMAKE_CURRENT_LIST_DIR}/..)
+  target_compile_features(gekkoaot-test-ipl-font PRIVATE cxx_std_20)
+  add_test(NAME hardware.ipl-font COMMAND gekkoaot-test-ipl-font)
   add_test(NAME hardware.widescreen COMMAND gekkoaot-test-widescreen)
   add_test(NAME hardware.sdk-idle-poll COMMAND gekkoaot-test-sdk-idle-poll)
   target_link_libraries(gekkoaot-test-vi-timing PRIVATE gekkoaot_native_runtime)

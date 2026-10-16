@@ -1,15 +1,40 @@
 #include "MainWindow.hpp"
+#include "MemoryCardManager.hpp"
+#include "GraphicsConfigDialog.hpp"
+#include "SettingsStyle.hpp"
+#include "DiscMetadata.hpp"
+#include "GameLibrary.hpp"
+#include "GameCard.hpp"
+#include "CompilationSidebar.hpp"
+#include "LivingRoomView.hpp"
+#include "ShellGamepad.hpp"
+#include "ShellStyle.hpp"
+#include "ShellKeyboard.hpp"
+#include "ShellNavigation.hpp"
+#include "ShellTitleBar.hpp"
+#include "BuildProgress.hpp"
+#include <QCryptographicHash>
 #include "InputProfile.hpp"
+#include "InputConfigDialog.hpp"
 
 #include <QAction>
 #include <QActionGroup>
+#include <QApplication>
+#include <QAbstractButton>
+#include <QAbstractSpinBox>
+#include <QAbstractSlider>
+#include <QAbstractItemView>
+#include <QKeyEvent>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QColor>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDockWidget>
 #include <QDir>
 #include <QDragEnterEvent>
+#include <QDateTime>
 #include <QDropEvent>
 #include <QDoubleSpinBox>
 #include <QEvent>
@@ -38,8 +63,10 @@
 #include <QPlainTextEdit>
 #include <QPixmap>
 #include <QProgressBar>
+#include <QPropertyAnimation>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QRegularExpressionValidator>
 #include <QSaveFile>
 #include <QScrollArea>
 #include <QScreen>
@@ -143,10 +170,30 @@ public:
     QPaintEngine* paintEngine() const override { return nullptr; }
 };
 
+class SessionWindow final : public QMainWindow
+{
+public:
+    explicit SessionWindow(QWidget* parent):QMainWindow(parent,Qt::Window){}
+    std::function<void()> closing;
+protected:
+    void closeEvent(QCloseEvent* e) override {if(closing)closing();e->accept();}
+};
+
 constexpr QFileDialog::Options kPortableFileDialogOptions = QFileDialog::DontUseNativeDialog;
 
 QIcon themedIcon(QWidget* widget, const QString& name, QStyle::StandardPixmap fallback)
 {
+    static const QMap<QString,QString> icons = {
+        {"document-open","folder-open"},{"media-playback-start","play"},{"media-playback-stop","square"},
+        {"media-playback-pause","pause"},{"view-fullscreen","maximize"},{"video-display","tv-minimal"},
+        {"preferences-desktop-display","sliders-horizontal"},{"input-gaming","gamepad-2"},
+        {"preferences-system","settings-2"},{"view-refresh","rotate-cw"},{"edit-find","scan-search"},
+        {"system-run","cpu"},{"edit-delete","trash"},{"applications-games","sparkles"},
+        {"view-list-details","list-video"},{"media-optical","disc-3"}};
+    if (icons.contains(name)) {
+        const auto icon = shellIcon(icons.value(name));
+        if (!icon.isNull()) return icon;
+    }
     QIcon icon = QIcon::fromTheme(name);
     if (icon.isNull())
         icon = widget->style()->standardIcon(fallback);
@@ -160,11 +207,6 @@ QLabel* mutedLabel(const QString& text, QWidget* parent)
     return label;
 }
 
-int comboIndexForData(const QComboBox* combo, const QString& value)
-{
-    const int index = combo->findData(value);
-    return index >= 0 ? index : 0;
-}
 
 QString gamePackPathForId(const QString& discId)
 {
@@ -233,83 +275,68 @@ quint32 be32(const QByteArray& data, qsizetype offset)
            (static_cast<quint32>(p[2]) << 8) | static_cast<quint32>(p[3]);
 }
 
-int expand5(int value)
-{
-    return (value << 3) | (value >> 2);
-}
 
-int expand4(int value)
-{
-    return (value << 4) | value;
-}
 
-QImage decodeGameCubeBanner(const QByteArray& bnr)
-{
-    constexpr qsizetype textureOffset = 0x20;
-    constexpr int width = 96;
-    constexpr int height = 32;
-    constexpr qsizetype textureBytes = width * height * 2;
-    if (bnr.size() < textureOffset + textureBytes ||
-        (bnr.left(4) != "BNR1" && bnr.left(4) != "BNR2"))
-        return {};
-
-    QImage image(width, height, QImage::Format_RGBA8888);
-    const auto* src = reinterpret_cast<const unsigned char*>(bnr.constData() + textureOffset);
-    qsizetype pos = 0;
-    for (int tileY = 0; tileY < height; tileY += 4)
-    {
-        for (int tileX = 0; tileX < width; tileX += 4)
-        {
-            for (int y = 0; y < 4; ++y)
-            {
-                for (int x = 0; x < 4; ++x)
-                {
-                    const quint16 value = static_cast<quint16>(src[pos] << 8 | src[pos + 1]);
-                    pos += 2;
-                    int r, g, b, a;
-                    if (value & 0x8000u)
-                    {
-                        a = 255;
-                        r = expand5((value >> 10) & 0x1F);
-                        g = expand5((value >> 5) & 0x1F);
-                        b = expand5(value & 0x1F);
-                    }
-                    else
-                    {
-                        a = ((value >> 12) & 0x7) * 255 / 7;
-                        r = expand4((value >> 8) & 0xF);
-                        g = expand4((value >> 4) & 0xF);
-                        b = expand4(value & 0xF);
-                    }
-                    image.setPixelColor(tileX + x, tileY + y, QColor(r, g, b, a));
-                }
-            }
-        }
-    }
-    return image;
-}
 }
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 {
+    // Styling backgrounds alone leaves the Windows/Fusion light palette in
+    // unstyled controls and dock titles. Set every shared foreground role too.
+    QApplication::setPalette(launcherPalette());
+    QApplication::setFont(shellBodyFont());
     setAcceptDrops(true);
     buildUi();
     buildMenusAndToolbar();
     connectUi();
     loadSettings();
+    m_library->selected = [this](const QString& path) { if (!m_controller.isRunning()) setIsoPath(path, false); };
+    m_library->activated = [this](const QString& path) {
+        if(!m_controller.isRunning())setIsoPath(path,true);
+        else if(m_runtimeStarted && path!=m_isoPath) {
+            m_pendingGame=path;m_pendingGameOnDesktop=true;m_stopAction->trigger();
+        } else if(m_runtimeStarted && m_runtimeOnDesktop) {
+            if(m_paused)m_pauseAction->trigger();
+            m_gameWindow->raise();m_gameWindow->activateWindow();
+        }
+    };
+    m_library->compileRequested = [this](const QStringList& paths) { enqueueCompilations(paths); };
+    m_library->changed = [this] { refreshLivingRoom(); };
+    m_compilationSidebar->compileRequested = m_library->compileRequested;
+    m_compilationSidebar->playRequested = [this](const QString& path){launchCompiledGame(path);};
+    m_library->error = [this](const QString& error) { m_log->appendPlainText("[library] " + error); };
+    m_library->metadataReady = [this](const QString& path) { m_discordTitles.remove(path); refreshDiscordPresence(); if (QFileInfo(path).canonicalFilePath() == QFileInfo(m_isoPath).canonicalFilePath()) { updateLoaderBanner(); updateGameEnhancementsMenu(); } };
+    m_library->importCachedGames();
+    if (!m_isoPath.isEmpty()) { m_library->addGame(m_isoPath); m_library->selectGame(m_isoPath); }
     updateGameMetadata();
+    m_livingRoom->setGames(m_library->entries());
+    m_livingRoom->setCurrentGame(m_isoPath);
+    m_livingRoom->setReducedMotion(QSettings("GekkoAOT", "GekkoAOT").value("ui/reducedMotion", false).toBool());
+    qApp->installEventFilter(this);
 
-    resize(1100, 760);
+    const QSize available = screen()->availableGeometry().size();
+    resize(qMin(1250, available.width() - 30), qMin(800, available.height() - 60));
     setMinimumSize(860, 620);
+    statusBar()->hide();statusBar()->setMaximumHeight(0);
     setWindowTitle(QString("GekkoAOT v%1").arg(QString::fromUtf8(GEKKOAOT_VERSION)));
-    setWindowIcon(themedIcon(this, "media-optical", QStyle::SP_DriveDVDIcon));
+    updateApplicationIcon();
+    refreshDiscordPresence();
+    shellAnimateButtons(this);
+}
+
+MainWindow::~MainWindow()
+{
+    m_discord.shutdown();
+    // Independent top-levels let the TV menu cover the game on compositors
+    // that keep transient children above their parent unconditionally.
+    delete m_gameWindow;
 }
 
 void MainWindow::buildUi()
 {
-    setStyleSheet(R"QSS(
+    setStyleSheet(QStringLiteral(R"QSS(
         QMainWindow, QWidget#Root {
-            background: #2b2b2b;
+            background: #222222;
             color: #e8e8e8;
             font-size: 13px;
         }
@@ -393,13 +420,13 @@ void MainWindow::buildUi()
             min-height: 22px;
             color: #ececec;
         }
-        QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #d6ae30; }
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #bdbdbd; }
         QPlainTextEdit {
             background: #181818;
             border: 1px solid #444444;
             border-radius: 4px;
             color: #e2e2e2;
-            selection-background-color: #8a6c16;
+            selection-background-color: #565656;
         }
         QProgressBar#CompileProgress {
             background: #171717;
@@ -419,7 +446,7 @@ void MainWindow::buildUi()
             color: #d7d7d7;
             border-top: 1px solid #474747;
         }
-    )QSS");
+    )QSS") + launcherChromeStyleSheet());
 
     auto* root = new QWidget(this);
     root->setObjectName("Root");
@@ -431,51 +458,54 @@ void MainWindow::buildUi()
     m_viewFrame->setMinimumHeight(420);
     m_viewStack = new QStackedLayout(m_viewFrame);
     m_viewStack->setContentsMargins(0, 0, 0, 0);
-    m_viewStack->setStackingMode(QStackedLayout::StackAll);
+    m_viewStack->setStackingMode(QStackedLayout::StackOne);
 
-    m_gameViewport = new NativeRenderWidget(m_viewFrame);
-    m_gameViewport->setObjectName("GameViewport");
-    m_gameViewport->setAttribute(Qt::WA_NativeWindow, true);
-    // The child XID becomes AuroraGX's presentation target once the native runtime starts.
-    // Do not let Qt's backing store paint the same X11 window at the same time:
-    // on XWayland that produces black/striped scanline-looking corruption even
-    // though the Vulkan swapchain itself is healthy.
-    m_gameViewport->setAttribute(Qt::WA_PaintOnScreen, true);
-    m_gameViewport->setAttribute(Qt::WA_NoSystemBackground, true);
-    m_gameViewport->setAutoFillBackground(false);
-    m_gameViewport->setFocusPolicy(Qt::StrongFocus);
-    m_gameViewport->setMinimumSize(640, 360);
-    m_viewStack->addWidget(m_gameViewport);
+    auto* session=new SessionWindow(nullptr);m_gameWindow=session;m_gameWindow->setObjectName("desktopGameWindow");m_gameWindow->resize(1000,650);
+    m_gameWindow->setWindowTitle("GekkoAOT");m_gameWindow->setWindowIcon(shellProjectIcon());
+    m_gameWindow->setStyleSheet("QMainWindow {background:#242424;} QWidget#gameHostRoot {background:#242424;}");
+    auto* gameRoot=new QWidget;gameRoot->setObjectName("gameHostRoot");auto* gameLayout=new QVBoxLayout(gameRoot);gameLayout->setContentsMargins(0,0,0,0);gameLayout->setSpacing(0);
+    gameLayout->addWidget(new ShellTitleBar(m_gameWindow));
+    m_desktopGameViewport=new NativeRenderWidget(gameRoot);m_desktopGameViewport->setObjectName("desktopGameViewport");
+    for(auto attribute:{Qt::WA_NativeWindow,Qt::WA_PaintOnScreen,Qt::WA_NoSystemBackground})m_desktopGameViewport->setAttribute(attribute);
+    m_desktopGameViewport->setFocusPolicy(Qt::StrongFocus);m_desktopGameViewport->setMinimumSize(640,360);gameLayout->addWidget(m_desktopGameViewport,1);m_gameWindow->setCentralWidget(gameRoot);
+    session->closing=[this]{if(m_runtimeOnDesktop && m_controller.isRunning()){m_stopRequested=true;m_controller.stop();}};
 
-    // Native overlay above Aurora's X11/Vulkan child surface. Keep this private
-    // to MainWindow.cpp so HUD changes do not churn the public MainWindow ABI.
-    g_perfHud = new QLabel(m_gameViewport);
-    g_perfHud->setObjectName("PerformanceHud");
-    g_perfHud->setAttribute(Qt::WA_NativeWindow, true);
-    g_perfHud->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-    g_perfHud->setText("VPS --  ·  G-FPS --  ·  FPS --  ·  I-FPS --  ·  Speed --%");
-    g_perfHud->setStyleSheet(
-        "QLabel#PerformanceHud { color: #ffffff; background: rgba(0,0,0,185); "
-        "border: 1px solid rgba(255,255,255,70); border-radius: 5px; padding: 6px 9px; "
-        "font-family: monospace; font-weight: 700; }");
-    g_perfHud->adjustSize();
-    g_perfHud->move(12, 12);
-    g_perfHud->hide();
 
-    m_loaderOverlay = new QWidget(m_viewFrame);
+    // v359: the performance HUD is drawn by the renderer into the game image
+    // (embedded, standalone and fullscreen windows alike); g_perfHud stays null.
+
+    QString discReader = QDir(QCoreApplication::applicationDirPath()).filePath("gekkoaot-native-disc");
+#ifdef Q_OS_WIN
+    discReader += ".exe";
+#endif
+    m_library = new GameLibrary(runtimeStateRoot(), discReader, m_viewFrame);
+    m_viewStack->addWidget(m_library);
+    m_viewStack->setCurrentWidget(m_library);
+    m_livingRoom = new LivingRoomView(m_viewFrame);m_livingRoom->setProperty("shellSceneTransition",true);
+    m_viewStack->addWidget(m_livingRoom);
+    m_shellGamepad = new ShellGamepad(this);
+    m_compileDialog = new QDialog(this);
+    m_compileDialog->setObjectName("compilationProgress");
+    m_compileDialog->setWindowTitle("Compilation");
+    m_compileDialog->setModal(false);
+    m_compileDialog->resize(620, 450);
+    m_compileDialog->setStyleSheet(settingsStyleSheet() + "QWidget#LoaderOverlay { background: #2b2b2b; } QLabel#LoaderStatus, QLabel#LoaderHint { background: transparent; }");
+    auto* compileLayout = new QVBoxLayout(m_compileDialog);
+    compileLayout->setContentsMargins(0, 0, 0, 0);
+    m_loaderOverlay = new QWidget(m_compileDialog);
     m_loaderOverlay->setObjectName("LoaderOverlay");
     // Do not mark the Qt loader as an opaque paint surface. Its child labels
     // are transparent by default, and rapid status updates can otherwise leave
     // old glyphs in the backing store (the "stacked text" artefact).
     m_loaderOverlay->setAttribute(Qt::WA_StyledBackground, true);
     auto* loaderOuter = new QVBoxLayout(m_loaderOverlay);
-    loaderOuter->setContentsMargins(70, 70, 70, 70);
+    loaderOuter->setContentsMargins(30, 24, 30, 24);
     loaderOuter->addStretch(2);
 
     m_bannerLabel = new QLabel(m_loaderOverlay);
     m_bannerLabel->setObjectName("GameBanner");
     m_bannerLabel->setAlignment(Qt::AlignCenter);
-    m_bannerLabel->setFixedSize(384, 128);
+    m_bannerLabel->setFixedSize(288, 96);
     m_bannerLabel->setVisible(false);
     loaderOuter->addWidget(m_bannerLabel, 0, Qt::AlignHCenter);
     loaderOuter->addSpacing(18);
@@ -491,7 +521,7 @@ void MainWindow::buildUi()
     m_loaderStatus->setObjectName("LoaderStatus");
     m_loaderStatus->setAlignment(Qt::AlignCenter);
     m_loaderStatus->setMinimumHeight(28);
-    m_loaderStatus->setWordWrap(false);
+    m_loaderStatus->setWordWrap(true);
     loaderOuter->addWidget(m_loaderStatus);
 
     loaderOuter->addSpacing(18);
@@ -511,8 +541,12 @@ void MainWindow::buildUi()
     loaderOuter->addWidget(m_loaderHint);
     loaderOuter->addStretch(3);
 
-    m_viewStack->addWidget(m_loaderOverlay);
-    m_viewStack->setCurrentWidget(m_loaderOverlay);
+    compileLayout->addWidget(m_loaderOverlay);
+    auto* compileButtons = new QDialogButtonBox(QDialogButtonBox::Cancel, m_compileDialog);
+    auto* compileLog = compileButtons->addButton("Show log", QDialogButtonBox::HelpRole);
+    connect(compileLog, &QPushButton::clicked, this, [this] { setLogVisible(true); });
+    connect(compileButtons, &QDialogButtonBox::rejected, this, [this] { m_stopRequested = true; m_controller.stop(); });
+    compileLayout->addWidget(compileButtons);
     outer->addWidget(m_viewFrame, 1);
 
     // Advanced settings live in their own non-modal window. Keeping this out
@@ -521,8 +555,10 @@ void MainWindow::buildUi()
     m_advancedDialog = new QDialog(this);
     m_advancedDialog->setWindowTitle("Advanced Settings");
     m_advancedDialog->setModal(false);
-    m_advancedDialog->setMinimumSize(760, 430);
-    m_advancedDialog->resize(900, 620);
+    m_advancedDialog->setObjectName("advancedSettings");
+    m_advancedDialog->setStyleSheet(settingsStyleSheet());
+    m_advancedDialog->setMinimumSize(740, 520);
+    m_advancedDialog->resize(860, 620);
     auto* advancedDialogLayout = new QVBoxLayout(m_advancedDialog);
     advancedDialogLayout->setContentsMargins(12, 12, 12, 12);
     advancedDialogLayout->setSpacing(10);
@@ -532,11 +568,30 @@ void MainWindow::buildUi()
     advancedOuter->setContentsMargins(0, 0, 0, 0);
     advancedOuter->setSpacing(10);
 
-    auto* settingsForm = new QFormLayout();
-    settingsForm->setHorizontalSpacing(18);
-    settingsForm->setVerticalSpacing(10);
-    settingsForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-
+    auto* advancedTabs = new QTabWidget(m_advancedPanel);
+    advancedTabs->setObjectName("advancedTabs");
+    const auto advancedPage = [&](const QString& title) {
+        auto* page = new QWidget;
+        auto* layout = new QVBoxLayout(page);
+        layout->setContentsMargins(24, 20, 24, 20);
+        layout->setSpacing(16);
+        advancedTabs->addTab(page, title);
+        return layout;
+    };
+    auto* compilationPage = advancedPage("Compilation");
+    auto* runtimePage = advancedPage("Runtime");
+    auto* maintenancePage = advancedPage("Tools");
+    const auto advancedForm = [](QVBoxLayout* page) {
+        auto* form = new QFormLayout;
+        form->setHorizontalSpacing(24);
+        form->setVerticalSpacing(16);
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        page->addLayout(form);
+        return form;
+    };
+    auto* settingsForm = advancedForm(compilationPage);
+    auto* runtimeForm = advancedForm(runtimePage);
     m_backend = new QComboBox(m_advancedPanel);
     m_backend->addItem("LLVM AOT", "llvm");
     m_backend->addItem("Portable C AOT", "c");
@@ -600,22 +655,19 @@ void MainWindow::buildUi()
     settingsForm->addRow("Performance", m_profile);
     settingsForm->addRow("Toolchain", m_toolchain);
     settingsForm->addRow("Native ABI", m_nativeAbi);
-    settingsForm->addRow("NativeOS", m_nativeOsCheck);
-    settingsForm->addRow("NativeHW", m_nativeHwCheck);
-    settingsForm->addRow("Runtime workers", m_runtimeWorkers);
+    runtimeForm->addRow("NativeOS", m_nativeOsCheck);
+    runtimeForm->addRow("NativeHW", m_nativeHwCheck);
+    runtimeForm->addRow("Runtime workers", m_runtimeWorkers);
     settingsForm->addRow("LLVM", llvmRow);
     settingsForm->addRow("Parallel jobs", m_jobs);
-    settingsForm->addRow("Extra runner args", m_runArgs);
-    advancedOuter->addLayout(settingsForm);
-
-    auto* asyncHint = mutedLabel(
-        "The build runs asynchronously. You can inspect logs and change settings while it runs; "
-        "changes apply to the next launch.", m_advancedPanel);
-    asyncHint->setWordWrap(true);
-    advancedOuter->addWidget(asyncHint);
-
-    auto* advancedButtons = new QHBoxLayout();
-    advancedButtons->setSpacing(8);
+    runtimeForm->addRow("Extra runner arguments", m_runArgs);
+    compilationPage->addStretch();
+    runtimePage->addStretch();
+    auto* applyHint = mutedLabel("Changes apply to the next launch.", m_advancedPanel);
+    runtimePage->addWidget(applyHint);
+    auto* advancedButtons = new QGridLayout;
+    advancedButtons->setHorizontalSpacing(16);
+    advancedButtons->setVerticalSpacing(16);
     m_pgo = new QPushButton("Train PGO", m_advancedPanel);
     m_pgo->setToolTip("Run representative gameplay, then press Stop to merge the profile and build the optimized LLVM AOT module.");
     m_pgo->setIcon(themedIcon(this, "system-run", QStyle::SP_BrowserReload));
@@ -628,10 +680,23 @@ void MainWindow::buildUi()
     m_clean = new QPushButton("Clean cache", m_advancedPanel);
     m_clean->setObjectName("DangerButton");
     m_clean->setIcon(themedIcon(this, "edit-delete", QStyle::SP_TrashIcon));
-    for (auto* button : {m_pgo, m_inspect, m_compile, m_buildTools, m_clean})
-        advancedButtons->addWidget(button);
-    advancedButtons->addStretch(1);
-    advancedOuter->addLayout(advancedButtons);
+    int toolRow = 0;
+    for (const auto& tool : QList<QPair<QPushButton*, QString>>{
+        {m_compile, "Build the selected game's native module"},
+        {m_pgo, "Optimize from a representative gameplay session"},
+        {m_inspect, "Inspect the disc and its executable files"},
+        {m_buildTools, "Rebuild the compiler and runtime tools"},
+        {m_clean, "Remove the selected game's generated cache"}}) {
+        tool.first->setMinimumWidth(170);
+        advancedButtons->addWidget(tool.first, toolRow, 0);
+        auto* description = mutedLabel(tool.second, m_advancedPanel);
+        description->setWordWrap(true);
+        advancedButtons->addWidget(description, toolRow++, 1);
+    }
+    advancedButtons->setColumnStretch(1, 1);
+    maintenancePage->addLayout(advancedButtons);
+    maintenancePage->addStretch();
+    advancedOuter->addWidget(advancedTabs, 1);
 
     auto* debugRow = new QHBoxLayout();
     m_showLogCheck = new QCheckBox("Show Log", m_advancedPanel);
@@ -645,7 +710,10 @@ void MainWindow::buildUi()
             .arg(kDolRecomp, kAurora, kNod),
         m_advancedPanel);
     revisions->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    advancedOuter->addWidget(revisions);
+    maintenancePage->addWidget(revisions);
+    auto* advancedClose = new QPushButton("Close", m_advancedPanel);
+    connect(advancedClose, &QPushButton::clicked, m_advancedDialog, &QDialog::close);
+    debugRow->addWidget(advancedClose);
     advancedDialogLayout->addWidget(m_advancedPanel);
 
     m_logPanel = new QGroupBox("Log", m_advancedDialog);
@@ -673,22 +741,52 @@ void MainWindow::buildUi()
 
 void MainWindow::buildMenusAndToolbar()
 {
+    m_compilationDock = new QDockWidget("Compilations", this);
+    m_compilationDock->setObjectName("compilationDock");
+    m_compilationDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    m_compilationSidebar = new CompilationSidebar(&m_compilations, m_compilationDock);
+    m_compilationDock->setWidget(m_compilationSidebar);
+    addDockWidget(Qt::RightDockWidgetArea, m_compilationDock);
+    m_compilationDock->hide();
+    m_compilationsAction = new QAction("Compilations",this);
+    m_compilationsAction->setIcon(themedIcon(this, "view-list-details", QStyle::SP_FileDialogListView));
+    m_compilationsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_B));
     auto* fileMenu = menuBar()->addMenu("&File");
     m_openAction = fileMenu->addAction(themedIcon(this, "document-open", QStyle::SP_DialogOpenButton),
                                        "Open Game…");
     fileMenu->addSeparator();
     fileMenu->addAction("Quit", this, &QWidget::close);
 
-    auto* emuMenu = menuBar()->addMenu("&Emulation");
+    m_openAction->setShortcut(QKeySequence::Open);
+
+    auto* emuMenu = menuBar()->addMenu("&Session");
     m_playAction = emuMenu->addAction(themedIcon(this, "media-playback-start", QStyle::SP_MediaPlay),
                                       "Play");
     m_stopAction = emuMenu->addAction(themedIcon(this, "media-playback-stop", QStyle::SP_MediaStop),
                                       "Stop");
+    m_pauseAction = emuMenu->addAction(themedIcon(this, "media-playback-pause", QStyle::SP_MediaPause), "Pause");
+    m_pauseAction->setObjectName("pauseGame");
+    m_pauseAction->setCheckable(true);
+    m_pauseAction->setEnabled(false);
+    m_pauseAction->setShortcut(QKeySequence(Qt::Key_F6));
     emuMenu->addSeparator();
     m_fullscreenAction = emuMenu->addAction(
         themedIcon(this, "view-fullscreen", QStyle::SP_TitleBarMaxButton),
         "Fullscreen Game View");
     m_fullscreenAction->setCheckable(true);
+    m_fullscreenAction->setText("Fullscreen game");
+    m_tvAction = emuMenu->addAction(themedIcon(this, "video-display", QStyle::SP_ComputerIcon), "TV Mode");
+    m_tvAction->setObjectName("tvMode");
+    connect(m_tvAction, &QAction::triggered, this, &MainWindow::enterTVMode);
+    auto* fullscreenKey = new QShortcut(QKeySequence(Qt::Key_F11), this);
+    fullscreenKey->setObjectName("fullscreenShortcut");
+    fullscreenKey->setContext(Qt::ApplicationShortcut);
+    fullscreenKey->setAutoRepeat(false);
+    connect(fullscreenKey, &QShortcut::activated, this, &MainWindow::toggleGameViewFullscreen);
+    auto* home = new QShortcut(QKeySequence(Qt::Key_Home), this);
+    home->setAutoRepeat(false);
+    home->setContext(Qt::ApplicationShortcut);
+    connect(home, &QShortcut::activated, this, &MainWindow::toggleHomeMenu);
 
     // Keep Alt+Enter independent from the menu action. QAction shortcuts can
     // stop toggling after a fullscreen state transition on some Qt/XWayland
@@ -719,7 +817,8 @@ void MainWindow::buildMenusAndToolbar()
     m_analyzeAction = toolsMenu->addAction(themedIcon(this, "edit-find", QStyle::SP_FileDialogContentsView),
                                            "Analyze");
     m_compileAction = toolsMenu->addAction(themedIcon(this, "system-run", QStyle::SP_ArrowForward),
-                                           "Compile only");
+                                           "Compile selected");
+    toolsMenu->addAction(m_compilationsAction);
     m_pgoAction = toolsMenu->addAction(themedIcon(this, "system-run", QStyle::SP_BrowserReload),
                                        "Train PGO");
     toolsMenu->addSeparator();
@@ -739,39 +838,144 @@ void MainWindow::buildMenusAndToolbar()
                 .arg(QStringLiteral(GEKKOAOT_VERSION)), 4000);
     });
 
-    m_mainToolbar = addToolBar("Main");
+    menuBar()->hide();
+    m_mainToolbar = addToolBar("Navigation");
+    m_mainToolbar->setObjectName("desktopNavigation");
     m_mainToolbar->setMovable(false);
-    m_mainToolbar->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-    m_mainToolbar->setIconSize(QSize(22, 22));
-    m_mainToolbar->addAction(m_openAction);
-    m_mainToolbar->addSeparator();
-    m_mainToolbar->addAction(m_playAction);
-    m_mainToolbar->addAction(m_stopAction);
-    m_mainToolbar->addSeparator();
-    m_mainToolbar->addAction(m_graphicsAction);
-    m_mainToolbar->addAction(m_inputAction);
-    m_mainToolbar->addSeparator();
-    m_gameEnhancementsButton = new QToolButton(m_mainToolbar);
-    m_gameEnhancementsButton->setText("Enhancements");
-    m_gameEnhancementsButton->setIcon(
-        themedIcon(this, "applications-games", QStyle::SP_DesktopIcon));
-    m_gameEnhancementsButton->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-    m_gameEnhancementsButton->setPopupMode(QToolButton::InstantPopup);
-    m_gameEnhancementsButton->setMenu(m_gameEnhancementsMenu);
-    m_gameEnhancementsButton->setEnabled(false);
-    m_mainToolbar->addWidget(m_gameEnhancementsButton);
-    m_mainToolbar->addSeparator();
-    m_mainToolbar->addAction(m_advancedAction);
+    m_mainToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_mainToolbar->setIconSize(QSize(19,19));
+    m_mainToolbar->setStyleSheet(R"(
+        QToolBar { background: #282828; border: 1px solid rgba(255,255,255,42); border-radius: 22px; padding: 10px 14px; spacing: 4px; }
+        QToolButton { border-radius: 15px; padding: 10px 14px; color: #dedede; border: 1px solid transparent; }
+        QToolButton:hover { background: rgba(255,255,255,14); border-color: #555555; }
+        QToolButton:focus { border-color: #eeeeee; }
+        QToolButton:disabled { color: #737373; }
+        QToolButton#primaryPlay { background: #eeeeee; color: #202020; border: 1px solid #eeeeee; }
+        QToolButton#primaryPlay:disabled { background: #383838; color: #777777; border-color: #444444; }
+        QToolButton::menu-indicator { image: none; }
+    )");
+    // Equal outer columns keep transport controls centered in the window,
+    // independently of the width of the identity and utility groups.
+    auto* content=new QWidget(m_mainToolbar);content->setObjectName("desktopNavContent");
+    content->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred);
+    auto* navigation=new QGridLayout(content);navigation->setContentsMargins(0,0,0,0);navigation->setHorizontalSpacing(12);
+    navigation->setColumnStretch(0,1);navigation->setColumnStretch(2,1);
+    auto* identity=new QWidget(content);auto* identityRow=new QHBoxLayout(identity);identityRow->setContentsMargins(0,0,0,0);identityRow->setSpacing(8);
+    auto* logo=new QLabel(identity);logo->setObjectName("desktopProjectLogo");logo->setFixedSize(36,36);logo->setPixmap(shellProjectIcon().pixmap(36,36));logo->setVisible(QSettings("GekkoAOT","GekkoAOT").value("ui/showProjectLogo",true).toBool());identityRow->addWidget(logo);
+    auto* brand=new QLabel("GEKKOAOT",identity);brand->setObjectName("desktopBrand");brand->setFont(shellDisplayFont(20));brand->setStyleSheet("color:#eeeeee;padding:0 8px 0 2px;");identityRow->addWidget(brand);
+    auto* menuButton=new QToolButton(identity);menuButton->setObjectName("desktopMenu");menuButton->setIcon(shellIcon("menu"));menuButton->setToolTip("Menu · Alt+M");menuButton->setAccessibleName("Menu");identityRow->addWidget(menuButton);
+    connect(menuButton,&QToolButton::clicked,this,[this]{showNavigationPanel(false);});
+    navigation->addWidget(identity,0,0,Qt::AlignLeft);
+    auto* transport=new QWidget(content);transport->setObjectName("desktopTransport");auto* transportRow=new QHBoxLayout(transport);transportRow->setContentsMargins(0,0,0,0);transportRow->setSpacing(4);
+    auto tool=[&](QAction* action,QHBoxLayout* row,const QString& name){
+        auto* button=new QToolButton(row->parentWidget());button->setObjectName(name);button->setDefaultAction(action);button->setToolButtonStyle(Qt::ToolButtonIconOnly);button->setIconSize({20,20});button->setFixedSize(50,46);button->setAccessibleName(action->text());row->addWidget(button);return button;
+    };
+    auto* play=tool(m_playAction,transportRow,"primaryPlay");play->setIcon(shellIcon("play",true));
+    connect(m_playAction,&QAction::changed,play,[play]{play->setIcon(shellIcon("play",true));});
+    tool(m_pauseAction,transportRow,"pauseButton");tool(m_stopAction,transportRow,"stopButton");
+    navigation->addWidget(transport,0,1,Qt::AlignCenter);
+    auto* utilities=new QWidget(content);auto* utilityRow=new QHBoxLayout(utilities);utilityRow->setContentsMargins(0,0,0,0);utilityRow->setSpacing(4);
+    tool(m_compilationsAction,utilityRow,"compilationsButton");tool(m_tvAction,utilityRow,"tvModeButton");
+    auto* windowChrome=new ShellTitleBar(this);windowChrome->integrateWindowControls(utilityRow);
+    navigation->addWidget(utilities,0,2,Qt::AlignRight);
+    m_mainToolbar->addWidget(content);
+    m_gameEnhancementsButton=new QToolButton(m_mainToolbar);m_gameEnhancementsButton->setMenu(m_gameEnhancementsMenu);m_gameEnhancementsButton->hide();
+    m_openAction->setToolTip("Open a game · Ctrl+O");
+    for(auto* action:{m_openAction,m_playAction,m_pauseAction,m_stopAction,m_tvAction,m_compilationsAction})addAction(action);
+    removeToolBar(m_mainToolbar);
+    m_mainToolbar->setParent(centralWidget());
+    auto* shellLayout=qobject_cast<QVBoxLayout*>(centralWidget()->layout());
+    shellLayout->setContentsMargins(16,14,16,8);shellLayout->setSpacing(12);shellLayout->insertWidget(0,m_mainToolbar);
+    m_mainToolbar->installEventFilter(this);
+    shellShadow(m_mainToolbar,16);m_mainToolbar->show();
+    for(auto* button:m_mainToolbar->findChildren<QToolButton*>())button->setFocusPolicy(Qt::StrongFocus);
+
+    auto* openMenu=new QShortcut(QKeySequence(Qt::ALT|Qt::Key_M),this);connect(openMenu,&QShortcut::activated,this,[this]{showNavigationPanel(false);});
+
 }
 
 void MainWindow::connectUi()
 {
+    connect(m_livingRoom, &LivingRoomView::playRequested, this, [this](const QString& path) {
+        if (!m_controller.isRunning()) setIsoPath(path, true);
+        else if(m_runtimeStarted && path==m_isoPath)dismissLivingRoom(true);
+        else if (m_runtimeStarted && path != m_isoPath) {
+            m_pendingGame = path;
+            m_pendingGameOnDesktop = false;
+            m_livingRoom->setBuildStatus("Closing current game…", 0);
+            m_stopAction->trigger();
+        }
+    });
+    connect(m_livingRoom, &LivingRoomView::compileRequested, this, [this](const QString& path) { enqueueCompilations({path}); });
+    connect(m_livingRoom, &LivingRoomView::resumeRequested, this, [this] { dismissLivingRoom(true); });
+    connect(m_livingRoom, &LivingRoomView::stopRequested, this, [this] {
+        m_pendingGame.clear(); m_stopAction->trigger();
+    });
+    connect(m_livingRoom, &LivingRoomView::desktopRequested, this, [this] { setGameViewFullscreen(false); });
+    connect(m_livingRoom, &LivingRoomView::backRequested, this, [this] {
+        if (m_runtimeStarted) dismissLivingRoom(m_shellPausedGame); else setGameViewFullscreen(false);
+    });
+    connect(m_livingRoom, &LivingRoomView::openRequested, this, &MainWindow::browseIso);
+    connect(m_livingRoom, &LivingRoomView::graphicsRequested, this, &MainWindow::showGraphicsConfig);
+    connect(m_livingRoom, &LivingRoomView::inputRequested, this, &MainWindow::showInputConfig);
+    connect(m_livingRoom, &LivingRoomView::advancedRequested, this, [this] { setAdvancedVisible(true); });
+    connect(m_livingRoom, &LivingRoomView::queueRequested, this, &MainWindow::showCompilations);
+    connect(m_livingRoom, &LivingRoomView::appearanceRequested, this, &MainWindow::showAppearanceConfig);
+    connect(m_livingRoom, &LivingRoomView::discordRequested, this, &MainWindow::showDiscordConfig);
+    connect(m_livingRoom, &LivingRoomView::memoryCardsRequested, this, &MainWindow::showMemoryCards);
+    connect(m_compilationsAction, &QAction::triggered, this, &MainWindow::showCompilations);
+    connect(m_livingRoom, &LivingRoomView::reducedMotionChanged, this, [](bool value) {
+        QSettings("GekkoAOT", "GekkoAOT").setValue("ui/reducedMotion", value);
+    });
+    // Never enter QDialog::exec from inside SDL polling: Qt deliberately
+    // suppresses recursive activation of the currently executing timer.
+    connect(m_shellGamepad, &ShellGamepad::homePressed, this, &MainWindow::toggleHomeMenu, Qt::QueuedConnection);
+    connect(m_shellGamepad, &ShellGamepad::navigationKey, this, &MainWindow::routeControllerKey, Qt::QueuedConnection);
+    connect(m_shellGamepad, &ShellGamepad::controllerChanged, m_livingRoom, &LivingRoomView::setControllerName);
+    connect(qApp, &QApplication::focusChanged, this, [this] { updateShellInput(); });
+    connect(qApp, &QGuiApplication::applicationStateChanged, this, [this] { updateShellInput(); });
+    connect(&m_compilations, &CompilationQueue::jobAdded, this, [this](quint64) {
+        if (!m_returnToTV && !shellActiveDialog(this)) showCompilations();
+    });
+    connect(&m_compilations, &CompilationQueue::countsChanged, this, [this] {
+        const int count = m_compilations.activeCount() + m_compilations.pendingCount();
+        m_compilationsAction->setText(count ? QString("Compilations (%1)").arg(count) : "Compilations");
+        m_livingRoom->setQueueCount(count);
+        setBusy(m_controller.isRunning());
+        QSettings("GekkoAOT", "GekkoAOT").setValue("build/parallelGames", m_compilations.maxParallel());
+        refreshDiscordPresence();
+    });
+    connect(&m_compilations, &CompilationQueue::jobChanged, this, [this] { refreshDiscordPresence(); });
+    connect(&m_compilations, &CompilationQueue::foregroundCancelRequested, this, [this] {
+        m_stopRequested = true;
+    });
     connect(m_llvmBrowse, &QPushButton::clicked, this, &MainWindow::browseLlvmDir);
     connect(m_openAction, &QAction::triggered, this, &MainWindow::browseIso);
     connect(m_playAction, &QAction::triggered, this, [this] { launchAction("run"); });
+    connect(m_pauseAction, &QAction::triggered, this, [this](bool paused) {
+        if (!m_runtimeStarted) return;
+        m_paused = paused;
+        QString error;
+        if (!writeFrontendConfig(&error)) {
+            m_paused = !paused;
+            m_pauseAction->setChecked(m_paused);
+            m_log->appendPlainText("[gekkoaot] pause: " + error);
+            return;
+        }
+        if (m_playClock.isValid()) {
+            if (paused) m_playSeconds += m_playClock.elapsed() / 1000;
+            else m_playClock.restart();
+        }
+        m_pauseAction->setText(paused ? "Resume" : "Pause");
+        m_pauseAction->setIcon(themedIcon(this, paused ? "media-playback-start" : "media-playback-pause",
+                                        paused ? QStyle::SP_MediaPlay : QStyle::SP_MediaPause));
+        statusBar()->showMessage(paused ? "Paused — F6 to resume" : "Game resumed", 3000);
+        refreshDiscordPresence();
+    });
     connect(m_stopAction, &QAction::triggered, this, [this] {
         if (m_activeAction == "pgo" && m_progressStage == "runtime")
         {
+            if (m_paused) m_pauseAction->trigger();
             // PGO needs a normal runtime shutdown so compiler-rt flushes the
             // .profraw counters. Ask the native runtime to stop cleanly instead of
             // killing the process group used by the generic Stop path.
@@ -830,6 +1034,7 @@ void MainWindow::connectUi()
                 updateStatusFromOutput(text);
             });
     connect(&m_controller, &BuildController::runningChanged, this, &MainWindow::setBusy);
+    connect(&m_controller, &BuildController::presentationEmbedded, this, [this](bool embedded) { m_runtimeEmbedded = embedded; });
     connect(&m_controller, &BuildController::finished, this,
             [this](int code, QProcess::ExitStatus status) {
                 const bool ok = code == 0 && status == QProcess::NormalExit;
@@ -865,9 +1070,39 @@ void MainWindow::connectUi()
                     QString("\n[gekkoaot] finished: code=%1 status=%2\n")
                         .arg(code)
                         .arg(finishStatus));
+                if (m_playClock.isValid()) {
+                    if (!m_paused) m_playSeconds += m_playClock.elapsed() / 1000;
+                    m_library->addPlayTime(m_isoPath, m_playSeconds);
+                    m_playClock.invalidate(); m_playSeconds = 0;
+                }
                 m_activeAction.clear();
                 m_runtimeStarted = false;
+                m_discordGameStart = 0;
+                m_gameWindow->hide();
+                m_shellPausedGame = false;
+                m_livingRoom->setGameRunning(false);
+        updateApplicationIcon();
+                m_livingRoom->setBuildStatus(ok || m_stopRequested ? QString{} : "Launch failed · open Compilations for the log");
+                m_paused = false;
+                m_pauseAction->setChecked(false);
+                m_pauseAction->setEnabled(false);
+                m_pauseAction->setText("Pause");
+                m_pauseAction->setIcon(themedIcon(this, "media-playback-pause", QStyle::SP_MediaPause));
                 m_stopRequested = false;
+                refreshDiscordPresence();
+                const QString selected = m_library->selectedPath();
+                if (!selected.isEmpty() && selected != m_isoPath) setIsoPath(selected, false);
+                if (!m_pendingGame.isEmpty()) {
+                    const QString next = m_pendingGame;
+                    const bool desktop=m_pendingGameOnDesktop;
+                    m_pendingGame.clear();
+                    QTimer::singleShot(0, this, [this, next, desktop] {
+                        if(desktop)restoreDesktopLauncher();else openLivingRoom();
+                        setIsoPath(next,true);
+                    });
+                }
+                else if (m_returnToTV) QTimer::singleShot(0, this, &MainWindow::openLivingRoom);
+                else if (m_hiddenForGame) { m_hiddenForGame = false; show(); }
             });
 }
 
@@ -878,6 +1113,7 @@ void MainWindow::loadSettings()
     m_llvmDir->setText(s.value("llvmDir").toString());
     m_runArgs->setText(s.value("runArgs").toString());
     m_jobs->setValue(s.value("jobs", qMax(1, QThread::idealThreadCount())).toInt());
+    m_compilations.setMaxParallel(s.value("build/parallelGames", 2).toInt());
 
     m_graphicsBackend = s.value("graphics/backend", "Vulkan").toString();
     m_resolution = s.value("graphics/resolution", "1920x1080").toString();
@@ -896,16 +1132,30 @@ void MainWindow::loadSettings()
     m_windowSystem = "auto";
     m_fullscreen = s.value("graphics/fullscreen", false).toBool();
     m_showFps = s.value("graphics/showFps", true).toBool();
-    m_frameInterpolation = false;
+    m_hudItems = s.value("graphics/hudItems", GekkoAOT::GX::HudDefaultItems).toUInt();
+    // v358: the unlock re-renders geometry. The old image-blend setting
+    // ("graphics/frameInterpolation") is deliberately not migrated.
+    m_frameInterpolation = s.value("graphics/frameUnlock", false).toBool();
+    m_graphicsExtras.unlock_predict = s.value("graphics/frameUnlockPredict", false).toBool() ? 1u : 0u;
     m_fpsLimit = qBound(1, s.value("graphics/fpsLimit", 120).toInt(), 1000);
     m_msaaSamples = s.value("graphics/msaaSamples", 1).toInt() == 4 ? 4 : 1;
     const int anisotropy = s.value("graphics/textureAnisotropy", 16).toInt();
     m_textureAnisotropy = (anisotropy == 1 || anisotropy == 2 || anisotropy == 4 ||
                            anisotropy == 8 || anisotropy == 16) ? anisotropy : 16;
+    m_graphicsExtras.render_percent = qBound(25, s.value("graphics/renderPercent", 100).toInt(), 400);
+    m_graphicsExtras.fxaa = s.value("graphics/fxaa", false).toBool();
+    m_graphicsExtras.brightness = qBound(0.0, s.value("graphics/brightness", double(m_graphicsExtras.brightness)).toDouble(), 2.0);
+    m_graphicsExtras.contrast = qBound(0.0, s.value("graphics/contrast", double(m_graphicsExtras.contrast)).toDouble(), 2.0);
+    m_graphicsExtras.saturation = qBound(0.0, s.value("graphics/saturation", double(m_graphicsExtras.saturation)).toDouble(), 2.0);
+    m_graphicsExtras.gamma = qBound(0.5, s.value("graphics/gamma", double(m_graphicsExtras.gamma)).toDouble(), 2.5);
+    m_graphicsExtras.exposure = qBound(-3.0, s.value("graphics/exposure", double(m_graphicsExtras.exposure)).toDouble(), 3.0);
+    m_graphicsExtras.temperature = qBound(-1.0, s.value("graphics/temperature", double(m_graphicsExtras.temperature)).toDouble(), 1.0);
+    m_graphicsExtras.vibrance = qBound(0.0, s.value("graphics/vibrance", double(m_graphicsExtras.vibrance)).toDouble(), 1.0);
+    m_graphicsExtras.tint = qBound(-1.0, s.value("graphics/tint", double(m_graphicsExtras.tint)).toDouble(), 1.0);
     m_postProcessing = s.value("graphics/postProcessing", true).toBool();
     m_postPreset = s.value("graphics/postPreset", "balanced").toString();
     if (m_postPreset != "balanced" && m_postPreset != "cinematic" &&
-        m_postPreset != "crisp" && m_postPreset != "custom")
+        m_postPreset != "crisp" && m_postPreset != "neutral" && m_postPreset != "custom")
         m_postPreset = "balanced";
     m_postSharpen = qBound(0.0, s.value("graphics/postSharpen", 0.28).toDouble(), 1.0);
     m_postBloom = qBound(0.0, s.value("graphics/postBloom", 0.10).toDouble(), 1.0);
@@ -935,6 +1185,8 @@ void MainWindow::loadSettings()
     m_nativeOsCheck->setChecked(s.value("advanced/nativeOS", true).toBool());
     m_nativeHwCheck->setChecked(s.value("advanced/nativeHW", true).toBool());
     m_nativeAbi->setEnabled(m_backend->currentData().toString() == "llvm");
+    m_discord.configure(s.value("discord/enabled", true).toBool(),
+        s.value("discord/applicationId", DiscordPresence::defaultApplicationId()).toString());
 }
 
 void MainWindow::saveSettings() const
@@ -944,6 +1196,7 @@ void MainWindow::saveSettings() const
     s.setValue("llvmDir", m_llvmDir->text());
     s.setValue("runArgs", m_runArgs->text());
     s.setValue("jobs", m_jobs->value());
+    s.setValue("build/parallelGames", m_compilations.maxParallel());
     s.setValue("backend", m_backend->currentData());
     s.setValue("profile", m_profile->currentData());
     s.setValue("toolchain", m_toolchain->currentData());
@@ -957,10 +1210,22 @@ void MainWindow::saveSettings() const
     s.setValue("graphics/aspectMode", m_aspectMode);
     s.setValue("graphics/fullscreen", m_fullscreen);
     s.setValue("graphics/showFps", m_showFps);
-    s.setValue("graphics/frameInterpolation", false);
+    s.setValue("graphics/frameUnlock", m_frameInterpolation);
+    s.setValue("graphics/frameUnlockPredict", m_graphicsExtras.unlock_predict != 0);
+    s.setValue("graphics/hudItems", m_hudItems);
     s.setValue("graphics/fpsLimit", m_fpsLimit);
     s.setValue("graphics/msaaSamples", m_msaaSamples);
     s.setValue("graphics/textureAnisotropy", m_textureAnisotropy);
+    s.setValue("graphics/renderPercent", int(m_graphicsExtras.render_percent));
+    s.setValue("graphics/fxaa", bool(m_graphicsExtras.fxaa));
+    s.setValue("graphics/brightness", m_graphicsExtras.brightness);
+    s.setValue("graphics/contrast", m_graphicsExtras.contrast);
+    s.setValue("graphics/saturation", m_graphicsExtras.saturation);
+    s.setValue("graphics/gamma", m_graphicsExtras.gamma);
+    s.setValue("graphics/exposure", m_graphicsExtras.exposure);
+    s.setValue("graphics/temperature", m_graphicsExtras.temperature);
+    s.setValue("graphics/vibrance", m_graphicsExtras.vibrance);
+    s.setValue("graphics/tint", m_graphicsExtras.tint);
     s.setValue("graphics/postProcessing", m_postProcessing);
     s.setValue("graphics/postPreset", m_postPreset);
     s.setValue("graphics/postSharpen", m_postSharpen);
@@ -974,20 +1239,18 @@ void MainWindow::saveSettings() const
 
 void MainWindow::browseIso()
 {
-    const QString startDir = m_isoPath.isEmpty() ? QString{} : QFileInfo(m_isoPath).absolutePath();
-    const QString path = QFileDialog::getOpenFileName(
-        this, "Choose a GameCube/Wii game", startDir,
-        "Game sources (*.iso *.gcm *.wbfs *.rvz *.wia *.gcz *.dol);;Disc images (*.iso *.gcm *.wbfs *.rvz *.wia *.gcz);;GameCube DOL (*.dol);;All files (*)",
-        nullptr, kPortableFileDialogOptions);
-    if (!path.isEmpty())
-        setIsoPath(path, true);
+    if (m_controller.isRunning()) return;
+    QFileDialog browser(this,"Choose a GameCube/Wii game",m_isoPath.isEmpty()?QString{}:QFileInfo(m_isoPath).absolutePath());
+    browser.setOption(QFileDialog::DontUseNativeDialog);
+    browser.setFileMode(QFileDialog::ExistingFile);
+    browser.setNameFilters({"Game sources (*.iso *.gcm *.wbfs *.rvz *.wia *.gcz *.dol)","All files (*)"});
+    presentShellDialog(browser,"Open game",m_shellVisible);
+    if(execShellDialog(browser)==QDialog::Accepted && !browser.selectedFiles().isEmpty())setIsoPath(browser.selectedFiles().first(),true);
 }
 
 void MainWindow::browseLlvmDir()
 {
-    const QString path = QFileDialog::getExistingDirectory(
-        this, "Select LLVM CMake directory", {},
-        QFileDialog::ShowDirsOnly | kPortableFileDialogOptions);
+    const QString path = shellChooseFiles(this,"Select LLVM CMake directory",{},false,true).value(0);
     if (!path.isEmpty())
         m_llvmDir->setText(path);
 }
@@ -995,6 +1258,8 @@ void MainWindow::browseLlvmDir()
 void MainWindow::setIsoPath(const QString& path, bool autoPlay)
 {
     m_isoPath = QFileInfo(path).absoluteFilePath();
+    m_library->addGame(m_isoPath);
+    m_library->selectGame(m_isoPath);
     updateGameMetadata();
     updateLoaderBanner();
     saveSettings();
@@ -1039,6 +1304,10 @@ QString MainWindow::slugForPath(const QString& path)
 
 QString MainWindow::gameTitleForPath(const QString& path)
 {
+    if (!path.isEmpty()) {
+        const QString title = readDiscMetadata(discMetadataCachePath(runtimeStateRoot(), path))["title"].toString();
+        if (!title.isEmpty()) return title;
+    }
     if (path.isEmpty())
         return {};
 
@@ -1100,6 +1369,10 @@ QString MainWindow::gameTitleForPath(const QString& path)
 
 QString MainWindow::discIdForPath(const QString& path)
 {
+    if (!path.isEmpty()) {
+        const QString id = readDiscMetadata(discMetadataCachePath(runtimeStateRoot(), path))["gameId"].toString();
+        if (!id.isEmpty()) return id;
+    }
     const QString cachedIdPath =
         QDir(runtimeStateRoot()).filePath("cache/discs/" + slugForPath(path) + "/meta/disc-id.txt");
     QFile cached(cachedIdPath);
@@ -1153,6 +1426,11 @@ bool MainWindow::looksLikeDiscImage(const QString& path)
 
 QImage MainWindow::gameCubeBannerForPath(const QString& path)
 {
+    QFile libraryBanner(discMetadataCachePath(runtimeStateRoot(), path) + "/meta/opening.bnr");
+    if (libraryBanner.open(QIODevice::ReadOnly)) {
+        const auto image = decodeGameCubeBanner(libraryBanner.readAll());
+        if (!image.isNull()) return image;
+    }
     // Compressed containers cannot be parsed as a raw disc with QFile. Once
     // DiscIO has filled the hidden executable cache, use its opening.bnr.
     const QString cachedBanner =
@@ -1296,14 +1574,40 @@ bool MainWindow::writeFrontendConfig(QString* error) const
     QTextStream out(&file);
     out << "# Generated by GekkoAOT\n"
            "# GekkoAOT native frontend settings\n"
-           "[Video]\n"
-        << "resolution=" << m_resolution << "\n"
+           "[Emulation]\n"
+        << "paused=" << (m_paused ? "true" : "false") << "\n"
+        << "[Video]\n"
         << "backend=" << m_graphicsBackend << "\n"
         << "aspect_ratio=" << m_aspectMode << "\n"
         << "fullscreen=" << (m_fullscreen ? "true" : "false") << "\n"
         << "show_fps_in_title=" << (m_showFps ? "true" : "false") << "\n"
         << "fps_limit=" << m_fpsLimit << "\n"
-        << "frame_interpolation=false\n"
+        << "frame_interpolation=" << (m_frameInterpolation ? 1 : 0) << "\n"
+        << "frame_unlock_predict=" << m_graphicsExtras.unlock_predict << "\n"
+        << "hud=" << (m_showFps ? 1 : 0) << "\n";
+    for (const auto& item : GekkoAOT::GX::HudItemKeys)
+        out << item.key << "=" << ((m_hudItems & item.bit) ? 1 : 0) << "\n";
+    out
+        << "render_percent=" << m_graphicsExtras.render_percent << "\n"
+        << "render_width=" << (screen()->size() * screen()->devicePixelRatio()).width() << "\n"
+        << "render_height=" << (screen()->size() * screen()->devicePixelRatio()).height() << "\n"
+        << "fxaa=" << m_graphicsExtras.fxaa << "\n"
+        << "post_processing=" << (m_postProcessing ? 1 : 0) << "\n"
+        << "post_sharpen=" << m_postSharpen << "\n"
+        << "post_bloom=" << m_postBloom << "\n"
+        << "post_vignette=" << m_postVignette << "\n"
+        << "post_grain=" << m_postGrain << "\n"
+        << "post_tone=" << m_postTone << "\n"
+        << "post_local_contrast=" << m_postLocalContrast << "\n"
+        << "post_cinematic=" << (m_postPreset == "cinematic" ? .20 : 0.) << "\n"
+        << "post_brightness=" << m_graphicsExtras.brightness << "\n"
+        << "post_contrast=" << m_graphicsExtras.contrast << "\n"
+        << "post_saturation=" << m_graphicsExtras.saturation << "\n"
+        << "post_gamma=" << m_graphicsExtras.gamma << "\n"
+        << "post_exposure=" << m_graphicsExtras.exposure << "\n"
+        << "post_temperature=" << m_graphicsExtras.temperature << "\n"
+        << "post_vibrance=" << m_graphicsExtras.vibrance << "\n"
+        << "post_tint=" << m_graphicsExtras.tint << "\n"
         << "msaa_samples=" << m_msaaSamples << "\n"
         << "texture_anisotropy=" << m_textureAnisotropy << "\n"
            "[Input]\n";
@@ -1385,10 +1689,10 @@ void MainWindow::updateGameMetadata()
     }
 }
 
-QMap<QString, QString> MainWindow::gameEnhancementEnvironment() const
+QMap<QString, QString> MainWindow::gameEnhancementEnvironment(const QString& path) const
 {
     QMap<QString, QString> environment;
-    const QString discId = discIdForPath(m_isoPath);
+    const QString discId = discIdForPath(path.isEmpty() ? m_isoPath : path);
     const QJsonObject pack = loadGamePackJson(discId);
     const QJsonObject ui = pack.value("ui").toObject();
     const QJsonArray options = ui.value("options").toArray();
@@ -1541,7 +1845,7 @@ void MainWindow::updateGameEnhancementsMenu()
 
 qreal MainWindow::effectiveDisplayScale() const
 {
-    const QScreen* current = m_gameViewport ? m_gameViewport->screen() : screen();
+    const QScreen* current = m_gameWindow && m_gameWindow->isVisible() ? m_gameWindow->screen() : screen();
     if (!current)
         return 1.0;
 
@@ -1574,533 +1878,54 @@ QString MainWindow::displaySessionDescription() const
 
 void MainWindow::showGraphicsConfig()
 {
-    QDialog dialog(this);
-    dialog.setWindowTitle("Graphics Settings");
-    dialog.setModal(true);
-    dialog.resize(600, 610);
-
-    auto* outer = new QVBoxLayout(&dialog);
-    auto* form = new QFormLayout();
-
-    auto* backend = new QComboBox(&dialog);
-    backend->addItem("Vulkan", "Vulkan");
-    backend->addItem("OpenGL", "OGL");
-    backend->setCurrentIndex(comboIndexForData(backend, m_graphicsBackend));
-
-    auto* resolution = new QComboBox(&dialog);
-    resolution->addItem("Native (640×528)", "640x528");
-    resolution->addItem("2× (1280×720)", "1280x720");
-    resolution->addItem("3× (1920×1080)", "1920x1080");
-    resolution->addItem("4× (2560×1440)", "2560x1440");
-    resolution->addItem("6× (3840×2160)", "3840x2160");
-    resolution->addItem("8× (5120×2880)", "5120x2880");
-    resolution->addItem("12× (7680×4320)", "7680x4320");
-    resolution->setCurrentIndex(comboIndexForData(resolution, m_resolution));
-
-    auto* aspect = new QComboBox(&dialog);
-    aspect->addItem("4:3", "4:3");
-    aspect->addItem("Stretched to Window", "stretch");
-    aspect->setCurrentIndex(comboIndexForData(aspect, m_aspectMode));
-
-    // v128b: preview aspect changes in the running game. NativeGX polls the
-    // frontend config about four times per second. Cancel restores the value
-    // that was active when this dialog opened.
-    const QString originalAspectMode = m_aspectMode;
-    connect(aspect, &QComboBox::currentIndexChanged, &dialog, [this, aspect](int) {
-        if (!m_runtimeStarted)
-            return;
-        const QString next = aspect->currentData().toString();
-        if (next == m_aspectMode)
-            return;
-        m_aspectMode = next;
+    GraphicsOptions options;
+    options.image=m_graphicsExtras;
+    options.image.msaa=m_msaaSamples; options.image.anisotropy=m_textureAnisotropy;
+    options.image.post=m_postProcessing; options.image.interpolation=m_frameInterpolation;
+    options.image.sharpen=m_postSharpen; options.image.bloom=m_postBloom;
+    options.image.vignette=m_postVignette; options.image.grain=m_postGrain;
+    options.image.tone=m_postTone; options.image.local_contrast=m_postLocalContrast;
+    options.image.cinematic=m_postPreset=="cinematic"?.20f:0.f;
+    options.backend=m_graphicsBackend;
+    options.aspect=m_aspectMode; options.preset=m_postPreset;
+    options.fps=m_fpsLimit; options.fullscreen=m_runtimeStarted?m_gameWindow->isFullScreen():m_fullscreen; options.hud=m_showFps;
+    options.hudItems=m_hudItems;
+    options.outputExtent = screen()->size() * screen()->devicePixelRatio();
+    const auto preview=[this,lastFullscreen=options.fullscreen](const GraphicsOptions& next) mutable {
+        const bool fullscreenChanged=next.fullscreen!=lastFullscreen;
+        lastFullscreen=next.fullscreen;
+        m_graphicsExtras=next.image;
+        m_graphicsBackend=next.backend;
+        m_aspectMode=next.aspect; m_postPreset=next.preset;
+        m_fpsLimit=next.fps; if(fullscreenChanged)m_fullscreen=next.fullscreen; m_showFps=next.hud;
+        m_hudItems=next.hudItems;
+        if (fullscreenChanged && m_runtimeStarted && m_runtimeEmbedded) {
+            // Colour/resolution previews never change window ownership/state.
+            // Only an explicit Fullscreen checkbox edit may do so.
+            auto* target=m_gameWindow;
+            if(m_fullscreen)target->showFullScreen();else target->showNormal();
+        }
+        m_msaaSamples=next.image.msaa; m_textureAnisotropy=next.image.anisotropy;
+        m_postProcessing=next.image.post; m_frameInterpolation=next.image.interpolation;
+        m_postSharpen=next.image.sharpen; m_postBloom=next.image.bloom;
+        m_postVignette=next.image.vignette; m_postGrain=next.image.grain;
+        m_postTone=next.image.tone; m_postLocalContrast=next.image.local_contrast;
+        if(g_perfHud) g_perfHud->setVisible(m_showFps && m_runtimeStarted && m_runtimeEmbedded);
         QString error;
-        if (!writeFrontendConfig(&error))
-            m_log->appendPlainText("[gekkoaot] live aspect update failed: " + error + "\n");
-    });
-
-    auto* fpsLimit = new QSlider(Qt::Horizontal, &dialog);
-    fpsLimit->setRange(1, 1000);
-    fpsLimit->setSingleStep(1);
-    fpsLimit->setPageStep(10);
-    fpsLimit->setTickInterval(30);
-    fpsLimit->setTickPosition(QSlider::TicksBelow);
-    fpsLimit->setValue(m_fpsLimit);
-    auto* fpsValue = new QLabel(QString::number(m_fpsLimit) + " FPS", &dialog);
-    fpsValue->setMinimumWidth(68);
-    fpsValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    auto* fpsRow = new QWidget(&dialog);
-    auto* fpsRowLayout = new QHBoxLayout(fpsRow);
-    fpsRowLayout->setContentsMargins(0, 0, 0, 0);
-    fpsRowLayout->addWidget(fpsLimit, 1);
-    fpsRowLayout->addWidget(fpsValue);
-    connect(fpsLimit, &QSlider::valueChanged, &dialog, [fpsValue](int value) {
-        fpsValue->setText(QString::number(value) + " FPS");
-    });
-
-    auto* fullscreen = new QCheckBox("Start in fullscreen", &dialog);
-    fullscreen->setChecked(m_fullscreen);
-    auto* showFps = new QCheckBox("Show performance HUD (VPS / FPS / Speed)", &dialog);
-    showFps->setChecked(m_showFps);
-    auto* msaa = new QComboBox(&dialog);
-    msaa->addItem("Off", 1);
-    msaa->addItem("4× MSAA", 4);
-    msaa->setCurrentIndex(msaa->findData(m_msaaSamples));
-    auto* anisotropy = new QComboBox(&dialog);
-    for (const int level : {1, 2, 4, 8, 16})
-        anisotropy->addItem(level == 1 ? "Off" : QString::number(level) + "×", level);
-    anisotropy->setCurrentIndex(anisotropy->findData(m_textureAnisotropy));
-
-    auto* postProcessing = new QCheckBox("Universal post-processing", &dialog);
-    postProcessing->setChecked(m_postProcessing);
-    auto* postPreset = new QComboBox(&dialog);
-    postPreset->addItem("Balanced — HPCOS Remaster", "balanced");
-    postPreset->addItem("Cinematic — MOH enhanced", "cinematic");
-    postPreset->addItem("Crisp / clean", "crisp");
-    postPreset->addItem("Custom", "custom");
-    postPreset->setCurrentIndex(comboIndexForData(postPreset, m_postPreset));
-
-    const auto makePostAmount = [&dialog](double value, double maximum = 1.0) {
-        auto* box = new QDoubleSpinBox(&dialog);
-        box->setDecimals(3);
-        box->setRange(0.0, maximum);
-        box->setSingleStep(0.01);
-        box->setValue(value);
-        return box;
+        if(!writeFrontendConfig(&error)) m_log->appendPlainText("[gekkoaot] graphics: "+error);
     };
-    auto* postSharpen = makePostAmount(m_postSharpen);
-    auto* postBloom = makePostAmount(m_postBloom);
-    auto* postVignette = makePostAmount(m_postVignette);
-    auto* postGrain = makePostAmount(m_postGrain, 0.25);
-    auto* postTone = makePostAmount(m_postTone);
-    auto* postLocalContrast = makePostAmount(m_postLocalContrast);
-    bool applyingPostPreset = false;
-    const auto applyPostPreset = [=, &applyingPostPreset](const QString& name) {
-        if (name == "custom")
-            return;
-        applyingPostPreset = true;
-        if (name == "cinematic") {
-            postSharpen->setValue(0.22); postBloom->setValue(0.18);
-            postVignette->setValue(0.10); postGrain->setValue(0.012);
-            postTone->setValue(0.32); postLocalContrast->setValue(0.12);
-        } else if (name == "crisp") {
-            postSharpen->setValue(0.42); postBloom->setValue(0.06);
-            postVignette->setValue(0.02); postGrain->setValue(0.0);
-            postTone->setValue(0.08); postLocalContrast->setValue(0.14);
-        } else {
-            postSharpen->setValue(0.28); postBloom->setValue(0.10);
-            postVignette->setValue(0.06); postGrain->setValue(0.0);
-            postTone->setValue(0.15); postLocalContrast->setValue(0.08);
-        }
-        applyingPostPreset = false;
-    };
-    connect(postPreset, &QComboBox::currentIndexChanged, &dialog, [=, &applyPostPreset](int) {
-        applyPostPreset(postPreset->currentData().toString());
-    });
-    const auto markPostCustom = [=, &applyingPostPreset](double) {
-        if (!applyingPostPreset)
-            postPreset->setCurrentIndex(postPreset->findData("custom"));
-    };
-    for (auto* amount : {postSharpen, postBloom, postVignette, postGrain, postTone, postLocalContrast})
-        connect(amount, qOverload<double>(&QDoubleSpinBox::valueChanged), &dialog, markPostCustom);
-
-    form->addRow("Backend", backend);
-    form->addRow("Internal resolution", resolution);
-    form->addRow("Aspect ratio", aspect);
-    form->addRow("Presentation cap (max FPS)", fpsRow);
-    form->addRow("Anti-aliasing", msaa);
-    form->addRow("Anisotropic filtering", anisotropy);
-    form->addRow(QString{}, postProcessing);
-    form->addRow("Post-processing preset", postPreset);
-    form->addRow("Sharpening", postSharpen);
-    form->addRow("Bloom", postBloom);
-    form->addRow("Vignette", postVignette);
-    form->addRow("Film grain", postGrain);
-    form->addRow("Filmic tone mapping", postTone);
-    form->addRow("Local contrast / light", postLocalContrast);
-    form->addRow(QString{}, fullscreen);
-    form->addRow(QString{}, showFps);
-    outer->addLayout(form);
-
-    auto* hint = mutedLabel(
-        displaySessionDescription() +
-            "\nThe presentation cap limits host output; it cannot make a game calculate extra frames. "
-            "AOT CPU execution stays uncapped while VI/timebase/DEC/DSP/AI remain on the "
-            "realtime 1.0x hardware clock. The HUD shows VPS, game-generated G-FPS, "
-            "presented FPS and timer Speed. "
-            "4:3 preserves the original frame. Stretched to Window follows the window aspect live: "
-            "the GX projection is compensated for both perspective 3D and orthographic 2D, so resizing "
-            "the window adapts the image instead of simply fat-stretching it. "
-            "Universal post-processing runs after final XFB scanout for every title: Balanced uses the "
-            "HPCOS Remaster tuning, while Cinematic adds the stronger MOH-style filmic presentation. "
-            "Backend, resolution, anti-aliasing, anisotropic filtering and post-processing "
-            "apply on the next launch.",
-        &dialog);
-    hint->setWordWrap(true);
-    outer->addWidget(hint);
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    outer->addWidget(buttons);
-
-    if (dialog.exec() != QDialog::Accepted)
-    {
-        if (m_aspectMode != originalAspectMode)
-        {
-            m_aspectMode = originalAspectMode;
-            if (m_runtimeStarted)
-            {
-                QString error;
-                if (!writeFrontendConfig(&error))
-                    m_log->appendPlainText("[gekkoaot] live aspect restore failed: " + error + "\n");
-            }
-        }
-        return;
+    if(editGraphicsOptions(this,options,m_runtimeStarted,preview)==QDialog::Accepted) {
+        saveSettings();
+        statusBar()->showMessage("Graphics settings saved",2500);
     }
-
-    m_graphicsBackend = backend->currentData().toString();
-    m_resolution = resolution->currentData().toString();
-    m_aspectMode = aspect->currentData().toString();
-    m_windowSystem = "auto";
-    m_fullscreen = fullscreen->isChecked();
-    m_showFps = showFps->isChecked();
-    m_frameInterpolation = false;
-    m_fpsLimit = fpsLimit->value();
-    m_msaaSamples = msaa->currentData().toInt();
-    m_textureAnisotropy = anisotropy->currentData().toInt();
-    m_postProcessing = postProcessing->isChecked();
-    m_postPreset = postPreset->currentData().toString();
-    m_postSharpen = postSharpen->value();
-    m_postBloom = postBloom->value();
-    m_postVignette = postVignette->value();
-    m_postGrain = postGrain->value();
-    m_postTone = postTone->value();
-    m_postLocalContrast = postLocalContrast->value();
-    if (g_perfHud)
-        g_perfHud->setVisible(m_showFps && m_runtimeStarted);
-    saveSettings();
-
-    QString error;
-    if (!writeFrontendConfig(&error))
-    {
-        m_log->appendPlainText("[gekkoaot] " + error + "\n");
-        setAdvancedVisible(true);
-        setLogVisible(true);
-        return;
-    }
-    statusBar()->showMessage("Graphics settings saved", 2500);
 }
 
 void MainWindow::showInputConfig()
 {
-    QDialog dialog(this);
-    dialog.setWindowTitle("Input Manager — SDL3 native mapping");
-    dialog.setModal(true);
-    dialog.resize(900, 720);
-
     const QString profileFile = QDir(frontendUserDir()).filePath("input.ini");
-    QVector<InputPortProfile> profiles = loadInputProfiles(profileFile);
-    const QStringList detectedDevices = detectHostInputDevices();
-
-    auto* outer = new QVBoxLayout(&dialog);
-    auto* hint = mutedLabel(
-        "Native SDL3 input. Auto combines the keyboard with the first matching gamepad/joystick. "
-        "Keyboard, Gamepad and Joystick can be forced per port. Device match is optional and may "
-        "contain any part of the device name; leaving it empty accepts any device.",
-        &dialog);
-    hint->setWordWrap(true);
-    outer->addWidget(hint);
-
-    struct DigitalWidgets
-    {
-        QKeySequenceEdit* key = nullptr;
-        QComboBox* button = nullptr;
-        QSpinBox* joystick = nullptr;
-    };
-    struct AxisWidgets
-    {
-        QKeySequenceEdit* negative = nullptr;
-        QKeySequenceEdit* positive = nullptr;
-        QComboBox* axis = nullptr;
-        QSpinBox* joystick = nullptr;
-        QCheckBox* invert = nullptr;
-        QSpinBox* deadzone = nullptr;
-    };
-    struct TriggerWidgets
-    {
-        QKeySequenceEdit* key = nullptr;
-        QComboBox* axis = nullptr;
-        QSpinBox* joystick = nullptr;
-    };
-    struct PortWidgets
-    {
-        QComboBox* source = nullptr;
-        QComboBox* device = nullptr;
-        QMap<QString, DigitalWidgets> digital;
-        QMap<QString, AxisWidgets> axes;
-        QMap<QString, TriggerWidgets> triggers;
-    };
-
-    const QList<QPair<QString, QString>> digitalControls = {
-        {"A", "a"}, {"B", "b"}, {"X", "x"}, {"Y", "y"}, {"Start", "start"},
-        {"Z", "z"}, {"L digital", "l"}, {"R digital", "r"},
-        {"D-Pad Up", "dpad_up"}, {"D-Pad Down", "dpad_down"},
-        {"D-Pad Left", "dpad_left"}, {"D-Pad Right", "dpad_right"},
-    };
-    const QList<QPair<QString, QString>> gamepadButtons = {
-        {"None", ""}, {"South / A", "south"}, {"East / B", "east"},
-        {"West / X", "west"}, {"North / Y", "north"}, {"Start", "start"},
-        {"Back", "back"}, {"Guide", "guide"}, {"Left Shoulder", "left_shoulder"},
-        {"Right Shoulder", "right_shoulder"}, {"Left Stick", "left_stick"},
-        {"Right Stick", "right_stick"}, {"D-Pad Up", "dpad_up"},
-        {"D-Pad Down", "dpad_down"}, {"D-Pad Left", "dpad_left"},
-        {"D-Pad Right", "dpad_right"},
-    };
-    const QList<QPair<QString, QString>> axes = {
-        {"None", ""}, {"Left X", "leftx"}, {"Left Y", "lefty"},
-        {"Right X", "rightx"}, {"Right Y", "righty"},
-        {"Left Trigger", "left_trigger"}, {"Right Trigger", "right_trigger"},
-    };
-    const QList<QPair<QString, QString>> axisControls = {
-        {"Main Stick X", "main_x"}, {"Main Stick Y", "main_y"},
-        {"C-Stick X", "c_x"}, {"C-Stick Y", "c_y"},
-    };
-    const QList<QPair<QString, QString>> triggerControls = {
-        {"L analog", "l_analog"}, {"R analog", "r_analog"},
-    };
-
-    const auto setComboData = [](QComboBox* combo, const QString& value) {
-        const int index = combo->findData(value);
-        if (index >= 0)
-            combo->setCurrentIndex(index);
-    };
-    const auto sequence = [](const QString& value) {
-        return QKeySequence::fromString(value, QKeySequence::PortableText);
-    };
-
-    auto* tabs = new QTabWidget(&dialog);
-    QVector<PortWidgets> widgets(4);
-
-    const auto loadWidgets = [&](int port, const InputPortProfile& profile) {
-        PortWidgets& w = widgets[port];
-        setComboData(w.source, profile.source);
-        w.device->setCurrentText(profile.device);
-        for (const auto& control : digitalControls)
-        {
-            auto& d = w.digital[control.second];
-            d.key->setKeySequence(sequence(profile.values.value(control.second + "_key")));
-            setComboData(d.button, profile.values.value(control.second + "_button"));
-            d.joystick->setValue(profile.values.value(control.second + "_joy_button", "-1").toInt());
-        }
-        for (const auto& control : axisControls)
-        {
-            auto& a = w.axes[control.second];
-            a.negative->setKeySequence(sequence(profile.values.value(control.second + "_negative_key")));
-            a.positive->setKeySequence(sequence(profile.values.value(control.second + "_positive_key")));
-            setComboData(a.axis, profile.values.value(control.second + "_axis"));
-            a.joystick->setValue(profile.values.value(control.second + "_joy_axis", "-1").toInt());
-            a.invert->setChecked(profile.values.value(control.second + "_invert") == "true");
-            a.deadzone->setValue(profile.values.value(control.second + "_deadzone", "4096").toInt());
-        }
-        for (const auto& control : triggerControls)
-        {
-            auto& t = w.triggers[control.second];
-            t.key->setKeySequence(sequence(profile.values.value(control.second + "_key")));
-            setComboData(t.axis, profile.values.value(control.second + "_axis"));
-            t.joystick->setValue(profile.values.value(control.second + "_joy_axis", "-1").toInt());
-        }
-    };
-
-    for (int port = 0; port < 4; ++port)
-    {
-        auto* scroll = new QScrollArea(tabs);
-        scroll->setWidgetResizable(true);
-        auto* page = new QWidget(scroll);
-        auto* pageLayout = new QVBoxLayout(page);
-        PortWidgets& w = widgets[port];
-
-        auto* deviceBox = new QGroupBox("Device", page);
-        auto* deviceForm = new QFormLayout(deviceBox);
-        w.source = new QComboBox(deviceBox);
-        w.source->addItem("Auto — keyboard + first compatible device", "auto");
-        w.source->addItem("Keyboard only", "keyboard");
-        w.source->addItem("Gamepad only", "gamepad");
-        w.source->addItem("Generic joystick only", "joystick");
-        w.source->addItem("Disabled", "disabled");
-        deviceForm->addRow("Source", w.source);
-        w.device = new QComboBox(deviceBox);
-        w.device->setEditable(true);
-        w.device->addItem("", "");
-        for (const QString& device : detectedDevices)
-            w.device->addItem(device, device);
-        w.device->lineEdit()->setPlaceholderText("Any device (or type a name substring)");
-        deviceForm->addRow("Device match", w.device);
-        auto* deviceNote = mutedLabel(
-            detectedDevices.isEmpty()
-                ? "No host device names were discovered by the GUI. Auto/Any still works because SDL3 performs runtime detection."
-                : QString("Detected by host: %1").arg(detectedDevices.join(", ")),
-            deviceBox);
-        deviceNote->setWordWrap(true);
-        deviceForm->addRow(deviceNote);
-        pageLayout->addWidget(deviceBox);
-
-        auto* digitalBox = new QGroupBox("Buttons", page);
-        auto* digitalGrid = new QGridLayout(digitalBox);
-        digitalGrid->addWidget(new QLabel("GameCube"), 0, 0);
-        digitalGrid->addWidget(new QLabel("Keyboard"), 0, 1);
-        digitalGrid->addWidget(new QLabel("SDL gamepad"), 0, 2);
-        digitalGrid->addWidget(new QLabel("Joystick button"), 0, 3);
-        int row = 1;
-        for (const auto& control : digitalControls)
-        {
-            DigitalWidgets d;
-            d.key = new QKeySequenceEdit(digitalBox);
-            d.key->setMaximumSequenceLength(1);
-            d.button = new QComboBox(digitalBox);
-            for (const auto& button : gamepadButtons)
-                d.button->addItem(button.first, button.second);
-            d.joystick = new QSpinBox(digitalBox);
-            d.joystick->setRange(-1, 63);
-            d.joystick->setSpecialValueText("None");
-            digitalGrid->addWidget(new QLabel(control.first, digitalBox), row, 0);
-            digitalGrid->addWidget(d.key, row, 1);
-            digitalGrid->addWidget(d.button, row, 2);
-            digitalGrid->addWidget(d.joystick, row, 3);
-            w.digital.insert(control.second, d);
-            ++row;
-        }
-        pageLayout->addWidget(digitalBox);
-
-        auto* analogBox = new QGroupBox("Analog sticks", page);
-        auto* analogGrid = new QGridLayout(analogBox);
-        analogGrid->addWidget(new QLabel("Axis"), 0, 0);
-        analogGrid->addWidget(new QLabel("Keyboard -"), 0, 1);
-        analogGrid->addWidget(new QLabel("Keyboard +"), 0, 2);
-        analogGrid->addWidget(new QLabel("SDL axis"), 0, 3);
-        analogGrid->addWidget(new QLabel("Joy axis"), 0, 4);
-        analogGrid->addWidget(new QLabel("Invert"), 0, 5);
-        analogGrid->addWidget(new QLabel("Deadzone"), 0, 6);
-        row = 1;
-        for (const auto& control : axisControls)
-        {
-            AxisWidgets a;
-            a.negative = new QKeySequenceEdit(analogBox);
-            a.positive = new QKeySequenceEdit(analogBox);
-            a.negative->setMaximumSequenceLength(1);
-            a.positive->setMaximumSequenceLength(1);
-            a.axis = new QComboBox(analogBox);
-            for (const auto& axis : axes)
-                a.axis->addItem(axis.first, axis.second);
-            a.joystick = new QSpinBox(analogBox);
-            a.joystick->setRange(-1, 31);
-            a.joystick->setSpecialValueText("None");
-            a.invert = new QCheckBox(analogBox);
-            a.deadzone = new QSpinBox(analogBox);
-            a.deadzone->setRange(0, 30000);
-            a.deadzone->setSingleStep(512);
-            analogGrid->addWidget(new QLabel(control.first, analogBox), row, 0);
-            analogGrid->addWidget(a.negative, row, 1);
-            analogGrid->addWidget(a.positive, row, 2);
-            analogGrid->addWidget(a.axis, row, 3);
-            analogGrid->addWidget(a.joystick, row, 4);
-            analogGrid->addWidget(a.invert, row, 5, Qt::AlignCenter);
-            analogGrid->addWidget(a.deadzone, row, 6);
-            w.axes.insert(control.second, a);
-            ++row;
-        }
-        pageLayout->addWidget(analogBox);
-
-        auto* triggerBox = new QGroupBox("Analog triggers", page);
-        auto* triggerGrid = new QGridLayout(triggerBox);
-        triggerGrid->addWidget(new QLabel("Trigger"), 0, 0);
-        triggerGrid->addWidget(new QLabel("Keyboard"), 0, 1);
-        triggerGrid->addWidget(new QLabel("SDL axis"), 0, 2);
-        triggerGrid->addWidget(new QLabel("Joy axis"), 0, 3);
-        row = 1;
-        for (const auto& control : triggerControls)
-        {
-            TriggerWidgets t;
-            t.key = new QKeySequenceEdit(triggerBox);
-            t.key->setMaximumSequenceLength(1);
-            t.axis = new QComboBox(triggerBox);
-            for (const auto& axis : axes)
-                t.axis->addItem(axis.first, axis.second);
-            t.joystick = new QSpinBox(triggerBox);
-            t.joystick->setRange(-1, 31);
-            t.joystick->setSpecialValueText("None");
-            triggerGrid->addWidget(new QLabel(control.first, triggerBox), row, 0);
-            triggerGrid->addWidget(t.key, row, 1);
-            triggerGrid->addWidget(t.axis, row, 2);
-            triggerGrid->addWidget(t.joystick, row, 3);
-            w.triggers.insert(control.second, t);
-            ++row;
-        }
-        pageLayout->addWidget(triggerBox);
-
-        auto* reset = new QPushButton("Reset this port to defaults", page);
-        connect(reset, &QPushButton::clicked, &dialog, [&, port] {
-            profiles[port] = defaultInputPortProfile(port);
-            loadWidgets(port, profiles[port]);
-        });
-        pageLayout->addWidget(reset, 0, Qt::AlignLeft);
-        pageLayout->addStretch();
-        scroll->setWidget(page);
-        tabs->addTab(scroll, QString("Port %1").arg(port + 1));
-        loadWidgets(port, profiles[port]);
-    }
-    outer->addWidget(tabs, 1);
-
-    auto* footer = mutedLabel(
-        "The runtime still uses SDL3 for hotplug, standardized gamepad mappings, generic joystick fallback and rumble. "
-        "The GUI only stores portable bindings; you never need to type SDL/0/... identifiers.",
-        &dialog);
-    footer->setWordWrap(true);
-    outer->addWidget(footer);
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    outer->addWidget(buttons);
-
-    if (dialog.exec() != QDialog::Accepted)
+    auto profiles = loadInputProfiles(profileFile);
+    if (editInputProfiles(this, profiles, detectHostInputDevices()) != QDialog::Accepted)
         return;
-
-    for (int port = 0; port < 4; ++port)
-    {
-        PortWidgets& w = widgets[port];
-        InputPortProfile profile;
-        profile.source = w.source->currentData().toString();
-        profile.device = w.device->currentText().trimmed();
-        for (const auto& control : digitalControls)
-        {
-            const auto d = w.digital.value(control.second);
-            profile.values[control.second + "_key"] =
-                d.key->keySequence().toString(QKeySequence::PortableText);
-            profile.values[control.second + "_button"] = d.button->currentData().toString();
-            profile.values[control.second + "_joy_button"] = QString::number(d.joystick->value());
-        }
-        for (const auto& control : axisControls)
-        {
-            const auto a = w.axes.value(control.second);
-            profile.values[control.second + "_negative_key"] =
-                a.negative->keySequence().toString(QKeySequence::PortableText);
-            profile.values[control.second + "_positive_key"] =
-                a.positive->keySequence().toString(QKeySequence::PortableText);
-            profile.values[control.second + "_axis"] = a.axis->currentData().toString();
-            profile.values[control.second + "_joy_axis"] = QString::number(a.joystick->value());
-            profile.values[control.second + "_invert"] = a.invert->isChecked() ? "true" : "false";
-            profile.values[control.second + "_deadzone"] = QString::number(a.deadzone->value());
-        }
-        for (const auto& control : triggerControls)
-        {
-            const auto t = w.triggers.value(control.second);
-            profile.values[control.second + "_key"] =
-                t.key->keySequence().toString(QKeySequence::PortableText);
-            profile.values[control.second + "_axis"] = t.axis->currentData().toString();
-            profile.values[control.second + "_joy_axis"] = QString::number(t.joystick->value());
-        }
-        profiles[port] = profile;
-    }
 
     QString error;
     if (!saveInputProfiles(profileFile, profiles, &error))
@@ -2131,14 +1956,19 @@ void MainWindow::showInputConfig()
     statusBar()->showMessage("Native input profile saved — hotplug and auto-detection enabled", 3000);
 }
 
-BuildRequest MainWindow::requestFor(const QString& action) const
+BuildRequest MainWindow::requestFor(const QString& action, const QString& path) const
 {
+    const QString source = path.isEmpty() ? m_isoPath : path;
     BuildRequest request;
     request.action = action;
-    request.isoPath = m_isoPath;
-    request.gameSlug = slugForPath(m_isoPath);
+    request.isoPath = source;
+    request.gameSlug = slugForPath(source);
     request.backend = m_backend->currentData().toString();
     request.graphicsBackend = m_graphicsBackend;
+    request.graphics = m_graphicsExtras;
+    const QSize renderReference = screen()->size() * screen()->devicePixelRatio();
+    request.graphics.render_width = renderReference.width();
+    request.graphics.render_height = renderReference.height();
     request.profile = m_profile->currentData().toString();
     request.toolchain = m_toolchain->currentData().toString();
     request.llvmDir = m_llvmDir->text().trimmed();
@@ -2148,12 +1978,12 @@ BuildRequest MainWindow::requestFor(const QString& action) const
     request.runtimeWorkers = m_runtimeWorkers->currentData().toString();
     request.jobs = m_jobs->value();
     request.runArgs = m_runArgs->text().trimmed();
-    request.userDir = frontendUserDir();
+    request.userDir = QDir(runtimeStateRoot()).filePath("user/" + request.gameSlug);
     request.aspectMode = m_aspectMode;
     request.resolution = m_resolution;
-    request.fullscreen = m_fullscreen;
+    request.fullscreen = m_fullscreen || m_returnToTV;
     request.fpsLimit = m_fpsLimit;
-    request.frameInterpolation = false;
+    request.frameInterpolation = m_frameInterpolation;
     request.msaaSamples = m_msaaSamples;
     request.textureAnisotropy = m_textureAnisotropy;
     request.postProcessing = m_postProcessing;
@@ -2165,8 +1995,18 @@ BuildRequest MainWindow::requestFor(const QString& action) const
     request.postTone = m_postTone;
     request.postLocalContrast = m_postLocalContrast;
     request.uiScale = QString::number(effectiveDisplayScale(), 'f', 3);
-    request.inputConfig = QDir(frontendUserDir()).filePath("input.ini");
-    request.gameEnvironment = gameEnhancementEnvironment();
+    request.inputConfig = QDir(request.userDir).filePath("input.ini");
+    request.persistentShell = true;
+    // Keep one render surface alive across Desktop, TV, Home and fullscreen.
+    QWidget* renderTarget=m_desktopGameViewport;
+    request.gameEnvironment = gameEnhancementEnvironment(source);
+    const QString iconPath=QDir(request.userDir).filePath("window-icon.bmp");
+    QDir().mkpath(request.userDir);
+    QImage banner=decodeGameCubeBanner([&]{QFile file(discMetadataCachePath(runtimeStateRoot(),source)+"/meta/opening.bnr");return file.open(QIODevice::ReadOnly)?file.readAll():QByteArray{};}());
+    QSettings appearance("GekkoAOT","GekkoAOT");
+    const auto icon=appearance.value("ui/gameAppIcon",true).toBool()?shellGameIcon(banner):shellProjectIcon();
+    if(icon.pixmap(128,128).toImage().convertToFormat(QImage::Format_RGB32).save(iconPath,"BMP"))request.gameEnvironment.insert("GEKKOAOT_WINDOW_ICON",iconPath);
+
 
     // Cross-process native child embedding exists on X11, not Wayland. On a
     // normal GNOME/KDE Wayland desktop DISPLAY points at XWayland, and main.cpp
@@ -2179,7 +2019,7 @@ BuildRequest MainWindow::requestFor(const QString& action) const
     if (canEmbedX11)
     {
         request.windowSystem = "x11";
-        request.embedWindow = QString::number(static_cast<qulonglong>(m_gameViewport->winId()));
+        request.embedWindow = QString::number(static_cast<qulonglong>(renderTarget->winId()));
     }
     else if (qEnvironmentVariable("XDG_SESSION_TYPE").compare("wayland", Qt::CaseInsensitive) == 0)
     {
@@ -2188,15 +2028,30 @@ BuildRequest MainWindow::requestFor(const QString& action) const
     }
     else
     {
-        request.windowSystem = "x11";
+#ifdef Q_OS_WIN
+        request.windowSystem = "windows";
+        request.embedWindow = QString::number(static_cast<qulonglong>(renderTarget->winId()));
+#else
+        request.windowSystem = "auto";
         request.embedWindow.clear();
+#endif
     }
+    if (request.persistentShell && !request.embedWindow.isEmpty()) request.fullscreen = false;
     return request;
 }
 
 void MainWindow::launchAction(const QString& action)
 {
     saveSettings();
+    if (action == "compile") {
+        auto paths = m_library->selectedPaths();
+        if (paths.isEmpty() && !m_isoPath.isEmpty()) paths << m_isoPath;
+        enqueueCompilations(paths);
+        return;
+    }
+    if (m_controller.isRunning()) return;
+    if ((action == "clean" || action == "tools") &&
+        (m_compilations.activeCount() || m_compilations.pendingCount())) return;
 
     if (action != "tools" && action != "clean" &&
         (!QFileInfo::exists(m_isoPath) || !looksLikeDiscImage(m_isoPath)))
@@ -2227,6 +2082,7 @@ void MainWindow::launchAction(const QString& action)
         }
     }
 
+    if(action=="run"||action=="pgo"){m_runtimeOnDesktop=!m_returnToTV;m_gameWindow->setWindowTitle(gameTitleForPath(m_isoPath));}
     m_activeAction = action;
     m_runtimeStarted = false;
     m_stopRequested = false;
@@ -2252,7 +2108,33 @@ void MainWindow::launchAction(const QString& action)
     else if (action == "clean")
         showLoader("GekkoAOT", "Cleaning cache…", 25);
 
-    m_controller.run(requestFor(action));
+    const auto request = requestFor(action);
+    if (action == "run" || action == "pgo")
+        m_compilations.trackForeground(&m_controller, request, gameTitle,
+            m_library->metadata(m_isoPath)["gameId"].toString());
+    m_controller.run(request);
+}
+
+void MainWindow::enqueueCompilations(const QStringList& paths)
+{
+    saveSettings();
+    if (m_controller.isRunning() && (m_activeAction == "clean" || m_activeAction == "tools")) {
+        statusBar()->showMessage("Wait for engine maintenance to finish", 4000);
+        return;
+    }
+    int count = 0;
+    for (const auto& path : paths) {
+        if (!QFileInfo(path).isFile() || !looksLikeDiscImage(path)) continue;
+        m_library->addGame(path);
+        const auto metadata = m_library->metadata(path);
+        m_compilations.enqueue(requestFor("compile", path),
+            metadata["title"].toString(gameTitleForPath(path)), metadata["gameId"].toString());
+        ++count;
+    }
+    if (count) {
+        if (!m_returnToTV && !shellActiveDialog(this)) showCompilations();
+        statusBar()->showMessage(QString("%1 game(s) added to compilations").arg(count), 4000);
+    }
 }
 
 void MainWindow::setAdvancedVisible(bool visible)
@@ -2261,6 +2143,7 @@ void MainWindow::setAdvancedVisible(bool visible)
         return;
     if (visible)
     {
+        presentShellDialog(*m_advancedDialog,"Advanced",m_shellVisible);
         m_advancedDialog->show();
         m_advancedDialog->raise();
         m_advancedDialog->activateWindow();
@@ -2284,106 +2167,237 @@ void MainWindow::setLogVisible(bool visible)
 
 void MainWindow::toggleGameViewFullscreen()
 {
-    // The window manager is the source of truth. This intentionally does not
-    // trust m_gameViewFullscreen: fullscreen transitions are asynchronous on
-    // Wayland/XWayland and the cached flag can lag one key press behind.
-    setGameViewFullscreen(!isFullScreen());
+    if(m_runtimeStarted) {
+        // A fullscreen desktop launcher must always have a way back too.
+        if(m_runtimeOnDesktop && !m_shellVisible && isActiveWindow() && isFullScreen()) {restoreDesktopLauncher();return;}
+        setGameViewFullscreen(m_shellVisible?false:!m_gameWindow->isFullScreen());
+    } else setGameViewFullscreen(!isFullScreen());
+}
+
+void MainWindow::enterTVMode()
+{
+    if(m_runtimeStarted && m_runtimeEmbedded) {
+        m_runtimeOnDesktop=false;
+        m_gameWindow->showFullScreen();
+    }
+    openLivingRoom();
+}
+
+void MainWindow::openLivingRoom()
+{
+    m_returnToTV = true;
+    centralWidget()->layout()->setContentsMargins(0,0,0,0);centralWidget()->layout()->setSpacing(0);
+    if (!m_shellVisible) {
+        m_restoreDockAfterTV = m_compilationDock->isVisible();
+        m_shellPausedGame = false;
+        if (m_runtimeStarted && !m_paused) {
+            m_pauseAction->trigger();
+            m_shellPausedGame = m_paused;
+        }
+    }
+    m_shellVisible = true;
+    setProperty("tvMode",true);
+    m_hiddenForGame = false;
+    m_livingRoom->setGameRunning(m_runtimeStarted, m_isoPath);
+    if (m_runtimeStarted) m_livingRoom->setCurrentGame(m_isoPath);
+    m_viewStack->setCurrentWidget(m_livingRoom);
+    m_compileDialog->hide();
+    m_advancedDialog->hide();
+    m_compilationDock->hide();
+    menuBar()->hide(); m_mainToolbar->hide(); statusBar()->hide();
+    if (!isFullScreen()) {
+        m_wasMaximizedBeforeGameFullscreen = isMaximized();
+        setWindowState(windowState() | Qt::WindowFullScreen);
+        showFullScreen();
+    } else show();
+    raise(); activateWindow();
+    m_livingRoom->setFocus(Qt::ShortcutFocusReason);shellRevealSnapshot(m_livingRoom);
+    m_gameViewFullscreen = true;
+    m_fullscreenAction->setChecked(true);
+    QTimer::singleShot(0, this, [this] { updateShellInput(); });
+    refreshDiscordPresence();
+}
+
+void MainWindow::toggleHomeMenu()
+{
+    if(auto* panel=shellActiveDialog(this)){panel->reject();return;}
+    if (m_shellVisible && m_runtimeStarted) dismissLivingRoom(m_shellPausedGame);
+    else if (m_shellVisible) m_livingRoom->openSettings();
+    else openLivingRoom();
+}
+
+void MainWindow::dismissLivingRoom(bool resume)
+{
+    if (resume && m_runtimeStarted && m_paused) m_pauseAction->trigger();
+    // A failed pause/resume write leaves the menu visible instead of hiding a
+    // game that the host could not resume.
+    if (resume && m_runtimeStarted && m_paused) return;
+    m_shellPausedGame = false;
+    m_shellVisible = false;
+    if(m_runtimeStarted && m_runtimeEmbedded) {
+        if(m_runtimeOnDesktop) {
+            restoreDesktopLauncher();
+            m_viewStack->setCurrentWidget(m_library);
+        }
+        m_gameWindow->show();m_gameWindow->raise();m_gameWindow->activateWindow();m_desktopGameViewport->setFocus();
+    } else {
+        m_viewStack->setCurrentWidget(m_library);
+        if(m_runtimeStarted && m_returnToTV) {m_hiddenForGame=true;hide();}
+    }
+    updateShellInput();
+}
+
+void MainWindow::restoreDesktopLauncher()
+{
+    m_returnToTV = false;
+    m_shellVisible = false;
+    m_hiddenForGame = false;
+    setProperty("tvMode", false);
+    centralWidget()->layout()->setContentsMargins(16,14,16,8);
+    centralWidget()->layout()->setSpacing(12);
+    if (m_wasMaximizedBeforeGameFullscreen) showMaximized(); else showNormal();
+    menuBar()->hide();
+    m_mainToolbar->show();
+    statusBar()->hide();
+    refreshDiscordPresence();
 }
 
 void MainWindow::setGameViewFullscreen(bool fullscreen)
 {
-    const bool actualFullscreen = isFullScreen();
-    if (actualFullscreen == fullscreen)
-    {
-        m_gameViewFullscreen = actualFullscreen;
-        if (m_fullscreenAction && m_fullscreenAction->isChecked() != actualFullscreen)
-        {
-            const QSignalBlocker blocker(m_fullscreenAction);
-            m_fullscreenAction->setChecked(actualFullscreen);
+    if(m_runtimeStarted && m_runtimeEmbedded) {
+        if(!fullscreen && (!m_runtimeOnDesktop || m_shellVisible)) {
+            // Leaving TV restores the library and detaches presentation only;
+            // SDL/Vulkan keep their original native window and running game.
+            if(m_shellPausedGame && m_paused)m_pauseAction->trigger();
+            m_shellPausedGame=false;m_runtimeOnDesktop=true;
+            restoreDesktopLauncher();m_viewStack->setCurrentWidget(m_library);
         }
+        if(fullscreen)m_gameWindow->showFullScreen();else m_gameWindow->showNormal();
+        m_gameWindow->raise();m_gameWindow->activateWindow();m_desktopGameViewport->setFocus();
         return;
     }
-
-    if (fullscreen)
-    {
-        m_wasMaximizedBeforeGameFullscreen = isMaximized();
-        m_restoreAdvancedAfterGameFullscreen =
-            m_advancedDialog && m_advancedDialog->isVisible();
-
-        if (m_advancedDialog)
-            m_advancedDialog->hide();
-        menuBar()->hide();
-        if (m_mainToolbar)
-            m_mainToolbar->hide();
-        statusBar()->hide();
-
-        // Set the state explicitly as well as calling showFullScreen(). KDE's
-        // XWayland path can otherwise leave showNormal() unable to clear a
-        // fullscreen bit that arrived asynchronously from the compositor.
-        setWindowState(windowState() | Qt::WindowFullScreen);
+    if(fullscreen) {
+        if(!isFullScreen())m_wasMaximizedBeforeGameFullscreen=isMaximized();
         showFullScreen();
+    } else {
+        m_viewStack->setCurrentWidget(m_library);restoreDesktopLauncher();
     }
-    else
-    {
-        setWindowState(windowState() & ~Qt::WindowFullScreen);
-        showNormal();
-        menuBar()->show();
-        if (m_mainToolbar)
-            m_mainToolbar->show();
-        statusBar()->show();
+    const QSignalBlocker blocker(m_fullscreenAction);
+    m_fullscreenAction->setChecked(fullscreen);updateShellInput();
+}
 
-        if (m_wasMaximizedBeforeGameFullscreen)
-            QTimer::singleShot(0, this, [this] { showMaximized(); });
-
-        if (m_restoreAdvancedAfterGameFullscreen)
-        {
-            m_restoreAdvancedAfterGameFullscreen = false;
-            QTimer::singleShot(0, this, [this] { setAdvancedVisible(true); });
-        }
-    }
-
-    // WindowStateChange is asynchronous. Re-sync once the compositor has
-    // processed the request, then focus the GameView/loader without affecting
-    // the background QProcess build.
-    QTimer::singleShot(0, this, [this, fullscreen] {
-        m_gameViewFullscreen = isFullScreen();
-        if (m_fullscreenAction && m_fullscreenAction->isChecked() != m_gameViewFullscreen)
-        {
-            const QSignalBlocker blocker(m_fullscreenAction);
-            m_fullscreenAction->setChecked(m_gameViewFullscreen);
-        }
-        if (fullscreen && isFullScreen())
-        {
-            if (m_runtimeStarted)
-                m_gameViewport->setFocus(Qt::ShortcutFocusReason);
-            else
-                m_loaderOverlay->setFocus(Qt::ShortcutFocusReason);
-        }
+void MainWindow::refreshLivingRoom()
+{
+    if (m_tvRefreshPending) return;
+    m_tvRefreshPending = true;
+    QTimer::singleShot(100, this, [this] {
+        m_tvRefreshPending = false;
+        m_livingRoom->setGames(m_library->entries());
     });
+}
+
+void MainWindow::updateShellInput()
+{
+    if (!m_shellGamepad) return;
+    QWidget* active=QApplication::activeWindow();
+    const bool launcherActive=active==this;
+    m_shellGamepad->setNavigationEnabled(launcherActive &&
+        (shellActiveDialog(this) || m_shellVisible || m_viewStack->currentWidget()==m_library));
+}
+
+void MainWindow::routeControllerKey(int key)
+{
+    auto owned=[this](QObject* object){for(auto* p=object;p;p=p->parent())if(p==this)return true;return false;};
+    if(auto* popup=QApplication::activePopupWidget();popup && owned(popup)) {
+        auto* focus=QApplication::focusWidget();
+        QWidget* target=focus && (focus==popup || popup->isAncestorOf(focus))?focus:popup;
+        QKeyEvent press(QEvent::KeyPress,key,Qt::NoModifier),release(QEvent::KeyRelease,key,Qt::NoModifier);
+        QApplication::sendEvent(target,&press);QApplication::sendEvent(target,&release);return;
+    }
+    if(auto* panel=shellActiveDialog(this)) {
+        if(key==Qt::Key_Escape){panel->reject();return;}
+        // Optional shortcuts remain conveniences; every tab is also a visible
+        // button reachable through normal directional navigation.
+        if(key==Qt::Key_PageUp || key==Qt::Key_PageDown) {
+            if(auto* tabs=panel->findChild<QTabWidget*>())tabs->setCurrentIndex((tabs->currentIndex()+(key==Qt::Key_PageDown?1:tabs->count()-1))%tabs->count());
+            return;
+        }
+        shellNavigate(panel,key);return;
+    }
+    if(!isActiveWindow())return;
+    if(m_shellVisible) {
+        if((key==Qt::Key_Return || key==Qt::Key_Enter))if(auto* edit=qobject_cast<QLineEdit*>(QApplication::focusWidget())){showShellKeyboard(edit);return;}
+        m_livingRoom->navigate(key);return;
+    }
+    if(m_viewStack->currentWidget()!=m_library)return;
+    auto* search=m_library->findChild<QLineEdit*>("librarySearch");
+    if(key==Qt::Key_Escape){if(isFullScreen())setGameViewFullscreen(false);else shellFocusControl(search);return;}
+    if(key==Qt::Key_PageUp){shellFocusControl(findChild<QToolButton*>("desktopMenu"));return;}
+    if(key==Qt::Key_PageDown){m_library->focusGames();return;}
+    if(m_library->navigateGames(key))return;
+    auto* focus=QApplication::focusWidget();
+    if(!focus || focus==this){shellFocusControl(search);return;}
+    auto* header=m_library->findChild<QWidget*>("libraryControls");
+    auto* import=m_library->findChild<QPushButton*>("libraryImportFolder");
+    if(focus==import){if(key==Qt::Key_Up)shellFocusControl(findChild<QToolButton*>("desktopMenu"));else shellFocusControl(search);return;}
+    if(focus==search || header->isAncestorOf(focus)) {
+        if(key==Qt::Key_Right){shellFocusControl(import);return;}
+        if(key==Qt::Key_Up){shellFocusControl(findChild<QToolButton*>("desktopMenu"));return;}
+        if(key==Qt::Key_Down){m_library->focusGames(true);return;}
+        shellNavigate(header,key);return;
+    }
+    if(m_mainToolbar->isAncestorOf(focus)) {
+        if(key==Qt::Key_Down){shellFocusControl(search);return;}
+        shellNavigate(m_mainToolbar,key);return;
+    }
+    shellNavigate(m_library,key);
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    if(event->type()==QEvent::KeyPress && shellActiveDialog(this)) {
+        auto* key=static_cast<QKeyEvent*>(event);
+        if(key->key()==Qt::Key_Tab || key->key()==Qt::Key_Backtab){routeControllerKey(key->key());return true;}
+    }
+
+    if(watched==m_mainToolbar && event->type()==QEvent::Resize) {
+        const bool compact=m_mainToolbar->width()<740;
+        if(auto* brand=findChild<QLabel*>("desktopBrand"))brand->setVisible(!compact);
+    }
+
+    if (m_shellVisible && event->type() == QEvent::KeyPress) {
+        auto* target = qobject_cast<QWidget*>(watched);
+        auto* key = static_cast<QKeyEvent*>(event);
+        if (target && target->window() == this && (target == m_livingRoom || m_livingRoom->isAncestorOf(target))) {
+            const int code = key->key();
+            if (!(qobject_cast<QLineEdit*>(target) && (code == Qt::Key_Left || code == Qt::Key_Right)) &&
+                (code == Qt::Key_Left || code == Qt::Key_Right || code == Qt::Key_Up || code == Qt::Key_Down ||
+                 code == Qt::Key_Return || code == Qt::Key_Enter || code == Qt::Key_Escape)) {
+                m_livingRoom->navigate(code); return true;
+            }
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
 }
 
 void MainWindow::changeEvent(QEvent* event)
 {
     QMainWindow::changeEvent(event);
-    if (!event || event->type() != QEvent::WindowStateChange)
-        return;
-
+    if (!event) return;
+    if (event->type() == QEvent::ActivationChange) { updateShellInput(); return; }
+    if (event->type() != QEvent::WindowStateChange) return;
     m_gameViewFullscreen = isFullScreen();
-    if (m_fullscreenAction && m_fullscreenAction->isChecked() != m_gameViewFullscreen)
-    {
+    if (m_fullscreenAction) {
         const QSignalBlocker blocker(m_fullscreenAction);
         m_fullscreenAction->setChecked(m_gameViewFullscreen);
     }
-
-    // Also restore chrome if fullscreen was cleared by the WM rather than by
-    // our own shortcut (for example KDE's fullscreen action).
-    if (!m_gameViewFullscreen)
-    {
-        menuBar()->show();
-        if (m_mainToolbar)
-            m_mainToolbar->show();
-        statusBar()->show();
+    // Window-manager state changes can arrive after a requested transition.
+    // They must not replace the logical TV view or discard an open overlay.
+    if (!m_gameViewFullscreen && !m_shellVisible) {
+        menuBar()->hide(); if (m_mainToolbar) m_mainToolbar->show(); statusBar()->hide();
+        updateShellInput();
     }
+
 }
 
 void MainWindow::showLoader(const QString& title, const QString& status, int progress)
@@ -2401,28 +2415,50 @@ void MainWindow::showLoader(const QString& title, const QString& status, int pro
     // Clear first so a shorter status cannot retain pixels from the previous
     // one on some XWayland/Qt backing-store combinations.
     m_loaderStatus->clear();
-    m_loaderStatus->setText(status);
+    m_loaderStatus->setText(buildProgressLabel(status));
     m_loaderHint->setText("Build runs in the background · Advanced → Show Log");
     m_progress->setRange(0, 100);
     m_progress->setValue(progress);
     m_progress->setFormat(QString::number(progress) + "%");
-    m_loaderOverlay->show();
-    m_loaderOverlay->raise();
-    m_viewStack->setCurrentWidget(m_loaderOverlay);
-    m_loaderOverlay->update();
+    if (m_shellVisible) {
+        m_livingRoom->setBuildStatus(status, progress);
+        return;
+    }
+    m_compileDialog->hide();
+    if(!m_controller.isRunning() && !shellActiveDialog(this))showCompilations();
+
 }
 
 void MainWindow::showGameViewport()
 {
     m_progress->setValue(100);
+    m_compileDialog->hide();
+    if(auto* queue=findChild<QDialog*>("compilationQueuePanel"))queue->close();
     m_loaderOverlay->hide();
-    m_gameViewport->show();
-    m_gameViewport->setFocus(Qt::OtherFocusReason);
-    m_viewStack->setCurrentWidget(m_gameViewport);
+    if(m_runtimeEmbedded) {
+        const bool reveal=!m_runtimeStarted && QStringList{"xcb","windows","cocoa"}.contains(QGuiApplication::platformName()) && !QSettings("GekkoAOT","GekkoAOT").value("ui/reducedMotion",false).toBool();
+        if(reveal)m_gameWindow->setWindowOpacity(.08);
+        m_viewStack->setCurrentWidget(m_returnToTV?static_cast<QWidget*>(m_livingRoom):static_cast<QWidget*>(m_library));
+        if(m_returnToTV || m_fullscreen)m_gameWindow->showFullScreen();else m_gameWindow->showNormal();
+        m_gameWindow->raise();m_gameWindow->activateWindow();m_desktopGameViewport->setFocus();
+        if(reveal){auto* motion=new QPropertyAnimation(m_gameWindow,"windowOpacity",m_gameWindow);motion->setObjectName("gameLaunchMotion");motion->setDuration(320);motion->setStartValue(.08);motion->setEndValue(1.0);motion->setEasingCurve(QEasingCurve::OutCubic);motion->start(QAbstractAnimation::DeleteWhenStopped);}
+    } else m_viewStack->setCurrentWidget(m_library);
+    if (!m_runtimeStarted) {
+        m_discordGameStart = QDateTime::currentSecsSinceEpoch();
+        m_playSeconds = 0; m_playClock.start();
+        m_library->recordLaunch(m_isoPath);
+    }
     m_runtimeStarted = true;
+    refreshDiscordPresence();
+    updateApplicationIcon();
+    updateShellInput();
+    m_livingRoom->setGameRunning(true, m_isoPath);
+    m_livingRoom->setBuildStatus({});
+    m_pauseAction->setEnabled(true);
+    if (m_returnToTV) dismissLivingRoom(false);
     if (g_perfHud)
     {
-        g_perfHud->setVisible(m_showFps);
+        g_perfHud->setVisible(m_showFps && m_runtimeEmbedded);
         g_perfHud->raise();
     }
 }
@@ -2431,6 +2467,7 @@ void MainWindow::showIdleViewport(const QString& message)
 {
     if (g_perfHud)
         g_perfHud->hide();
+    updateApplicationIcon();
     updateLoaderBanner();
     const QFileInfo info(m_isoPath);
     m_loaderTitle->setText(info.isFile() ? gameTitleForPath(m_isoPath) : QStringLiteral("GekkoAOT"));
@@ -2447,9 +2484,8 @@ void MainWindow::showIdleViewport(const QString& message)
     m_progress->setRange(0, 100);
     m_progress->setValue(0);
     m_progress->setFormat("0%");
-    m_loaderOverlay->show();
-    m_loaderOverlay->raise();
-    m_viewStack->setCurrentWidget(m_loaderOverlay);
+    m_compileDialog->hide();
+    m_viewStack->setCurrentWidget(m_shellVisible ? static_cast<QWidget*>(m_livingRoom) : static_cast<QWidget*>(m_library));
 }
 
 void MainWindow::updateStatusFromOutput(const QString& text)
@@ -2505,7 +2541,7 @@ void MainWindow::updateStatusFromOutput(const QString& text)
                 .arg(target).arg(drops));
         g_perfHud->adjustSize();
         g_perfHud->move(12, 12);
-        g_perfHud->setVisible(m_showFps && m_runtimeStarted);
+        g_perfHud->setVisible(m_showFps && m_runtimeStarted && m_runtimeEmbedded);
         g_perfHud->raise();
     }
     auto stageMatches = stageRe.globalMatch(m_progressBuffer);
@@ -2759,9 +2795,11 @@ void MainWindow::setBusy(bool busy)
     const bool canPgo = !busy && hasGame && m_backend->currentData().toString() == "llvm";
     m_pgo->setEnabled(canPgo);
     m_inspect->setEnabled(!busy && hasGame);
-    m_compile->setEnabled(!busy && hasGame);
-    m_buildTools->setEnabled(!busy);
-    m_clean->setEnabled(!busy);
+    const bool maintenance = busy && (m_activeAction == "clean" || m_activeAction == "tools");
+    const bool builds = m_compilations.activeCount() || m_compilations.pendingCount();
+    m_compile->setEnabled(!maintenance && hasGame);
+    m_buildTools->setEnabled(!busy && !builds);
+    m_clean->setEnabled(!busy && !builds);
 
     if (m_openAction)
         m_openAction->setEnabled(!busy);
@@ -2778,13 +2816,13 @@ void MainWindow::setBusy(bool busy)
     if (m_analyzeAction)
         m_analyzeAction->setEnabled(!busy && hasGame);
     if (m_compileAction)
-        m_compileAction->setEnabled(!busy && hasGame);
+        m_compileAction->setEnabled(!maintenance && hasGame);
     if (m_pgoAction)
         m_pgoAction->setEnabled(canPgo);
     if (m_buildToolsAction)
-        m_buildToolsAction->setEnabled(!busy);
+        m_buildToolsAction->setEnabled(!busy && !builds);
     if (m_cleanAction)
-        m_cleanAction->setEnabled(!busy);
+        m_cleanAction->setEnabled(!busy && !builds);
 }
 
 void MainWindow::dragEnterEvent(QDragEnterEvent* event)
@@ -2804,13 +2842,184 @@ void MainWindow::dragEnterEvent(QDragEnterEvent* event)
 
 void MainWindow::dropEvent(QDropEvent* event)
 {
+    QStringList paths;
     for (const QUrl& url : event->mimeData()->urls())
     {
         if (url.isLocalFile() && looksLikeDiscImage(url.toLocalFile()))
         {
-            setIsoPath(url.toLocalFile(), true);
-            event->acceptProposedAction();
-            return;
+            paths << url.toLocalFile();
         }
     }
+    if (paths.isEmpty()) return;
+    if (paths.size() == 1 && !m_controller.isRunning()) setIsoPath(paths.first(), true);
+    else enqueueCompilations(paths);
+    event->acceptProposedAction();
+}
+
+void MainWindow::updateApplicationIcon()
+{
+    QIcon icon=shellProjectIcon();
+    if(m_runtimeStarted && m_runtimeEmbedded && QSettings("GekkoAOT","GekkoAOT").value("ui/gameAppIcon",true).toBool()) {
+        for(const auto& entry:m_library->entries())if(entry.path==m_isoPath){icon=shellGameIcon(entry.banner);break;}
+    }
+    setWindowIcon(m_runtimeOnDesktop?shellProjectIcon():icon);
+    QIcon gameIcon=shellProjectIcon();
+    if(QSettings("GekkoAOT","GekkoAOT").value("ui/gameAppIcon",true).toBool())for(const auto& entry:m_library->entries())if(entry.path==m_isoPath){gameIcon=shellGameIcon(entry.banner);break;}
+    const QString gameId=m_library->metadata(m_isoPath)["gameId"].toString();
+    setShellWindowIdentity(this,{},"GekkoAOT",shellProjectIcon());
+    setShellWindowIdentity(m_gameWindow,gameId.isEmpty()?"unknown":gameId,gameTitleForPath(m_isoPath),gameIcon);
+    qApp->setWindowIcon(shellProjectIcon());
+}
+void MainWindow::showAppearanceConfig()
+{
+    QDialog dialog(this);dialog.setWindowTitle("Appearance");dialog.resize(640,420);
+    auto* layout=new QVBoxLayout(&dialog);layout->setContentsMargins(24,24,24,24);layout->setSpacing(18);
+    QSettings config("GekkoAOT","GekkoAOT");
+    auto* brand=new QCheckBox("Show project logo in Desktop and TV Mode");brand->setObjectName("showProjectLogo");brand->setChecked(config.value("ui/showProjectLogo",true).toBool());layout->addWidget(brand);
+    auto* game=new QCheckBox("Use the running game's banner as its application icon");game->setObjectName("useGameAppIcon");game->setChecked(config.value("ui/gameAppIcon",true).toBool());layout->addWidget(game);
+    auto* motion=new QCheckBox("Reduce interface animations");motion->setChecked(config.value("ui/reducedMotion",false).toBool());layout->addWidget(motion);
+    auto* preview=new QLabel;preview->setPixmap(shellProjectIcon().pixmap(72,72));preview->setAlignment(Qt::AlignCenter);layout->addWidget(preview);
+    QString path=config.value("ui/projectLogo").toString();
+    auto* choose=new QPushButton(shellIcon("folder-open"),"Choose project logo…");layout->addWidget(choose);
+    connect(choose,&QPushButton::clicked,&dialog,[&]{
+        QFileDialog files(&dialog,"Project logo");files.setOption(QFileDialog::DontUseNativeDialog);files.setFileMode(QFileDialog::ExistingFile);files.setNameFilter("Images (*.png *.jpg *.jpeg *.bmp *.ico)");presentShellDialog(files,"Project logo",m_shellVisible);
+        if(execShellDialog(files)==QDialog::Accepted && !files.selectedFiles().isEmpty()){QImage image(files.selectedFiles().first());if(!image.isNull()){path=files.selectedFiles().first();preview->setPixmap(QPixmap::fromImage(image).scaled(72,72,Qt::KeepAspectRatio,Qt::SmoothTransformation));}}
+    });
+    auto* reset=new QPushButton("Restore GekkoAOT logo");layout->addWidget(reset);connect(reset,&QPushButton::clicked,&dialog,[&]{path.clear();preview->setPixmap(QPixmap(":/launcher/app-icon.png").scaled(72,72));});
+    auto* licences=new QPushButton("Google Sans Flex · licence");layout->addWidget(licences);
+    connect(licences,&QPushButton::clicked,&dialog,[&]{
+        QDialog notice(&dialog);auto* body=new QVBoxLayout(&notice);auto* text=new QPlainTextEdit;text->setReadOnly(true);
+        QFile file(":/launcher/fonts/GoogleSansFlex-OFL.txt");if(file.open(QIODevice::ReadOnly))text->setPlainText(QString::fromUtf8(file.readAll()));body->addWidget(text);
+        presentShellDialog(notice,"Font licence",m_shellVisible);execShellDialog(notice);
+    });
+    auto* buttons=new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Cancel);layout->addWidget(buttons);connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+    presentShellDialog(dialog,"Appearance",m_shellVisible);
+    if(execShellDialog(dialog)!=QDialog::Accepted)return;
+    config.setValue("ui/projectLogo",path);config.setValue("ui/showProjectLogo",brand->isChecked());config.setValue("ui/gameAppIcon",game->isChecked());config.setValue("ui/reducedMotion",motion->isChecked());
+    auto* logo=findChild<QLabel*>("desktopProjectLogo");logo->setPixmap(shellProjectIcon().pixmap(36,36));logo->setVisible(brand->isChecked());
+    m_livingRoom->refreshBrand();m_livingRoom->setReducedMotion(motion->isChecked());updateApplicationIcon();
+}
+void MainWindow::refreshDiscordPresence()
+{
+    DiscordPresenceContext context;
+    const auto publicTitle = [this](const QString& path) {
+        if (!m_discordTitles.contains(path))
+            m_discordTitles.insert(path, readDiscMetadata(discMetadataCachePath(runtimeStateRoot(), path))["title"].toString());
+        return m_discordTitles.value(path);
+    };
+    context.gameRunning = m_runtimeStarted;
+    context.gameTitle = m_runtimeStarted ? publicTitle(m_isoPath) : QString{};
+    context.gameStartedAt = m_discordGameStart;
+    context.paused = m_paused;
+    context.tvMode = m_returnToTV;
+    if (!context.gameRunning) {
+        for (const auto id : m_compilations.ids()) {
+            const auto* job = m_compilations.job(id);
+            if (job && job->state == CompilationJob::Running) {
+                context.compiling = true;
+                context.compilationTitle = publicTitle(job->request.isoPath);
+                break;
+            }
+        }
+    }
+    m_discord.setActivity(discordActivityFor(context));
+}
+
+void MainWindow::showDiscordConfig()
+{
+    QDialog dialog(this);
+    dialog.setObjectName("discordSettings");
+    dialog.resize(650, 430);
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(24,24,24,24);
+    layout->setSpacing(18);
+    QSettings config("GekkoAOT", "GekkoAOT");
+    auto* enabled = new QCheckBox("Share activity with Discord");
+    enabled->setObjectName("discordEnabled");
+    enabled->setChecked(config.value("discord/enabled", true).toBool());
+    layout->addWidget(enabled);
+    auto* description = mutedLabel("Show the current game, pause or compilation on your Discord profile. Turn this off at any time.", &dialog);
+    description->setWordWrap(true); layout->addWidget(description);
+    auto* form = new QFormLayout;
+    auto* id = new QLineEdit(config.value("discord/applicationId", DiscordPresence::defaultApplicationId()).toString());
+    id->setObjectName("discordApplicationId");
+    id->setAccessibleName("Discord Application ID");
+    id->setPlaceholderText("Public application ID");
+    id->setMaxLength(20);
+    id->setValidator(new QRegularExpressionValidator(QRegularExpression("[0-9]{0,20}"), id));
+    form->addRow("Application ID", id); layout->addLayout(form);
+    auto* status = new QLabel(m_discord.statusText());
+    status->setObjectName("discordStatus"); status->setWordWrap(true);
+    layout->addWidget(status);
+    connect(&m_discord, &DiscordPresence::statusChanged, &dialog, [this, status] { status->setText(m_discord.statusText()); });
+    layout->addStretch();
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+        if (enabled->isChecked() && !DiscordPresence::validApplicationId(id->text())) {
+            status->setText("Enter the public Application ID from the Discord Developer Portal.");
+            id->setFocus(); return;
+        }
+        config.setValue("discord/enabled", enabled->isChecked());
+        if (id->text().trimmed().isEmpty()) config.remove("discord/applicationId");
+        else config.setValue("discord/applicationId", id->text().trimmed());
+        refreshDiscordPresence();
+        m_discord.configure(enabled->isChecked(), id->text());
+        dialog.accept();
+    });
+    presentShellDialog(dialog, "Discord", m_shellVisible);
+    execShellDialog(dialog);
+}
+
+void MainWindow::showCompilations()
+{
+    if(auto* existing=findChild<QDialog*>("compilationQueuePanel")) {
+        if(existing->property("tvMode").toBool()!=m_shellVisible)presentShellDialog(*existing,"Compilations",m_shellVisible);
+        existing->show();existing->raise();existing->activateWindow();return;
+    }
+    auto* dialog=new QDialog(this);dialog->setObjectName("compilationQueuePanel");dialog->setAttribute(Qt::WA_DeleteOnClose);dialog->setWindowTitle("Compilations");dialog->resize(520,qMin(700,screen()->availableGeometry().height()-80));
+    auto* layout=new QVBoxLayout(dialog);auto* view=new CompilationSidebar(&m_compilations,dialog);view->compileRequested=[this](const QStringList& paths){enqueueCompilations(paths);};view->playRequested=[this](const QString& path){launchCompiledGame(path);};layout->addWidget(view);
+    auto* close=new QPushButton("Close");layout->addWidget(close);connect(close,&QPushButton::clicked,dialog,&QDialog::close);
+    presentShellDialog(*dialog,"Compilations",m_shellVisible);dialog->show();dialog->raise();dialog->findChild<QPushButton*>("shellDialogBack")->setFocus();updateShellInput();
+}
+
+void MainWindow::launchCompiledGame(const QString& path)
+{
+    if(auto* panel=shellActiveDialog(this))panel->close();
+    if(m_shellVisible)m_livingRoom->playRequested(path);
+    else if(m_library->activated)m_library->activated(path);
+}
+
+void MainWindow::showNavigationPanel(bool settingsOnly)
+{
+    if(auto* old=shellActiveDialog(this)) {
+        const bool same=old->objectName()=="navigationPanel";
+        old->close();if(same)return;
+    }
+    auto* dialog=new QDialog(this);dialog->setObjectName("navigationPanel");dialog->setAttribute(Qt::WA_DeleteOnClose);dialog->resize(500,620);
+    auto* layout=new QVBoxLayout(dialog);layout->setContentsMargins(8,8,8,8);layout->setSpacing(4);
+    auto add=[&](const QString& text,const QString& icon,std::function<void()> action,bool enabled=true){
+        auto* button=new QPushButton(shellIcon(icon),text);button->setIconSize({19,19});button->setFixedHeight(m_shellVisible?50:46);
+        button->setStyleSheet("QPushButton {text-align:left;padding:0 12px;border:1px solid transparent;border-radius:11px;background:transparent;}QPushButton:hover {background:rgba(255,255,255,15);}QPushButton:focus {background:rgba(255,255,255,18);border-color:rgba(255,255,255,100);}QPushButton:pressed {background:rgba(255,255,255,26);}");button->setEnabled(enabled);layout->addWidget(button);
+        connect(button,&QPushButton::clicked,dialog,[dialog,action]{dialog->close();QTimer::singleShot(0,qApp,action);});
+    };
+    add("Open game…","folder-open",[this]{m_openAction->trigger();},m_openAction->isEnabled());
+    add("Graphics","sliders-horizontal",[this]{showGraphicsConfig();});
+    add("Controllers","gamepad-2",[this]{showInputConfig();});
+    add("Memory cards","memory-stick",[this]{showMemoryCards();});
+    auto* divider=new QFrame;divider->setFixedHeight(1);divider->setStyleSheet("background:rgba(255,255,255,18);margin:4px 8px;");layout->addWidget(divider);
+    add("Appearance","sparkles",[this]{showAppearanceConfig();});
+    add("Discord","messages-square",[this]{showDiscordConfig();});
+    add("Advanced","settings-2",[this]{setAdvancedVisible(true);});
+    presentShellDialog(*dialog,settingsOnly?"Settings":"Menu",m_shellVisible);dialog->show();dialog->raise();
+    if(auto* first=dialog->findChild<QPushButton*>())first->setFocus();
+}
+
+void MainWindow::showMemoryCards()
+{
+    if(auto* panel=shellActiveDialog(this))panel->close();
+    QMap<QString,QString> titles;for(const auto& game:m_library->entries()){if(!game.gameId.isEmpty())titles[game.gameId]=game.title;titles[slugForPath(game.path)]=game.title;}
+    MemoryCardManager dialog(runtimeStateRoot(),frontendUserDir(),m_runtimeStarted?frontendUserDir():QString{},titles,this);
+    presentShellDialog(dialog,"Memory cards",m_shellVisible);execShellDialog(dialog);
 }

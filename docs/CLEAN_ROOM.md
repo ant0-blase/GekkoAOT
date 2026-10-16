@@ -28,6 +28,14 @@ Future generators/reviews should preserve that property: absolute addresses, cop
 
 If a new recognition technique requires retaining large exact instruction sequences from a proprietary binary, redesign the representation before publishing it.
 
+## Firmware replacements
+
+When no IPL ROM is supplied, GekkoAOT serves its own boot-ROM font so games
+that call `OSInitFont` can start. The glyphs were drawn for GekkoAOT and
+encoded at run time; no data from a Nintendo IPL is included. A user-supplied
+IPL always takes precedence, and `GEKKOAOT_ROM_FONT=0` disables the
+replacement.
+
 ## User-provided material
 
 Users are responsible for supplying their own legally obtained game dumps and any optional firmware/data required by a runtime path. GekkoAOT should reference user files from local state; it should not upload, redistribute or silently copy them into the repository.

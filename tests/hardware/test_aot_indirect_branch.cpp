@@ -63,6 +63,25 @@ static void VerifyRelImportIdentity() {
   CHECK(GekkoAOT::Native::MatchRelImportProofs(ram, 0x100u, &proof, 1u));
   put(0x204u, 0x80000ff8u);
   CHECK(!GekkoAOT::Native::MatchRelImportProofs(ram, 0x100u, &proof, 1u));
+
+  // OSLinkFixed: module 7 (REL v3) keeps its import of module 2 but trims its
+  // self and DOL imports from the table after applying them.
+  std::vector<std::uint8_t> fixed(0x1000u);
+  const auto set = [&](std::size_t at, std::uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) fixed[at+i] = value >> (24u-i*8u);
+  };
+  set(0x100u, 7u); set(0x11cu, 3u);
+  set(0x128u, 0x80000200u); set(0x12cu, 8u);
+  set(0x200u, 2u); set(0x204u, 0x80000300u);
+  fixed[0x302u] = 1u; set(0x304u, 0x00001234u); fixed[0x30au] = 203u;
+  std::uint64_t kept = 0xcbf29ce484222325ull;
+  for (unsigned i=0; i<16; ++i) { kept ^= fixed[0x300u+i]; kept *= 1099511628211ull; }
+  const GekkoAOTRelImportProof three[3]{{2u, 16u, kept}, {7u, 8u, 1u}, {0u, 16u, hash}};
+  CHECK(GekkoAOT::Native::MatchRelImportProofs(fixed, 0x100u, three, 3u));
+  set(0x304u, 0x00004321u);   // a retained import that differs still rejects
+  CHECK(!GekkoAOT::Native::MatchRelImportProofs(fixed, 0x100u, three, 3u));
+  set(0x304u, 0x00001234u); set(0x11cu, 2u);   // v2 has no fixed-link trim
+  CHECK(!GekkoAOT::Native::MatchRelImportProofs(fixed, 0x100u, three, 3u));
 }
 
 namespace GekkoAOT::Native {

@@ -10,6 +10,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -140,6 +141,7 @@ class Service {
   // Low-memory globals installed by the GameCube SDK.
   static constexpr std::uint32_t kCurrentContext = 0x800000D4u;
   static constexpr std::uint32_t kActiveThreadHead = 0x800000DCu;
+  static constexpr std::uint32_t kActiveThreadTail = 0x800000E0u;
   static constexpr std::uint32_t kCurrentThread = 0x800000E4u;
   static constexpr std::uint32_t kPhysicalCurrentContext = 0x800000C0u;
   static constexpr std::uint32_t kFpuContext = 0x800000D8u;
@@ -250,6 +252,7 @@ class Service {
   // The eager shadow policy is retained only for older modules which lacked
   // the gate, and can be selected independently for regression comparisons.
   bool eager_fpu_contexts_ = false;
+  bool active_queue_enabled_ = true;
   std::unordered_map<std::uint32_t, std::deque<std::uint32_t>> wait_queues_;
   std::unordered_map<std::uint32_t, PendingSend> pending_sends_;
   std::unordered_map<std::uint32_t, PendingReceive> pending_receives_;
@@ -372,6 +375,77 @@ class Service {
     if (!thread) return;
     if (std::find(known_threads_.begin(), known_threads_.end(), thread) == known_threads_.end())
       known_threads_.push_back(thread);
+  }
+
+  // v367: the SDK __OSActiveThreadQueue (AddTail/RemoveItem on linkActive).
+  // Guest-AOT OSCreateThread, OSJoinThread and __OSIsThreadActive walk it,
+  // so native thread services unlink every thread that terminates. Animaniacs creates threads in
+  // guest code and exits them natively; a detached thread left linked here
+  // was written through (prev->linkActive.next) by the next OSCreateThread
+  // after the game had freed its OSThread, corrupting the heap at level load.
+  bool ActiveContains(CPUState* state, std::uint32_t thread) const {
+    std::uint32_t cursor = 0;
+    if (!thread || !Read32(state, kActiveThreadHead, &cursor)) return false;
+    for (unsigned depth = 0; cursor && depth < 256u; ++depth) {
+      if (cursor == thread) return true;
+      if (!Read32(state, cursor + kThreadActiveNext, &cursor)) return false;
+    }
+    return false;
+  }
+  void RemoveActive(CPUState* state, std::uint32_t thread) {
+    if (!active_queue_enabled_ || !ActiveContains(state, thread)) return;
+    std::uint32_t next = 0, prev = 0;
+    Read32(state, thread + kThreadActiveNext, &next);
+    Read32(state, thread + kThreadActivePrev, &prev);
+    if (next) Write32(state, next + kThreadActivePrev, prev);
+    else Write32(state, kActiveThreadTail, prev);
+    if (prev) Write32(state, prev + kThreadActiveNext, next);
+    else Write32(state, kActiveThreadHead, next);
+  }
+  // SDK OSExitThread/OSCancelThread epilogue: a detached thread leaves the
+  // active queue at once; otherwise it stays moribund until joined/detached.
+  void FinishThread(CPUState* state, std::uint32_t thread) {
+    std::uint16_t attr = 0; Read16(state, thread + kThreadAttr, &attr);
+    const bool detached = (attr & kThreadDetach) != 0;
+    Write16(state, thread + kThreadState, detached ? 0 : kThreadMoribund);
+    if (detached) RemoveActive(state, thread);
+    std::uint32_t value = 0; Read32(state, thread + kThreadValue, &value);
+    bool joined = false;
+    auto join = wait_queues_.find(thread + kThreadJoinQueue);
+    if (join != wait_queues_.end()) {
+      const auto waiters = join->second;
+      for (auto waiter : waiters) {
+        if (const auto pending = pending_receives_.find(waiter); pending != pending_receives_.end()) {
+          if (pending->second.output) Write32(state, pending->second.output, value);
+          pending_receives_.erase(pending);
+          joined = true;
+        }
+        // Saved OSJoinThread continuation must observe TRUE in r3.
+        Write32(state, waiter + 12, 1);
+        WakeThread(state, waiter);
+      }
+      wait_queues_.erase(join); Write32(state, thread + kThreadJoinQueue, 0); Write32(state, thread + kThreadJoinQueue + 4, 0);
+    }
+    // A native OSJoinThread waiter resumes past the SDK's moribund check, so
+    // complete that join here: the joined thread is exited and unlinked.
+    if (joined && !detached && active_queue_enabled_) {
+      Write16(state, thread + kThreadState, 0);
+      RemoveActive(state, thread);
+    }
+    ForgetThread(thread);
+  }
+
+  // A terminated thread leaves the host scheduler structures. Its OSThread
+  // memory may be freed and reused by the game (HP Sorcerer's Stone recycles
+  // it for path strings); the ready audit would otherwise read a stale
+  // "ready" state out of that data and resume a garbage context (PC 0, ASCII
+  // in the restored GPRs). Moribund threads stay joinable: OSJoinThread reads
+  // the target directly and never needs the registry.
+  void ForgetThread(std::uint32_t thread) {
+    if (!thread) return;
+    known_threads_.erase(std::remove(known_threads_.begin(), known_threads_.end(), thread),
+                         known_threads_.end());
+    RemoveReady(thread);
   }
 
   FpShadow* FindFpShadow(std::uint32_t context) {
@@ -715,10 +789,12 @@ class Service {
       *out = ReadBE32(code);
       return true;
     };
-    const auto decode_mtctr = [](std::uint32_t word, unsigned* rs) -> bool {
+    // mtspr to CTR (bctrl call) or LR (blrl call: the Wind Waker SDK revision
+    // calls SwitchThreadCallback through `lwz r12,d(r13); mtlr r12; blrl`).
+    const auto decode_mtspr = [](std::uint32_t word, unsigned spr_wanted, unsigned* rs) -> bool {
       if ((word >> 26) != 31u || ((word >> 1) & 0x3ffu) != 467u) return false;
       const auto spr = ((word >> 16) & 0x1fu) | (((word >> 11) & 0x1fu) << 5);
-      if (spr != 9u) return false; // CTR
+      if (spr != spr_wanted) return false;
       if (rs) *rs = (word >> 21) & 0x1fu;
       return true;
     };
@@ -732,14 +808,18 @@ class Service {
 
     for (std::uint32_t pc = begin; pc + 4u <= end; pc += 4u) {
       std::uint32_t word = 0;
-      if (!read_word(pc, &word) || word != 0x4e800421u) continue; // bctrl
+      if (!read_word(pc, &word)) continue;
+      unsigned spr_wanted = 0u;
+      if (word == 0x4e800421u) spr_wanted = 9u;       // bctrl <- mtctr
+      else if (word == 0x4e800021u) spr_wanted = 8u;  // blrl  <- mtlr
+      else continue;
 
       unsigned ctr_source = 0;
       std::uint32_t mtctr_pc = 0;
       for (unsigned back = 1; back <= 8 && pc >= begin + back * 4u; ++back) {
         std::uint32_t candidate = 0;
         const auto candidate_pc = pc - back * 4u;
-        if (read_word(candidate_pc, &candidate) && decode_mtctr(candidate, &ctr_source)) {
+        if (read_word(candidate_pc, &candidate) && decode_mtspr(candidate, spr_wanted, &ctr_source)) {
           mtctr_pc = candidate_pc;
           break;
         }
@@ -788,7 +868,51 @@ class Service {
 
   bool InvokeSwitchThreadCallback(CPUState* state, std::uint32_t from,
                                   std::uint32_t to) {
+    static const bool trace_switch = [] {
+      const char* v = std::getenv("GEKKOAOT_TRACE_SWITCH_CALLBACK");
+      return v && *v && *v != '0';
+    }();
+    // Diagnostic: GEKKOAOT_TRACE_SWITCH_CALLBACK_WATCH=a,b,... prints guest
+    // words before and after each callback.
+    static const std::vector<std::uint32_t> trace_watch = [] {
+      std::vector<std::uint32_t> list;
+      for (const char* p = std::getenv("GEKKOAOT_TRACE_SWITCH_CALLBACK_WATCH"); p && *p;) {
+        char* end = nullptr;
+        const auto value = std::strtoul(p, &end, 16);
+        if (end == p) break;
+        list.push_back(static_cast<std::uint32_t>(value));
+        p = *end == ',' ? end + 1 : end;
+      }
+      return list;
+    }();
+    const auto watch_words = [&] {
+      std::string text;
+      for (const auto address : trace_watch) {
+        std::uint32_t value = 0;
+        if (state) Read32(state, address, &value);
+        char word[16];
+        std::snprintf(word, sizeof(word), " %08x", value);
+        text += word;
+      }
+      return text;
+    };
+    if (trace_switch)
+      std::fprintf(stderr, "GEKKOAOT_SWITCH_CALLBACK_TRACE from=%08x to=%08x nested=%u watch=%s lr=%08x pc=%08x\n",
+                   from, to, switch_callback_active_ ? 1u : 0u, watch_words().c_str(),
+                   state ? state->lr : 0u, state ? state->pc : 0u);
     if (!state || switch_callback_active_) return state != nullptr;
+    {
+      // Diagnostic (v363): guest code that switches threads outside NativeOS
+      // leaves current_thread_ stale; the callback would then save the running
+      // thread's state into another thread's record.
+      std::uint32_t guest_current = 0;
+      static unsigned mismatch_logs = 0;
+      if (Read32(state, kCurrentThread, &guest_current) && guest_current != from && mismatch_logs < 64u) {
+        ++mismatch_logs;
+        std::fprintf(stderr, "GEKKOAOT_NATIVE_OS_CURRENT_MISMATCH_V363 from=%08x guest_current=%08x to=%08x lr=%08x pc=%08x\n",
+                     from, guest_current, to, state->lr, state->pc);
+      }
+    }
     const auto offset = DiscoverSwitchCallbackSdaOffset(state);
     if (!offset) return true; // SDK revision without a proven callback slot.
 
@@ -846,6 +970,9 @@ class Service {
       if (state->pc == target && state->exception == 0u) break;
     }
     switch_callback_active_ = false;
+    if (trace_switch && !trace_watch.empty())
+      std::fprintf(stderr, "GEKKOAOT_SWITCH_CALLBACK_TRACE_AFTER watch=%s completed=%u\n",
+                   watch_words().c_str(), completed ? 1u : 0u);
 
     static unsigned callback_logs = 0u;
     if (callback_logs++ < 64u)
@@ -1037,6 +1164,14 @@ class Service {
   }
   bool AddReady(CPUState* state, std::uint32_t thread) {
     if (!thread || !Ptr(state, thread, kThreadSize)) return false;
+    // A terminated (exited/cancelled/joined) thread is never runnable again;
+    // its OSThread may already be recycled memory. See ForgetThread().
+    std::uint16_t previous = 0;
+    if (Read16(state, thread + kThreadState, &previous) &&
+        (previous == 0u || previous == kThreadMoribund)) {
+      RemoveReady(thread);
+      return false;
+    }
 
     // SDK OSWakeupThread changes WAITING -> READY even when suspend > 0.  A
     // suspended READY thread is simply not inserted into the runnable queue
@@ -1651,6 +1786,9 @@ public:
     active_alarm_count_ = 0;
     next_alarm_fire_ = std::numeric_limits<std::uint64_t>::max();
     fp_shadows_.clear();
+    const char* active_queue = std::getenv("GEKKOAOT_NATIVE_OS_ACTIVE_QUEUE");
+    active_queue_enabled_ = !(active_queue && (std::string_view(active_queue) == "0" ||
+                                                std::string_view(active_queue) == "off"));
     const char* eager = std::getenv("GEKKOAOT_NATIVE_OS_EAGER_FPU");
     eager_fpu_contexts_ = eager && *eager && std::string_view(eager) != "0" &&
         std::string_view(eager) != "false" && std::string_view(eager) != "off";
@@ -1984,29 +2122,19 @@ public:
       Write32(state, thread + kThreadBase, static_cast<std::uint32_t>(priority)); Write32(state, thread + kThreadValue, 0xffffffffu);
       Write32(state, thread + kThreadQueue, 0); Write32(state, thread + kThreadJoinQueue, 0); Write32(state, thread + kThreadJoinQueue + 4, 0);
       Write32(state, thread + kThreadMutex, 0); Write32(state, thread + kThreadMutexQueue, 0); Write32(state, thread + kThreadMutexQueue + 4, 0);
+      RemoveActive(state, thread);
       Write32(state, thread + kThreadActiveNext, 0); Write32(state, thread + kThreadActivePrev, 0);
       Write32(state, thread + kThreadStackBase, stack); Write32(state, thread + kThreadStackEnd, stack - stack_size);
+      // Not AddActive: NativeOS keeps ready threads in host queues, and debug
+      // SDKs (Pikmin) panic in OSCheckActiveThreads when a listed READY thread
+      // is not on the guest RunQueue. Guest-created threads stay listed.
       Write32(state, stack - stack_size, 0xDEADBABEu); RememberThread(thread); ReturnU32(state, 1); return true;
     }
     case Kind::ExitThread: {
       if (!Bootstrap(state)) return false;
       const auto thread = current_thread_;
-      const auto value = state->gpr[3]; Write32(state, thread + kThreadValue, value); std::uint16_t attr = 0; Read16(state, thread + kThreadAttr, &attr);
-      Write16(state, thread + kThreadState, (attr & kThreadDetach) ? 0 : kThreadMoribund);
-      auto join = wait_queues_.find(thread + kThreadJoinQueue);
-      if (join != wait_queues_.end()) {
-        const auto waiters = join->second;
-        for (auto waiter : waiters) {
-          if (const auto pending = pending_receives_.find(waiter); pending != pending_receives_.end()) {
-            if (pending->second.output) Write32(state, pending->second.output, value);
-            pending_receives_.erase(pending);
-          }
-          // Saved OSJoinThread continuation must observe TRUE in r3.
-          Write32(state, waiter + 12, 1);
-          WakeThread(state, waiter);
-        }
-        wait_queues_.erase(join); Write32(state, thread + kThreadJoinQueue, 0); Write32(state, thread + kThreadJoinQueue + 4, 0);
-      }
+      Write32(state, thread + kThreadValue, state->gpr[3]);
+      FinishThread(state, thread);
       return SwitchOrIdle(state);
     }
     case Kind::CancelThread: {
@@ -2014,13 +2142,13 @@ public:
       const auto thread = state->gpr[3]; if (!Ptr(state, thread, kThreadSize)) return false;
       if (thread == current_thread_) { state->gpr[3] = 0; return Dispatch(Kind::ExitThread, state); }
       RemoveReady(thread); std::uint32_t queue = 0; Read32(state, thread + kThreadQueue, &queue); if (queue) RemoveWait(state, queue, thread);
-      std::uint16_t attr = 0; Read16(state, thread + kThreadAttr, &attr); Write16(state, thread + kThreadState, (attr & kThreadDetach) ? 0 : kThreadMoribund); ReturnVoid(state); return true;
+      FinishThread(state, thread); ReturnVoid(state); return true;
     }
     case Kind::JoinThread: {
       const auto target = state->gpr[3], value_out = state->gpr[4]; if (!Ptr(state, target, kThreadSize)) return false;
       const auto s = ThreadState(state, target); std::uint16_t attr = 0; Read16(state, target + kThreadAttr, &attr);
       if (attr & kThreadDetach) { ReturnU32(state, 0); return true; }
-      if (s == kThreadMoribund || s == 0) { std::uint32_t value = 0; Read32(state, target + kThreadValue, &value); if (value_out) Write32(state, value_out, value); Write16(state, target + kThreadState, 0); ReturnU32(state, 1); return true; }
+      if (s == kThreadMoribund || s == 0) { std::uint32_t value = 0; Read32(state, target + kThreadValue, &value); if (value_out) Write32(state, value_out, value); Write16(state, target + kThreadState, 0); if (s == kThreadMoribund) RemoveActive(state, target); ForgetThread(target); ReturnU32(state, 1); return true; }
       if (!Bootstrap(state)) return false;
       const auto thread = current_thread_; state->gpr[3] = 1; if (!SaveContext(state, thread, state->lr)) return false;
       // Remember the requested value pointer in an otherwise host-only map by reusing PendingReceive.
@@ -2029,7 +2157,9 @@ public:
     }
     case Kind::DetachThread: {
       const auto thread = state->gpr[3]; std::uint16_t attr = 0; if (!Read16(state, thread + kThreadAttr, &attr)) return false;
-      Write16(state, thread + kThreadAttr, attr | kThreadDetach); if (ThreadState(state, thread) == kThreadMoribund) Write16(state, thread + kThreadState, 0); ReturnVoid(state); return true;
+      Write16(state, thread + kThreadAttr, attr | kThreadDetach);
+      if (ThreadState(state, thread) == kThreadMoribund) { Write16(state, thread + kThreadState, 0); RemoveActive(state, thread); ForgetThread(thread); }
+      ReturnVoid(state); return true;
     }
     case Kind::ResumeThread: {
       const auto thread = state->gpr[3]; std::uint32_t raw = 0; if (!Read32(state, thread + kThreadSuspend, &raw)) return false;

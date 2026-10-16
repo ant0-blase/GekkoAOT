@@ -1,8 +1,12 @@
 #pragma once
+#include "../runtime/gx/graphics_settings.h"
 
 #include "BuildController.hpp"
+#include "CompilationQueue.hpp"
+#include "DiscordPresence.hpp"
 
 #include <QMainWindow>
+#include <QElapsedTimer>
 #include <QMap>
 #include <QString>
 #include <QStringList>
@@ -27,17 +31,28 @@ class QStackedLayout;
 class QToolBar;
 class QToolButton;
 class QWidget;
+class GameLibrary;
+class CompilationSidebar;
+class QDockWidget;
+class LivingRoomView;
+class ShellGamepad;
 
 class MainWindow final : public QMainWindow
 {
     Q_OBJECT
 public:
     explicit MainWindow(QWidget* parent = nullptr);
+    ~MainWindow() override;
+    QMainWindow* gameWindow() const { return m_gameWindow; }
+    bool livingRoomVisible() const { return m_shellVisible; }
+public slots:
+    void openLivingRoom();
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;
     void changeEvent(QEvent* event) override;
     void dropEvent(QDropEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
     void buildUi();
@@ -50,26 +65,42 @@ private:
     void setIsoPath(const QString& path, bool autoPlay = true);
     void updateGameMetadata();
     void updateGameEnhancementsMenu();
-    QMap<QString, QString> gameEnhancementEnvironment() const;
+    QMap<QString, QString> gameEnhancementEnvironment(const QString& path = {}) const;
     void gameEnhancementChanged(const QString& label);
     void updateStatusFromOutput(const QString& text);
     void launchAction(const QString& action);
+    void enqueueCompilations(const QStringList& paths);
     void setBusy(bool busy);
     void setAdvancedVisible(bool visible);
     void setLogVisible(bool visible);
     void showGraphicsConfig();
     void showInputConfig();
+    void showAppearanceConfig();
+    void showDiscordConfig();
+    void showMemoryCards();
+    void refreshDiscordPresence();
+    void updateApplicationIcon();
+    void showCompilations();
+    void launchCompiledGame(const QString& path);
+    void showNavigationPanel(bool settingsOnly);
     void showLoader(const QString& title, const QString& status, int progress);
     void showGameViewport();
     void showIdleViewport(const QString& message = {});
     void toggleGameViewFullscreen();
     void setGameViewFullscreen(bool fullscreen);
+    void restoreDesktopLauncher();
+    void enterTVMode();
+    void toggleHomeMenu();
+    void dismissLivingRoom(bool resume);
+    void refreshLivingRoom();
+    void updateShellInput();
+    void routeControllerKey(int key);
     void updateLoaderBanner();
     QString frontendUserDir() const;
     qreal effectiveDisplayScale() const;
     QString displaySessionDescription() const;
     bool writeFrontendConfig(QString* error = nullptr) const;
-    BuildRequest requestFor(const QString& action) const;
+    BuildRequest requestFor(const QString& action, const QString& path = {}) const;
     static QString slugForPath(const QString& path);
     static QString discIdForPath(const QString& path);
     static QString gameTitleForPath(const QString& path);
@@ -77,9 +108,32 @@ private:
     static QImage gameCubeBannerForPath(const QString& path);
 
     BuildController m_controller;
+    CompilationQueue m_compilations;
+    DiscordPresence m_discord;
+    qint64 m_discordGameStart = 0;
+    QMap<QString, QString> m_discordTitles;
+    CompilationSidebar* m_compilationSidebar = nullptr;
+    QDockWidget* m_compilationDock = nullptr;
+    QAction* m_compilationsAction = nullptr;
+    LivingRoomView* m_livingRoom = nullptr;
+    ShellGamepad* m_shellGamepad = nullptr;
+    QAction* m_tvAction = nullptr;
+    bool m_shellVisible = false, m_returnToTV = false, m_shellPausedGame = false;
+    bool m_hiddenForGame = false, m_restoreDockAfterTV = false, m_tvRefreshPending = false;
+    QString m_pendingGame;
+    bool m_pendingGameOnDesktop = false;
     QString m_isoPath;
     QString m_activeAction;
     bool m_runtimeStarted = false;
+    bool m_runtimeEmbedded = false;
+    bool m_runtimeOnDesktop = false;
+    QMainWindow* m_gameWindow = nullptr;
+    QWidget* m_desktopGameViewport = nullptr;
+    bool m_paused = false;
+    QElapsedTimer m_playClock;
+    qint64 m_playSeconds = 0;
+    GameLibrary* m_library = nullptr;
+    QDialog* m_compileDialog = nullptr;
     bool m_stopRequested = false;
     bool m_gameViewFullscreen = false;
     bool m_wasMaximizedBeforeGameFullscreen = false;
@@ -94,11 +148,13 @@ private:
     int m_lastProgress = 0;
 
     QString m_graphicsBackend = "Vulkan";
+    GekkoAOT::GX::GraphicsSettings m_graphicsExtras;
     QString m_resolution = "1920x1080";
     QString m_windowSystem = "auto";
     QString m_aspectMode = "4:3";
     bool m_fullscreen = false;
     bool m_showFps = true;
+    std::uint32_t m_hudItems = GekkoAOT::GX::HudDefaultItems;
     bool m_frameInterpolation = false;
     int m_fpsLimit = 120;
     int m_msaaSamples = 1;
@@ -114,7 +170,6 @@ private:
     QStringList m_controllers;
 
     QWidget* m_viewFrame = nullptr;
-    QWidget* m_gameViewport = nullptr;
     QWidget* m_loaderOverlay = nullptr;
     QStackedLayout* m_viewStack = nullptr;
     QLabel* m_bannerLabel = nullptr;
@@ -153,6 +208,7 @@ private:
     QAction* m_openAction = nullptr;
     QAction* m_playAction = nullptr;
     QAction* m_stopAction = nullptr;
+    QAction* m_pauseAction = nullptr;
     QAction* m_graphicsAction = nullptr;
     QAction* m_inputAction = nullptr;
     QAction* m_advancedAction = nullptr;

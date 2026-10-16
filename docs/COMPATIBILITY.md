@@ -1,59 +1,84 @@
 # Compatibility
 
-GekkoAOT 0.0.7 has been exercised on substantially more titles than the original public compatibility table. The entries below record the furthest documented development state from local captures, test logs and user observations. They do not claim that every level or the final packaged binaries have been exhaustively validated.
+This list records the furthest point each game reached in development testing
+for GekkoAOT 0.0.8. Unless noted otherwise, results come from automated runs on
+Linux (Intel Core Ultra 7 258V, Arc 140V), in 16:9, with NativeOS and NativeHW
+enabled, driving the menus with scripted input for 100–240 seconds. Notes
+marked "user report" come from players.
 
-## Titles observed running
+No game has been verified from start to finish. A state only describes the
+scenes that were reached. When the latest run stopped earlier than a previous
+test, the state keeps the furthest result and the note says so.
 
-“Gameplay observed” includes direct user reports/captures. “Menu” and “opening video” are intentionally separate from gameplay. A matching cached AOT module alone is not counted as a launch.
-
-| Title | Disc ID | Furthest observed state | Observation / remaining work |
-| --- | --- | --- | --- |
-| Harry Potter and the Sorcerer's Stone | GHLE69 | Gameplay / early 3D | Captured gameplay; rendering and complete progression remain under test. |
-| Harry Potter and the Chamber of Secrets | GHSE69 | Gameplay / early 3D | Burrow courtyard/tutorial captured with player HUD; scene-dependent performance and progression remain under test. |
-| Harry Potter and the Prisoner of Azkaban | GAZE69 | Gameplay / early 3D | Hogwarts Express corridor captured with player HUD; resident-VM and memory-fault paths were exercised. |
-| Mario Kart: Double Dash!! | GM4E01 | Gameplay / early 3D | Gameplay captured; audio and race/level transitions need longer validation. |
-| Super Mario Sunshine | GMSE01 | Gameplay / early 3D | Gameplay captured; water/EFB effects and rendering remain active correctness targets. |
-| Luigi’s Mansion | GLME01 | Gameplay / early 3D | User gameplay captures and earlier UI-scissor tests; flashlight effects, the central rectangle and JAudio still need follow-up. |
-| Tales of Symphonia | GQSEAF | Gameplay / save loaded | Launcher-card gameplay and widescreen/map result confirmed by the user; combat/world transitions require continued coverage. |
-| Call of Duty: Finest Hour | GCOE52 | Gameplay / early 3D | Stalingrad boat/pier gameplay reviewed; movies, later missions and performance remain under test. |
-| GoldenEye: Rogue Agent | GOYE69 | Gameplay / early 3D | Fort Knox helicopter gameplay and camera interaction reviewed; later progression remains under test. |
-| Tom Clancy’s Ghost Recon 2 | GGYE41 | Gameplay observed | User in-game capture; Ubisoft/H4M movies and widescreen side visibility remain unresolved targets. |
-| Star Fox Adventures | GSAE01 | Gameplay observed | User reports from in-game scenes; effect-dependent slowdowns and widescreen shadows remain targets. |
-| Terminator 3: The Redemption | — | Gameplay observed | User in-game reports; movie, lighting/particle and shadow correctness require further validation. |
-| Resident Evil | — | Gameplay observed | User reported an in-game crash; scene/level transitions are not certified crash-free. |
-| Medal of Honor: Frontline | GMFE69 | Early level execution | Earlier level/movie progress observed; rendering and level/exit transitions remain under test. |
-| Disney’s Hide & Sneak | GHVE08 | Gameplay in an earlier LLVM test | Earlier first-level Mickey/HUD run documented; nested REL discovery restores later boot tests. Subsequent code coverage remains under test. |
-| Disney’s Magical Mirror Starring Mickey Mouse | GDME01 | Boot / rendering activity | Nested-directory/REL discovery restores runtime/frame activity; complete gameplay is not certified. |
-| Disney/Pixar Cars | GKJE78 | Gameplay / racing scene | Captured race with Lightning McQueen, lap counter and HUD. |
-| Disney/Pixar Finding Nemo | GNEE78 | Menu | Captured New Game / Load Game menu; low frame rate remains an active issue. |
-| Animaniacs: The Great Edgar Hunt | GANE7U | Menu / memory-card prompt | Captured overwrite-save prompt and animated menu scene; gameplay has not been established by that capture. |
-| Driven | GDVE6L | Menu / memory-card prompt | Captured load-data/card prompt; clock-polling optimization tested, complete racing gameplay not established by that capture. |
-| Tony Hawk’s Underground | GTDE52 | Opening video / card navigation | Earlier opening VID video was documented as visible; later menu/level transition black screens remain under test. |
-| Medal of Honor: Rising Sun | — | Level-selection menu observed | User reported a crash when selecting a level; successful full level execution needs renewed proof. |
-| Nintendo Developer Demo | DNDD01 | Working tested sample | Current demo scene captured and exercised; wider sample/pacing coverage remains ongoing. |
-
-## Additional corpus targets
-
-The local corpus and compiler/service recognition tests also cover or prepare additional targets, including The Wind Waker, Twilight Princess, Pikmin, Spyro: A Hero’s Tail, Killer7, Metroid Prime, Rayman 3, Resident Evil 4, SSX Tricky, Shadow the Hedgehog, Super Mario Strikers and the Super Monkey Ball titles. Their presence in the corpus or a successful AOT build is not a verified boot/gameplay result. Add a stronger status only when a reproducible run establishes it.
-
-## Status definitions
+## States
 
 | State | Meaning |
 | --- | --- |
-| Untested | No reproducible runtime result for the stated configuration |
-| Compiles | Module generation succeeds; boot is unconfirmed |
-| Boot / rendering activity | The executable runs and runtime/rendering activity is observed; the final scene can be unclassified |
-| Menu / video | A recognizable menu, prompt or opening movie is reached |
-| Gameplay / early 3D | An in-game scene is reached; correctness and progression can remain incomplete |
-| Working sample | The stated sample/path runs without a known blocker |
-| Playable | Meaningful gameplay and progression validated without a major blocker |
+| Gameplay | An in-game scene is controllable. Later levels can still fail. |
+| Cutscene | An in-engine opening or story scene runs; gameplay was not reached in the test. |
+| Menu | Title screen, menus or memory-card prompts work. |
+| Boots | The game runs and renders, but stops before its menus. |
+| Compiles | The game compiles; it does not run correctly yet. |
+| Untested | No result for this version. |
 
-No retail title is certified completely playable by this release preparation. Known graphics, audio, movie, widescreen and transition issues remain documented alongside the successful starts.
+## Games
+
+| Game | Disc ID | State | Notes |
+| --- | --- | --- | --- |
+| Animaniacs: The Great Edgar Hunt | `GANE7U` | Gameplay | First level, from a new game and from a save. Level loading fixed in 0.0.8. |
+| Call of Duty: Finest Hour | `GCOE52` | Gameplay | Stalingrad, Volga crossing. |
+| Disney/Pixar Cars | `GKJE78` | Gameplay | Race in Radiator Springs. |
+| Disney/Pixar Finding Nemo | `GNEE78` | Menu | Underwater title screen. Runs at about 16 fps. |
+| Disney's Hide & Sneak | `GHVE08` | Cutscene | Player select and opening cutscene; earlier builds reached the first level. |
+| Disney's Magical Mirror Starring Mickey Mouse | `GDME01` | Cutscene | New game started; opening in Mickey's bedroom. |
+| Driven | `GDVE6L` | Gameplay | Race at 60 fps with NativeOS (user report). |
+| GoldenEye: Rogue Agent | `GOYE69` | Gameplay | First mission with NativeOS (user report). Still unstable. |
+| Harry Potter and the Chamber of Secrets | `GHSE69` | Gameplay | The Burrow. |
+| Harry Potter and the Prisoner of Azkaban | `GAZE69` | Gameplay | Hogwarts Express and the in-game pause menu. |
+| Harry Potter and the Sorcerer's Stone | `GHLE69` | Gameplay | Diagon Alley with Hagrid and Quirrell. Thread-reuse crash fixed in 0.0.8. |
+| Killer7 | `GK7E08` | Gameplay | Opening chapter (user report). Aiming fixed in 0.0.8; some textures still render incorrectly. |
+| Lemony Snicket's A Series of Unfortunate Events | `GLCE52` | Menu | Main menu and save selection. |
+| Luigi's Mansion | `GLME01` | Gameplay | Training room, with the Game Boy Horror HUD in place. |
+| Mario Kart: Double Dash!! | `GM4E01` | Gameplay | Time trial on Luigi Circuit. |
+| Medal of Honor: Frontline | `GMFE69` | Gameplay | D-Day trenches. Abort Mission freeze fixed in 0.0.8. |
+| Medal of Honor: Rising Sun | `GR8E69` | Menu | Load-game menu. A crash when selecting a level was reported in 0.0.7. |
+| Metroid Prime | `GM8E01` | Cutscene | In-engine opening above Tallon IV. |
+| Nintendo Developer Demo | `DNDD01` | Gameplay | Demo scene and pause menu at full speed. |
+| Pikmin | `GPIE01` | Cutscene | File select and the opening crash-landing scene. |
+| Rayman 3: Hoodlum Havoc | `GRHE41` | Menu | Opening scene and profile creation. |
+| Resident Evil | `GBIE08` | Gameplay | Rooms and inventory; pre-rendered rooms shown in 4:3 since 0.0.8. |
+| Resident Evil 4 | `G4BE08` | Boots | Crashed in the opening in 0.0.7 (a REL module stored in an archive). The 0.0.8 extraction fix is not yet verified in game. |
+| Shadow the Hedgehog | `GUPE8P` | Gameplay | First stage. Bloom seams in widescreen fixed in 0.0.8. |
+| Spyro: A Hero's Tail | `G5SE7D` | Cutscene | Freezes during the first in-engine cutscene. |
+| SSX Tricky | `GSTE69` | Untested | Compilation did not finish within the test time limit. |
+| Star Fox Adventures | `GSAE01` | Gameplay | Save loaded at Krazoa Palace. |
+| Super Mario Strikers | `G4QE01` | Gameplay | Match at 60 fps with NativeOS (user report). |
+| Super Mario Sunshine | `GMSE01` | Gameplay | Opening cutscene in the latest run; gameplay in 0.0.7 testing. Water and EFB effects are incomplete. |
+| Super Monkey Ball | `GMBE8P` | Gameplay | Stages played through Floor 2; 60 fps at 5 % CPU (user report). |
+| Super Monkey Ball 2 | `GM2E8P` | Menu | Crashes after Start is pressed on the title screen. |
+| Super Monkey Ball Adventure | `G3LE8P` | Gameplay | Jungle Island at 60 fps with NativeOS (user report). |
+| Tales of Symphonia | `GQSEAF` | Gameplay | Save loaded in Iselia. Memory use down to 430 MB in 0.0.8. |
+| Terminator 3: The Redemption | `GT6E70` | Gameplay | In-game corridor scene. |
+| The Legend of Zelda: The Wind Waker | `GZLE01` | Menu | Title screen with NativeOS disabled (user report). With NativeOS enabled it halts a few seconds after boot. |
+| The Legend of Zelda: Twilight Princess | `GZ2E01` | Boots | Compiles since 0.0.8 (757 REL modules). Crashes after the health warning and the Nintendo logo. |
+| Tom Clancy's Ghost Recon 2 | `GGYE41` | Menu | Profile menus without an IPL ROM since 0.0.8; in-game reached by a user in 0.0.7. |
+| Tony Hawk's Underground | `GTDE52` | Menu | Can freeze after the Neversoft logo while waiting for the GPU. |
 
 ## Reporting a problem
 
-Include the game ID, region/revision, GekkoAOT commit/version, host CPU/GPU/driver, LLVM version and backend. State the native options, graphics settings, cache-hit/cold-build status and save/scene needed to reproduce the first failure.
+Please include:
 
-For crashes, include a backtrace and concise log excerpts around the failure. For performance problems, distinguish whole-machine CPU use from one-core utilization and record the game's frame rate. For graphics problems, compare 4:3 and widescreen where relevant.
+- the game title, disc ID, region and revision;
+- the GekkoAOT version or commit;
+- your OS, CPU, GPU and driver version;
+- whether NativeOS was enabled, and any options you changed;
+- the save and scene needed to reach the problem;
+- whether the game was compiled fresh or loaded from the cache.
 
-Keep raw profiling captures and full benchmark reports in local state or issue attachments. Do not add game images, commercial executables, saves, SDK files or firmware dumps to the repository.
+For crashes, attach the log around the failure. For performance problems,
+say whether CPU figures are per core or for the whole machine and include the
+frame rate (the performance HUD shows both). For graphics problems, compare
+widescreen with the 4:3 aspect ratio.
+
+Do not attach or commit game images, extracted game files, saves, SDK files or
+firmware dumps.

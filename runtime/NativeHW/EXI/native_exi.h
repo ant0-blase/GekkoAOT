@@ -26,8 +26,12 @@ private:
   enum class Region : std::uint8_t { None, Sram, Rom };
   void Save() const;
   void LoadRom();
+  bool RomReadable(std::uint32_t address);
   std::array<std::uint8_t, 0x44> sram_{};
   std::vector<std::uint8_t> rom_;
+  // No user IPL: only the font slots are served, from GekkoAOT's own font.
+  bool rom_replacement_ = false;
+  bool rom_replacement_failed_ = false;
   std::filesystem::path save_path_;
   std::uint32_t command_ = 0;
   std::uint32_t cursor_ = 0;

@@ -29,7 +29,17 @@ cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE="$BUILD_TYPE" "${CMAKE_
 # keeps ./build-linux.sh useful with -DGEKKOAOT_BUILD_GUI=OFF.
 cmake --build "$BUILD" -j "$JOBS"
 mkdir -p "$ROOT/bin"
-[[ -x "$BUILD/bin/gekkoaot" ]] && install -m0755 "$BUILD/bin/gekkoaot" "$ROOT/bin/gekkoaot"
+if [[ -x "$BUILD/bin/gekkoaot" ]]; then
+  # Replace atomically, so rebuilding never overwrites a running launcher or
+  # the mapped Discord SDK. The SDK is part of the ready-to-run local bundle.
+  install -m0755 "$BUILD/bin/gekkoaot" "$ROOT/bin/.gekkoaot.$$"
+  if [[ -f "$BUILD/bin/libdiscord_partner_sdk.so" ]]; then
+    install -m0755 "$BUILD/bin/libdiscord_partner_sdk.so" "$ROOT/bin/.discord-sdk.$$"
+    mv -f "$ROOT/bin/.discord-sdk.$$" "$ROOT/bin/libdiscord_partner_sdk.so"
+    install -m0644 "$BUILD/bin/Discord-SDK-License-Notices.txt" "$ROOT/bin/Discord-SDK-License-Notices.txt"
+  fi
+  mv -f "$ROOT/bin/.gekkoaot.$$" "$ROOT/bin/gekkoaot"
+fi
 for f in gekkoaotctl gekkoaot-module-meta gekkoaot-secondary-build gekkoaot-native-run gekkoaot-native-disc; do
   [[ -x "$BUILD/bin/$f" ]] && install -m0755 "$BUILD/bin/$f" "$ROOT/bin/$f"
 done

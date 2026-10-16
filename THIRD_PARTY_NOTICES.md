@@ -46,6 +46,22 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Qt 6 is used by the optional desktop frontend. Portable releases deploy Qt runtime libraries and platform plugins, including the Windows Qt runtime and the Linux AppImage deployment. Qt retains its commercial/open-source licensing terms and upstream notices. Source builds may use a system Qt installation.
 
+## Launcher fonts and icons
+
+Google Sans Flex and Doto are embedded under the SIL Open Font License 1.1.
+Their original licenses, the Google Sans Flex trademark notice and source
+information are retained in `assets/fonts` and installed with the launcher.
+Lucide icons use the ISC license retained in `assets/icons/lucide/LICENSE`.
+
+## Optional Discord Social SDK
+
+Discord Rich Presence can use the official Discord Social SDK 1.10 or later.
+The SDK is a separate optional dependency supplied through Discord's Developer
+Portal, subject to Discord's SDK terms; it is not relicensed as GekkoAOT source.
+SDK-enabled packages retain its upstream `License-Notices.txt` under
+`share/licenses/GekkoAOT/discord`. See `docs/discord-rich-presence.md` for build
+and platform requirements.
+
 ## Game and platform trademarks
 
 Nintendo, GameCube and game titles/trademarks belong to their respective owners. GekkoAOT is an independent project and is not affiliated with or endorsed by Nintendo, Electronic Arts, Warner Bros. or other game/platform rights holders.
@@ -78,3 +94,7 @@ license notices are retained by the portable toolchain staging process under
 `toolchain/licenses`; these components are not relicensed as GekkoAOT code.
 Optional system FFmpeg libraries retain the license terms of the selected host
 build.
+
+## Memory card interoperability
+
+The save-serial rebinding routines in `src/MemoryCard.cpp` are adapted from the Dolphin Emulator Project’s GCMemcard implementation, Copyright 2008 Dolphin Emulator Project, licensed GPL-2.0-or-later (used here under GPL-3.0-or-later). The GCS/SAV container layouts and animated-icon interpretation were checked against Dolphin’s GCMemcard and GCMemcardUtils sources, Copyright 2008/2020 Dolphin Emulator Project. See [memory-card references](docs/memory-cards.md). The original project is available at <https://github.com/dolphin-emu/dolphin>.

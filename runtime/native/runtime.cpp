@@ -307,6 +307,21 @@ bool IsChainTransparentLeaf(std::uint32_t token) {
   }
 }
 
+// v367: SDK matrix uploads (GXLoad*MtxImm) replace guest code whose only
+// host-visible effect is WGPIPE bytes. Their HLE queues those bytes through
+// the same per-32-byte-line epoch bumps as the guest stores, and an overflow
+// IRQ taken at entry sets cpu->exception, so they need no extra boundary.
+bool IsChainTransparentGxMatrix(std::uint32_t token) {
+  if ((token & kStaticDirectMask) != kStaticDirectSimpleBase) return false;
+  switch (static_cast<SimpleHleKind>(token & 0xffu)) {
+  case SimpleHleKind::GxLoadPosMtxImm: case SimpleHleKind::GxLoadTexMtxImm:
+  case SimpleHleKind::GxLoadNrmMtxImm: case SimpleHleKind::GxLoadNrmMtxImm3x3:
+    return true;
+  default:
+    return false;
+  }
+}
+
 std::uint32_t ReadGuestBE32(const std::uint8_t* bytes) {
   return (std::uint32_t(bytes[0]) << 24) | (std::uint32_t(bytes[1]) << 16) |
          (std::uint32_t(bytes[2]) << 8) | std::uint32_t(bytes[3]);
@@ -404,6 +419,18 @@ void AcknowledgeSynchronousExceptionVector(CPUState* cpu, std::uint32_t physical
   // Once the chassis has actually entered the corresponding low-memory vector,
   // that pending bit must be consumed. Leaving it set makes helpers such as
   // mftb immediately return after their `if (ctx->exception)` guard forever.
+  // v366: synchronous guest exceptions are rare and usually end in a game's
+  // own crash handler (JUTException, OSPanic); keep the first ones visible.
+  if (physical == 0x0300u || physical == 0x0600u || physical == 0x0700u ||
+      physical == 0x0200u) {
+    static unsigned logs = 0u;
+    if (logs++ < 16u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_GUEST_EXCEPTION_V366 vector=%04x srr0=%08x srr1=%08x dar=%08x dsisr=%08x "
+                   "program=%08x lr=%08x r1=%08x r3=%08x\n",
+                   physical, cpu->srr0, cpu->srr1, cpu->dar, cpu->dsisr, cpu->program_exception,
+                   cpu->lr, cpu->gpr[1], cpu->gpr[3]);
+  }
   switch (physical) {
   case 0x0500u: cpu->exception &= ~kPpcExcExternalUnwind; break;
   case 0x0200u: cpu->exception &= ~kPpcExcMachineCheck; break;
@@ -688,7 +715,7 @@ HostRuntime::HostRuntime(bool enable_mem2) : memory_(enable_mem2), dsp_(&memory_
   // v47: AOT execution itself is never throttled. The GameCube-visible clock
   // domain comes from steady_clock, while presentation has an independent cap.
   host_fps_limit_hz_ = RuntimeEnvU32("GEKKOAOT_HOST_FPS_LIMIT", 120u, 1000u);
-  frame_interpolation_enabled_ = false;
+  frame_interpolation_enabled_ = RuntimeEnvBool("GEKKOAOT_FRAME_INTERPOLATION", false);
   perf_metrics_enabled_ = RuntimeEnvBool("GEKKOAOT_PERF_METRICS", true);
   widescreen_frustum_assist_enabled_ =
       RuntimeEnvBool("GEKKOAOT_WIDESCREEN_FRUSTUM", true);
@@ -1010,6 +1037,11 @@ void HostRuntime::Reset() {
   lc_.Reset();
   cp_.Reset();
   cp_.SetDeferredRegisterDrain(RuntimeEnvBool("GEKKOAOT_CP_DEFER_REGISTER_DRAIN", true));
+  cp_poll_drain_enabled_ = RuntimeEnvBool("GEKKOAOT_CP_POLL_DRAIN", true);
+  // Opt-in: THUG's GP watchdog loop parked rarely (no CPU change) and one of
+  // two parked runs froze, so the default keeps CP status reads unparked.
+  cp_poll_park_enabled_ = RuntimeEnvBool("GEKKOAOT_CP_POLL_PARK", false);
+  cp_poll_drains_ = 0;
   si_.SetTransferEvents(RuntimeEnvBool("GEKKOAOT_NATIVE_SI_TRANSFER_EVENTS", false));
   pe_.Reset();
   pi_.Reset();
@@ -1110,7 +1142,13 @@ ModuleStatus HostRuntime::LoadModule(const std::filesystem::path& path,
 ModuleStatus HostRuntime::LoadSecondaryModule(const std::filesystem::path& path,
                                               const char* expected_game_id) {
   auto library = std::make_unique<ModuleLibrary>();
-  const auto status = library->Open(path, expected_game_id);
+  // v367: REL side modules carry a native entry per guest instruction, so one
+  // can hold 60-150 MiB of text and a title preloads every compiled variant
+  // (Tales of Symphonia: 15 modules). Copying them all onto anonymous huge
+  // pages made ~1.5 GiB permanently resident; keep them file-backed (demand
+  // paged, shared, reclaimable). GEKKOAOT_HUGE_TEXT_SECONDARY=1 restores it.
+  static const bool secondary_huge_text = RuntimeEnvBool("GEKKOAOT_HUGE_TEXT_SECONDARY", false);
+  const auto status = library->Open(path, expected_game_id, secondary_huge_text);
   if (status != ModuleStatus::Ok) {
     secondary_module_last_error_ = library->LastError();
     return status;
@@ -1708,6 +1746,7 @@ bool HostRuntime::InitializeNativeGX(const std::filesystem::path& bridge_path) {
   else
     native_gx_.SetPeEventSink(&HostRuntime::NativeGXPeEvent, this);
   native_gx_.SetFrameReadyFence(frame_interpolation_enabled_);
+  native_gx_.ApplyGraphicsSettings(live_graphics_settings_);
   native_gx_.SetAsyncWritesEnabled(runtime_parallel_workers_);
   // Preserve any event produced during renderer initialization before the sink
   // policy was installed.
@@ -2027,6 +2066,12 @@ void HostRuntime::NativePadDirect(void* user, std::uint32_t channel,
   const std::uint8_t parameter1 = static_cast<std::uint8_t>(command);
   (void)parameter1;
   if (opcode != 0x40u) return;
+  if (!polling_enabled && self->native_pad_mode_[channel] != parameter2) {
+    static unsigned mode_logs = 0;
+    if (mode_logs++ < 16u)
+      std::fprintf(stderr, "GEKKOAOT_NATIVE_SI_PAD_MODE channel=%u mode=%u previous=%u\n",
+                   channel, unsigned(parameter2), unsigned(self->native_pad_mode_[channel]));
+  }
   if (!polling_enabled) self->native_pad_mode_[channel] = parameter2;
 #if defined(GEKKOAOT_NATIVE_SDL_INPUT)
   if (self->native_input_ready_)
@@ -2433,7 +2478,13 @@ std::uint64_t HostRuntime::NativeTryStableMmioRead(CPUState* cpu, std::uint32_t 
   if (size == 2u && !(physical & 1u)) {
     if (self->native_hw_.CP() && physical >= 0x0c000000u && physical < 0x0c001000u) {
       handled = self->cp_.Read(address, size, &value);
-      if (handled) self->SyncNativeCPInterrupt();
+      if (handled) {
+        self->SyncNativeCPInterrupt();
+        // v366: an unchanged CP status read in a tight loop waits for other
+        // guest activity (THUG's GP watchdog thread spins on GXGetGPStatus
+        // for the FIFO high watermark): park it like other device polls.
+        if (physical == 0x0c000000u && self->cp_poll_park_enabled_) self->NoteMmioPoll(address, value);
+      }
     } else if (physical >= 0x0c001000u && physical <= 0x0c00100eu) {
       // PE config/control/token are scalar mirrors. Bounding box and EFB
       // accesses need GPU work and cannot enter this state-free service.
@@ -2684,8 +2735,38 @@ std::uint64_t HostRuntime::ExternalRead(CPUState* cpu, std::uint32_t address, st
     // guest load. Decode the 4 KiB hardware page once and only enter the owner.
     switch (physical & 0xfffff000u) {
     case HW::CP::NativeCP::BasePhysical:
+      // v366: a released CP breakpoint defers the GP drain to the next host
+      // boundary (the release usually happens in the CP interrupt handler).
+      // A thread that then polls CP state (EE on, same register again) waits
+      // for that drain: the hardware GP keeps reading during the wait. THUG
+      // spun ~12M CP status reads/s until the AOT cycle guard reached a host
+      // boundary. Serve the pending drain to such a poll.
+      if (self->cp_poll_drain_enabled_ && self->cp_.RegisterDrainPending() &&
+          (cpu->msr & kPpcMsrEe) != 0u && self->same_mmio_read_streak_ > 1u) {
+        self->cp_.ServiceRegisterDrain();
+        self->SyncNativeCPInterrupt();
+        ++self->cp_poll_drains_;
+        if (self->cp_poll_drains_ <= 4u)
+          std::fprintf(stderr, "GEKKOAOT_CP_POLL_DRAIN_V366=1 ea=%08x pc=%08x drains=%llu action=serve-deferred-gp-drain\n",
+                       address, cpu->pc, static_cast<unsigned long long>(self->cp_poll_drains_));
+      }
       if (self->cp_.Read(address, size, &value)) {
         self->SyncNativeCPInterrupt();
+        if (physical == 0x0c000000u && self->cp_poll_park_enabled_) self->NoteMmioPoll(address, value);
+        // Diagnostic: GEKKOAOT_CP_POLL_TRACE=1 samples hot CP register polls.
+        static const bool cp_trace = RuntimeEnvBool("GEKKOAOT_CP_POLL_TRACE", false);
+        if (cp_trace) {
+          static std::uint64_t cp_reads = 0; static unsigned window = 0, windows = 0;
+          if ((++cp_reads & 0xfffffu) == 0u && windows < 24u) { window = 12u; ++windows; }
+          if (window) {
+            --window;
+            std::fprintf(stderr, "GEKKOAOT_CP_POLL_TRACE ea=%08x value=%llx pc=%08x lr=%08x msr=%x "
+                         "rw=%08x rp=%08x wp=%08x ctl=%04x\n", address,
+                         static_cast<unsigned long long>(value), cpu->pc, cpu->lr, cpu->msr,
+                         self->cp_.FifoReadWriteDistance(), self->cp_.FifoReadPointer(),
+                         self->cp_.FifoWritePointer(), self->cp_.Control());
+          }
+        }
         return value;
       }
       break;
@@ -2723,6 +2804,7 @@ std::uint64_t HostRuntime::ExternalRead(CPUState* cpu, std::uint32_t address, st
     case DSP::NativeDSP::BasePhysical:
       if (self->dsp_.Read(address, size, &value)) {
         self->SyncNativeDSPInterrupt();
+        self->NoteMmioPoll(address, value);
         return value;
       }
       break;
@@ -2733,24 +2815,28 @@ std::uint64_t HostRuntime::ExternalRead(CPUState* cpu, std::uint32_t address, st
       case 0x000u:
         if (self->di_.Read(address, size, &value)) {
           self->SyncNativeDIInterrupt();
+          self->NoteMmioPoll(address, value);
           return value;
         }
         break;
       case 0x400u:
         if (self->si_.Read(address, size, &value)) {
           self->SyncNativeSIInterrupt();
+          self->NoteMmioPoll(address, value);
           return value;
         }
         break;
       case 0x800u:
         if (self->exi_.ReadRegister(address, size, &value)) {
           self->SyncNativeEXIInterrupt();
+          self->NoteMmioPoll(address, value);
           return value;
         }
         break;
       case 0xc00u:
         if (self->ai_.Read(address, size, &value)) {
           self->SyncNativeAIInterrupt();
+          self->NoteMmioPoll(address, value);
           return value;
         }
         break;
@@ -3775,9 +3861,55 @@ bool HostRuntime::DispatchOsHle(GekkoAOT::NativeOS::Kind kind, std::uint32_t add
       return true;
   }
 
+  // Diagnostic: unbounded trace of OSThread lifecycle services (rare calls).
+  static const bool trace_threads = RuntimeEnvBool("GEKKOAOT_TRACE_OS_THREADS", false);
+  if (trace_threads) {
+    using K = GekkoAOT::NativeOS::Kind;
+    switch (kind) {
+    case K::CreateThread: case K::ExitThread: case K::CancelThread: case K::JoinThread:
+    case K::DetachThread: case K::ResumeThread: case K::SuspendThread: case K::LoadContext: {
+      std::uint32_t current = 0;
+      memory_.Read32(0x800000e4u, &current);
+      std::fprintf(stderr, "GEKKOAOT_OS_THREAD_TRACE kind=%s r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x lr=%08x current=%08x tb=%llx\n",
+                   GekkoAOT::NativeOS::Name(kind), cpu_.gpr[3], cpu_.gpr[4], cpu_.gpr[5], cpu_.gpr[6],
+                   cpu_.gpr[7], cpu_.gpr[8], cpu_.lr, current, static_cast<unsigned long long>(cpu_.timebase));
+      break;
+    }
+    default: break;
+    }
+  }
   auto& native_os = GekkoAOT::NativeOS::Service::Get();
   if (GekkoAOT::NativeOS::Service::IsInlineFastKind(kind)) {
     if (native_os.DispatchInlineFast(kind, &cpu_)) return true;
+  } else if (kind == GekkoAOT::NativeOS::Kind::YieldThread && yield_spin_enabled_) {
+    // v344: a yield with no ready peer of equal or higher priority returns to
+    // its caller on the same thread; count it for ParkYieldSpin.
+    const auto lr = cpu_.lr;
+    std::uint32_t before = 0, after = 0;
+    const bool known = memory_.Read32(0x800000e4u, &before);
+    if (native_os.Dispatch(kind, &cpu_)) {
+      if (known && cpu_.pc == lr && cpu_.exception == 0u &&
+          memory_.Read32(0x800000e4u, &after) && after == before) {
+        // A yield is a scheduling point: deliver an interrupt that became
+        // pending while this AOT chain spun (SRR0 = the yield's return
+        // address), instead of letting the loop run until the chain ends.
+        if ((cpu_.msr & kPpcMsrEe) != 0u && (pi_.InterruptPending() || decrementer_pending_)) {
+          yield_noop_count_ = 0u;
+          if (!TryTakeExternalInterrupt()) TryTakeDecrementerInterrupt();
+          return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (lr != yield_noop_lr_ || now - yield_spin_start_ > std::chrono::microseconds(64)) {
+          yield_noop_lr_ = lr; yield_noop_count_ = 0u; yield_spin_start_ = now;
+        }
+        if (++yield_noop_count_ >= 64u) {
+          yield_noop_count_ = 0u;
+          ParkYieldSpin();
+          yield_spin_start_ = std::chrono::steady_clock::now();
+        }
+      }
+      return true;
+    }
   } else if (native_os.Dispatch(kind, &cpu_)) {
     return true;
   }
@@ -3827,6 +3959,17 @@ HostRuntime::GuestRangeStatus HostRuntime::TranslateGuestRange(
           bytes > memory_.Mem1().size() - translation.physical)
         return GuestRangeStatus::Invalid;
       spans.push_back({memory_.Mem1().data() + translation.physical, bytes});
+      done += bytes;
+      continue;
+    }
+    // v365: the locked-cache scratchpad is plain memory for libc services
+    // (Spyro: A Hero's Tail memsets 0xE0001000); it has its own backing.
+    if (ea >= HW::LC::NativeLC::Base && ea - HW::LC::NativeLC::Base < HW::LC::NativeLC::Size) {
+      const std::uint32_t bytes = std::min<std::uint32_t>(
+          remaining, HW::LC::NativeLC::Size - (ea - HW::LC::NativeLC::Base));
+      auto* host = static_cast<std::uint8_t*>(lc_.Pointer(ea, bytes));
+      if (!host) return GuestRangeStatus::Invalid;
+      spans.push_back({host, bytes});
       done += bytes;
       continue;
     }
@@ -3917,9 +4060,14 @@ bool HostRuntime::DispatchSimpleHle(SimpleHleKind kind, std::uint32_t address) {
   };
   // v300: VM-correct memory helpers (TranslateGuestRange).
   const auto range_failure=[&](GuestRangeStatus status) -> bool {
-    if(status==GuestRangeStatus::NotResident) return decline_to_guest();
-    SetFault(FaultKind::HleFailure,address);
-    return false;
+    // v365: a range a native service cannot translate (an unusual mapping)
+    // runs the original guest body, which performs the exact architectural
+    // accesses, instead of stopping the game.
+    static unsigned decline_logs=0;
+    if(status!=GuestRangeStatus::NotResident && decline_logs++<16u)
+      std::fprintf(stderr,"GEKKOAOT_NATIVE_HLE_RANGE_DECLINE_V365 pc=%08x kind=%u r3=%08x r4=%08x r5=%08x action=guest-body\n",
+                   address,static_cast<unsigned>(kind),cpu_.gpr[3],cpu_.gpr[4],cpu_.gpr[5]);
+    return decline_to_guest();
   };
   const auto gather=[](const std::vector<GuestSpan>& spans,std::uint8_t* out) {
     for(const auto& span:spans){std::memcpy(out,span.host,span.length);out+=span.length;}
@@ -4674,7 +4822,8 @@ bool HostRuntime::HostCall(CPUState* cpu, std::uint32_t address) {
   // already ends the chain through cpu->exception) -- exactly like the guest
   // code they replace, so they do not end the superchain either.
   if (handled && address != kNativeRegionProbe && address != kRelAddressProbe &&
-      address != kGlobalIndirectProbe && !IsChainTransparentLeaf(address))
+      address != kGlobalIndirectProbe && !IsChainTransparentLeaf(address) &&
+      !(self->gx_matrix_chain_enabled_ && IsChainTransparentGxMatrix(address)))
     BumpHostWriteEpoch(cpu);
   return handled;
 }
@@ -6346,9 +6495,14 @@ void HostRuntime::ServiceHostFrameScheduler(std::chrono::steady_clock::time_poin
     present_period = std::chrono::nanoseconds(
         static_cast<std::int64_t>(1000000000ull / host_fps_limit_hz_));
     if (host_present_started_ && now < host_present_next_) return;
+    // v359: advance by whole periods so the cadence holds its exact rate
+    // (rescheduling from `now` lost the sampling lateness every frame, e.g.
+    // 59.3 Hz for 60). Never queue a burst after a host stall: resync instead.
+    if (!host_present_started_ || now - host_present_next_ >= present_period)
+      host_present_next_ = now + present_period;
+    else
+      host_present_next_ += present_period;
     host_present_started_ = true;
-    // Never queue a burst after a host stall. The newest temporal state wins.
-    host_present_next_ = now + present_period;
   }
 
   bool presented = false;
@@ -6438,6 +6592,20 @@ void HostRuntime::ServicePerformanceMetrics(std::uint64_t hardware_cycles) {
       (static_cast<double>(std::max<std::uint32_t>(vi_.TicksPerHalfLine(), 1u)) *
        static_cast<double>(std::max<std::uint32_t>(vi_.HalfLinesPerFrame(), 1u)));
 
+  {
+    // v359: the in-game HUD shows these live, with this thread's CPU load
+    // (the guest CPU runs here, so it is the emulation's critical thread).
+    const double thread_seconds = GekkoAOT::GX::CurrentThreadCpuSeconds();
+    float main_cpu = -1.f;
+    if (perf_last_thread_seconds_ >= 0.0 && thread_seconds >= 0.0)
+      main_cpu = static_cast<float>(std::clamp(
+          100.0 * (thread_seconds - perf_last_thread_seconds_) / seconds, 0.0, 100.0));
+    perf_last_thread_seconds_ = thread_seconds;
+    const float values[] = {static_cast<float>(vps), static_cast<float>(nominal_vps),
+                            static_cast<float>(guest_fps), static_cast<float>(speed), main_cpu,
+                            static_cast<float>(host_fps_limit_hz_)};
+    native_gx_.PublishPerf(values, static_cast<std::uint32_t>(std::size(values)));
+  }
   std::fprintf(stderr,
                "GEKKOAOT_PERF_V49=1 vps=%.3f nominal_vps=%.3f guest_fps=%.3f "
                "present_fps=%.3f interp_fps=%.3f speed=%.2f target=%u drops=%llu\n",
@@ -6553,6 +6721,27 @@ void HostRuntime::ServicePerformanceMetrics(std::uint64_t hardware_cycles) {
                per_second(idle_loop_parks_, perf_last_idle_parks_),
                per_second(guest_cycles_total_, perf_last_guest_cycles_) / 1e6,
                per_second(ee_enable_queries_, perf_last_ee_queries_));
+  if (runtime_profile_enabled_ && mmio_poll_parks_) {
+    static std::uint64_t last_parks = 0, last_ns = 0;
+    std::fprintf(stderr, "GEKKOAOT_MMIO_POLL_STATS_V347=1 parks_per_s=%.0f parked_ms_per_s=%.1f\n",
+                 per_second(mmio_poll_parks_, last_parks), per_second(mmio_poll_park_ns_, last_ns) / 1e6);
+    last_parks = mmio_poll_parks_; last_ns = mmio_poll_park_ns_;
+  }
+  if (runtime_profile_enabled_ && fixed_point_probes_) {
+    static std::uint64_t last_parks = 0, last_probes = 0;
+    static std::uint64_t last_ns = 0;
+    std::fprintf(stderr, "GEKKOAOT_FIXED_POINT_STATS_V346=1 parks_per_s=%.0f probes_per_s=%.0f parked_ms_per_s=%.1f\n",
+                 per_second(fixed_point_parks_, last_parks), per_second(fixed_point_probes_, last_probes),
+                 per_second(fixed_point_park_ns_, last_ns) / 1e6);
+    last_parks = fixed_point_parks_; last_probes = fixed_point_probes_; last_ns = fixed_point_park_ns_;
+  }
+  if (runtime_profile_enabled_ && (yield_spin_parks_ || yield_spin_declines_)) {
+    static std::uint64_t last_parks = 0, last_declines = 0, last_ns = 0;
+    std::fprintf(stderr, "GEKKOAOT_YIELD_SPIN_STATS_V344=1 parks_per_s=%.0f declines_per_s=%.0f parked_ms_per_s=%.1f\n",
+                 per_second(yield_spin_parks_, last_parks), per_second(yield_spin_declines_, last_declines),
+                 per_second(yield_spin_park_ns_, last_ns) / 1e6);
+    last_parks = yield_spin_parks_; last_declines = yield_spin_declines_; last_ns = yield_spin_park_ns_;
+  }
   if (runtime_profile_enabled_) {
     // v301: busiest native services (s<SimpleHleKind>, o<NativeOS::Kind>).
     std::vector<std::pair<std::uint64_t, std::string>> kinds;
@@ -6603,7 +6792,7 @@ void HostRuntime::PollLiveVideoConfig(std::uint64_t charged) {
   if (live_video_config_path_.empty()) return;
   live_video_config_poll_cycles_ += charged;
   constexpr std::uint64_t kPollCycles =
-      GekkoAOT::HW::VI::NativeVI::CpuClockHz / 4u;  // ~250 ms hardware time.
+      GekkoAOT::HW::VI::NativeVI::CpuClockHz / 15u;
   if (live_video_config_poll_cycles_ < kPollCycles) return;
   live_video_config_poll_cycles_ %= kPollCycles;
 
@@ -6620,14 +6809,31 @@ void HostRuntime::PollLiveVideoConfig(std::uint64_t charged) {
   std::string aspect_mode;
   bool have_aspect = false;
   bool have_fps = false;
+  bool pause_requested = false;
   std::uint32_t next_fps = host_fps_limit_hz_;
+  auto next_graphics = live_graphics_settings_;
   while (std::getline(file, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    const auto equals = line.find('=');
+    if (equals != std::string::npos) {
+      const auto key = line.substr(0, equals), value = line.substr(equals + 1);
+      if (key == "paused") pause_requested = value == "true" || value == "1";
+      GX::ParseGraphicsSetting(next_graphics, key, value);
+      if (key == "fullscreen") next_graphics.fullscreen = value == "true" || value == "1";
+      if (key == "resolution") {
+        unsigned width = 0, height = 0; char extra = 0;
+        if (std::sscanf(value.c_str(), "%ux%u%c", &width, &height, &extra) == 2 &&
+            width >= 320 && width <= 7680 && height >= 240 && height <= 4320) {
+          next_graphics.output_width = width; next_graphics.output_height = height;
+        }
+      }
+    }
     constexpr std::string_view fps_prefix = "fps_limit=";
     constexpr std::string_view aspect_prefix = "aspect_ratio=";
     if (line.starts_with(fps_prefix)) {
       char* end = nullptr;
       const auto value = std::strtoul(line.c_str() + fps_prefix.size(), &end, 10);
-      if (end && *end == '\0' && value >= 30u && value <= 360u) {
+      if (end && *end == '\0' && value >= 1u && value <= 1000u) {
         next_fps = static_cast<std::uint32_t>(value);
         have_fps = true;
       }
@@ -6646,6 +6852,47 @@ void HostRuntime::PollLiveVideoConfig(std::uint64_t charged) {
                  host_fps_limit_hz_, frame_interpolation_enabled_ ? 1u : 0u);
   }
   if (have_aspect) native_gx_.SetAspectMode(aspect_mode);
+  if (native_gx_.ApplyGraphicsSettings(next_graphics)) {
+    live_graphics_settings_ = next_graphics;
+    const bool interpolation = next_graphics.interpolation && native_gx_.HasFrameInterpolation();
+    if (interpolation != frame_interpolation_enabled_) {
+      frame_interpolation_enabled_ = interpolation;
+      native_gx_.SetFrameReadyFence(interpolation);
+      interpolation_pair_valid_ = false;
+      host_present_started_ = false;
+    }
+  }
+  if (pause_requested) {
+    // Stop at the existing host-service boundary, never in the middle of an
+    // AOT block or a hardware operation. All guest clocks remain frozen.
+    native_gx_.SetPaused(true);
+    dsp_.FlushAudioSink();
+    std::fprintf(stderr, "GEKKOAOT_PAUSE state=paused pc=%08x tb=%llu\n",
+                 cpu_.pc, static_cast<unsigned long long>(cpu_.timebase));
+    while (pause_requested && !native_gx_.QuitRequested()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(40));
+      native_gx_.PollEvents();
+      std::ifstream control(live_video_config_path_);
+      if (!control) continue;
+      // QSaveFile atomically replaces the file, so no partial state is read.
+      while (std::getline(control, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.starts_with("paused=")) {
+          const auto value = line.substr(7);
+          pause_requested = value == "true" || value == "1";
+        }
+      }
+    }
+    native_gx_.SetPaused(false);
+    dsp_.FlushAudioSink();
+    hardware_clock_started_ = false;
+    hardware_clock_guest_since_sample_ = 0;
+    host_present_started_ = false;
+    interpolation_pair_valid_ = false;
+    perf_metrics_started_ = false;
+    std::fprintf(stderr, "GEKKOAOT_PAUSE state=running pc=%08x tb=%llu\n",
+                 cpu_.pc, static_cast<unsigned long long>(cpu_.timebase));
+  }
 }
 
 void HostRuntime::ServiceWidescreenFrustumAssist(bool frame_boundary) {
@@ -7426,11 +7673,19 @@ void HostRuntime::RefreshSecondaryRelMappings() {
   rel_mapping_dirty_ = false;
 
   static unsigned refresh_logs = 0u;
-  if (refresh_logs++ < 32u)
+  if (refresh_logs++ < 32u) {
     std::fprintf(stderr,
                  "GEKKOAOT_REL_MAP_REFRESH_V156=1 sections=%zu refreshes=%llu action=index-committed\n",
                  active_rel_sections_.size(),
                  static_cast<unsigned long long>(rel_mapping_refreshes_));
+    // Diagnostic: GEKKOAOT_REL_MAP_TRACE=1 lists each live section.
+    static const bool trace = RuntimeEnvU32("GEKKOAOT_REL_MAP_TRACE", 0u, 1u) != 0u;
+    if (trace)
+      for (const auto& section : active_rel_sections_)
+        std::fprintf(stderr, "GEKKOAOT_REL_MAP_SECTION module=%u section=%u canonical=%08x runtime=%08x size=%08x\n",
+                     section.module_id, section.section_index, section.linked_start,
+                     section.runtime_start, section.size);
+  }
 }
 
 const GekkoAOTModuleDesc* HostRuntime::SelectFixedExecutableModule(
@@ -7923,9 +8178,47 @@ bool HostRuntime::DispatchFixedExecutableModule(const GekkoAOTModuleDesc* descri
   cpu_.downcount = 0;
   cpu_.external_read_count = 0;
   cpu_.external_write_count = 0;
-  if (!descriptor->dispatch(&cpu_, runtime_address)) {
+  native_region_last_blocked_start_ = 0u;
+  native_region_probe_capture_ = true;
+  const bool dispatched = descriptor->dispatch(&cpu_, runtime_address);
+  native_region_probe_capture_ = false;
+  if (!dispatched) {
     cpu_.pc = runtime_address;
     return false;
+  }
+  // v350: an overlay image reloaded over the bootstrap executable (MoH
+  // Frontline re-runs its stub to leave a mission) keeps the bootstrap SDK
+  // hooks' original bytes, so the entry-time region guard bounces to the host
+  // before one instruction runs; the router then picks the same image again
+  // and the guest livelocks with time frozen. Mirror the v204c REL handling:
+  // run the exact host call when the entry itself is hooked, otherwise admit
+  // the rejected range once.
+  if (cpu_.pc == runtime_address && cpu_.downcount == 0 &&
+      cpu_.external_read_count == 0u && cpu_.external_write_count == 0u &&
+      native_region_last_blocked_start_ != 0u) {
+    const std::uint32_t blocked_start = native_region_last_blocked_start_;
+    static unsigned zero_progress_logs = 0u;
+    if (DispatchHostCall(runtime_address)) {
+      ++hle_calls_;
+      ++result.dispatches;
+      if (zero_progress_logs++ < 64u)
+        std::fprintf(stderr,
+                     "GEKKOAOT_FIXED_ZERO_PROGRESS_V350=1 pc=%08x guard=%08x action=dispatch-exact-host-call\n",
+                     runtime_address, blocked_start);
+      return true;
+    }
+    native_region_retry_start_ = blocked_start;
+    cpu_.pc = runtime_address;
+    const bool retried = descriptor->dispatch(&cpu_, runtime_address);
+    native_region_retry_start_ = 0u;
+    if (!retried) {
+      cpu_.pc = runtime_address;
+      return false;
+    }
+    if (zero_progress_logs++ < 64u)
+      std::fprintf(stderr,
+                   "GEKKOAOT_FIXED_ZERO_PROGRESS_V350=1 pc=%08x guard=%08x next=%08x action=retry-blocked-range-once\n",
+                   runtime_address, blocked_start, cpu_.pc);
   }
   ++secondary_dispatches_;
   ++result.dispatches;
@@ -8091,10 +8384,37 @@ bool HostRuntime::TranslateCanonicalRelAddress(std::uint32_t canonical_address,
   // Address queries emitted by a REL have a known owner. Its own sections
   // must win over another loaded module with the same synthetic link window.
   if (native_region_secondary_owner_) {
+    // v366: a REL's canonical window and its own OSLink placement can overlap
+    // (Twilight Princess module 55: canonical 80c6814c, runtime 80c615ac).
+    // Translation requests come from canonical provenance, so an address in
+    // both of the owner's windows is canonical: GEKKOAOT_REL_OWNER_CANONICAL_FIRST=1
+    // translates it instead of keeping it as a live pointer. Opt-in: no title
+    // has hit the overlap yet (TP's module-55 crash logged none).
+    static const bool canonical_first = RuntimeEnvBool("GEKKOAOT_REL_OWNER_CANONICAL_FIRST", false);
+    const ActiveRelSection* own_canonical = nullptr;
+    for (const auto& section : active_rel_sections_)
+      if (section.owner == native_region_secondary_owner_ && canonical_address >= section.linked_start &&
+          std::uint64_t(canonical_address) < std::uint64_t(section.linked_start) + section.size) {
+        own_canonical = &section;
+        break;
+      }
     for (const auto& section : active_rel_sections_) {
       if (section.owner != native_region_secondary_owner_) continue;
       if (canonical_address >= section.runtime_start &&
           std::uint64_t(canonical_address) < std::uint64_t(section.runtime_start) + section.size) {
+        if (own_canonical) {
+          static unsigned overlap_logs = 0u;
+          if (overlap_logs++ < 16u)
+            std::fprintf(stderr,
+                         "GEKKOAOT_REL_OWN_WINDOW_OVERLAP_V366 pc=%08x address=%08x module=%u canonical_section=%u "
+                         "runtime_section=%u action=%s\n",
+                         cpu_.pc, canonical_address, section.module_id, own_canonical->section_index,
+                         section.section_index, canonical_first ? "translate" : "keep");
+          if (canonical_first) {
+            *runtime_address = own_canonical->runtime_start + (canonical_address - own_canonical->linked_start);
+            return true;
+          }
+        }
         *runtime_address = canonical_address;
         return true;
       }
@@ -8104,6 +8424,22 @@ bool HostRuntime::TranslateCanonicalRelAddress(std::uint32_t canonical_address,
       if (canonical_address >= section.linked_start &&
           std::uint64_t(canonical_address) < std::uint64_t(section.linked_start) + section.size) {
         *runtime_address = section.runtime_start + (canonical_address - section.linked_start);
+        // Diagnostic: the owner's canonical window also covers another live
+        // module's OSLink placement, so this address is ambiguous.
+        static unsigned ambiguous_logs = 0u;
+        if (ambiguous_logs < 64u)
+          for (const auto& other : active_rel_sections_)
+            if (other.owner != native_region_secondary_owner_ &&
+                canonical_address >= other.runtime_start &&
+                std::uint64_t(canonical_address) < std::uint64_t(other.runtime_start) + other.size) {
+              ++ambiguous_logs;
+              std::fprintf(stderr,
+                           "GEKKOAOT_REL_AMBIGUOUS_ADDRESS_V366 pc=%08x lr=%08x address=%08x owner_module=%u "
+                           "owner_runtime=%08x live_module=%u live_section=%u\n",
+                           cpu_.pc, cpu_.lr, canonical_address, section.module_id, *runtime_address,
+                           other.module_id, other.section_index);
+              break;
+            }
         return true;
       }
     }
@@ -8389,13 +8725,13 @@ bool HostRuntime::DispatchSecondaryModule(std::uint32_t runtime_address, RunResu
   return false;
 }
 
-std::uint64_t HostRuntime::IdleWakeDeadlineCycles() const {
+std::uint64_t HostRuntime::IdleWakeDeadlineCycles(bool include_decrementer) const {
   using GekkoAOT::NativeHW::Events::Deadlines;
   using GekkoAOT::NativeHW::Events::Earliest;
   using GekkoAOT::NativeHW::Events::Never;
 
   // An already-asserted source should be delivered immediately, not parked.
-  if (pi_.InterruptPending() || decrementer_pending_) return 0u;
+  if (pi_.InterruptPending() || (include_decrementer && decrementer_pending_)) return 0u;
 
   Deadlines deadlines{};
   deadlines.vi = vi_.CyclesUntilNextInterrupt();
@@ -8423,6 +8759,7 @@ std::uint64_t HostRuntime::IdleWakeDeadlineCycles() const {
   const std::uint64_t dec_ticks = static_cast<std::uint64_t>(spr_state_[kSprDec]) + 1ull;
   const std::uint64_t dec_scaled = dec_ticks * kTimerRatio;
   deadlines.decrementer =
+      !include_decrementer ? Never :
       dec_scaled > decrementer_cycle_remainder_
           ? dec_scaled - decrementer_cycle_remainder_
           : 1u;
@@ -8442,13 +8779,14 @@ std::uint64_t HostRuntime::IdleWakeDeadlineCycles() const {
   return Earliest(deadlines);
 }
 
-void HostRuntime::WaitForIdleEvent(RunResult& result,std::uint64_t maximum_cycles,bool masked_timer) {
+void HostRuntime::WaitForIdleEvent(RunResult& result,std::uint64_t maximum_cycles,bool masked_timer,
+                                   bool hold_decrementer) {
   // First publish any wall time that elapsed while the guest was entering the
   // idle path. This can itself latch the event we were about to wait for.
   AdvanceRuntimeCycles(0u, result, true);
   if (result.status == RunStatus::HostRequestedExit) return;
 
-  std::uint64_t deadline = std::min(IdleWakeDeadlineCycles(),maximum_cycles);
+  std::uint64_t deadline = std::min(IdleWakeDeadlineCycles(!hold_decrementer),maximum_cycles);
   // A proved finite counter delay can occur with interrupts masked. Pending
   // causes remain latched; they cannot end this timer wait until EE is restored.
   if(deadline==0u && masked_timer && (cpu_.msr&kPpcMsrEe)==0u) deadline=maximum_cycles;
@@ -8655,6 +8993,35 @@ void HostRuntime::ParkClockSpin(RunResult& result) {
   else cpu_.gpr[3]=static_cast<std::uint32_t>(t);
 }
 
+void HostRuntime::ParkYieldSpin() {
+  // v344: OSYieldThread with no ready peer of equal or higher priority returns
+  // at once, so a loop around it only ends when an interrupt, an alarm or a
+  // thread woken by one changes the awaited state. Cars spins ~30M such
+  // yields per second (7 guest cycles apart) on the main thread, inside one
+  // AOT chain that only ends at the next interrupt: a full host core. After
+  // 64 no-op yields from one site within 64 us, wait inside the yield for the
+  // next hardware/timer event and deliver it here, exactly like the
+  // OSDisableInterrupts entry fence: SRR0 is the yield's return address. The
+  // cap bounds the overshoot of a wait on an inline mftb clock to 250 us.
+  if (!active_result_ || !idle_event_wait_enabled_ || cpu_.exception ||
+      (cpu_.msr & kPpcMsrEe) == 0u || pi_.InterruptPending() || decrementer_pending_) {
+    ++yield_spin_declines_;
+    return;
+  }
+  auto& result = *active_result_;
+  const auto start = std::chrono::steady_clock::now();
+  ++yield_spin_parks_;
+  if (yield_spin_parks_ <= 8u)
+    std::fprintf(stderr, "GEKKOAOT_YIELD_SPIN_V344=1 lr=%08x parks=%llu wait=next-event cap_us=250\n",
+                 yield_noop_lr_, static_cast<unsigned long long>(yield_spin_parks_));
+  constexpr std::uint64_t kMaxParkCycles = GekkoAOT::HW::VI::NativeVI::CpuClockHz / 4000u;
+  WaitForIdleEvent(result, kMaxParkCycles, true);
+  yield_spin_park_ns_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - start).count());
+  if (result.status != RunStatus::HostRequestedExit && !TryTakeExternalInterrupt())
+    TryTakeDecrementerInterrupt();
+}
+
 void HostRuntime::ThrottleGuestRate(RunResult& result) {
   // Opt-in (GEKKOAOT_GUEST_RATE_CEILING_PCT): cap charged guest cycles at a
   // percentage of 486 MHz. A token bucket with a 20 ms burst keeps per-frame
@@ -8724,6 +9091,121 @@ void HostRuntime::ParkNativeReadPoll(RunResult& result) {
   }
 }
 
+void HostRuntime::NoteMmioPoll(std::uint32_t address, std::uint64_t value) {
+  // v347: a device status register read over and over with an unchanged value
+  // is a hardware wait (HP Sorcerer's Stone: `while (ARGetDMAStatus());`, ~11M
+  // DSPCR reads per second for every ARAM DMA). The reads happen inside one
+  // AOT chain, so sleep right here until the next modelled device/timer event
+  // (ARAM DMA completion, mailbox, DI/SI/EXI/AI deadlines), capped at 250 us.
+  // Nothing is delivered or skipped: the guest re-reads the register after the
+  // wait and observes the completion itself. Pending interrupts end the wait
+  // immediately (they are delivered at the next boundary as before).
+  static const bool trace = RuntimeEnvBool("GEKKOAOT_MMIO_POLL_TRACE", false);
+  if (trace) {
+    static std::uint64_t reads = 0; static unsigned window = 0, windows = 0;
+    if ((++reads & 0xfffffu) == 0u && windows < 16u) { window = 24u; ++windows; }
+    if (window) { --window; std::fprintf(stderr, "GEKKOAOT_MMIO_POLL_TRACE_V347 ea=%08x value=%llx msr=%x\n",
+                                         address, static_cast<unsigned long long>(value), cpu_.msr); }
+  }
+  if (!mmio_poll_park_enabled_ || !active_result_ || !idle_event_wait_enabled_) return;
+  if (address != mmio_poll_address_ || value != mmio_poll_value_) {
+    mmio_poll_address_ = address; mmio_poll_value_ = value; mmio_poll_count_ = 0u;
+    return;
+  }
+  if (++mmio_poll_count_ == 1u) mmio_poll_start_ = std::chrono::steady_clock::now();
+  if (mmio_poll_count_ < 64u) return;
+  const auto now = std::chrono::steady_clock::now();
+  mmio_poll_count_ = 0u;
+  if (now - mmio_poll_start_ > std::chrono::microseconds(64)) return;  // not a tight wait
+  ++mmio_poll_parks_;
+  if (mmio_poll_parks_ <= 8u)
+    std::fprintf(stderr, "GEKKOAOT_MMIO_POLL_PARK_V347=1 ea=%08x value=%llx parks=%llu wait=next-event cap_us=250\n",
+                 address, static_cast<unsigned long long>(value),
+                 static_cast<unsigned long long>(mmio_poll_parks_));
+  constexpr std::uint64_t kMaxParkCycles = GekkoAOT::HW::VI::NativeVI::CpuClockHz / 4000u;
+  WaitForIdleEvent(*active_result_, kMaxParkCycles, true);
+  mmio_poll_park_ns_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - now).count());
+}
+
+void HostRuntime::ParkFixedPointPoll(RunResult& result) {
+  // v346: an AOT wait loop side-exits at its header whenever its cycle budget
+  // runs out. When the same header keeps coming back, interpret one iteration
+  // in the spin-probe sandbox; if it is a fixed point (same registers, only
+  // re-stores of bytes RAM already holds, no HLE/MMIO/SPR/FP), nothing but an
+  // interrupt, DMA or another thread can end it: park until the next event.
+  // Nemo's `while (VIGetRetraceCount() - start < 2)` frame pacing burned ~40%
+  // of its main thread this way.
+  if(!fixed_point_park_enabled_ || !idle_event_wait_enabled_ || cpu_.exception ||
+     (cpu_.msr&kPpcMsrEe)==0u || pi_.InterruptPending() || decrementer_pending_) return;
+  const auto pc=cpu_.pc;
+  // A wait loop that side-exits at its header comes straight back to it; any
+  // other boundary in between means real work, not a candidate wait.
+  const bool repeated=pc==fixed_point_last_pc_;
+  fixed_point_last_pc_=pc;
+  if(!repeated) return;
+  auto& entry=fixed_points_[((pc>>2u)^(pc>>9u))&(fixed_points_.size()-1u)];
+  if(entry.pc!=pc) entry={pc,0u,0u,0u,false};
+  if(entry.cooldown) {--entry.cooldown;return;}
+  // A proven wait site is re-probed at once: its failures are the iterations
+  // that leave the wait, and the next wait must not spin through a cooldown.
+  if(++entry.hits<(entry.proven ? 1u : 4u)) return;
+  struct Memory {
+    HostRuntime* self;
+    bool Read(std::uint32_t ea,unsigned size,std::uint32_t* value) const {
+      if((ea>>28u)!=0x8u && (ea>>28u)!=0xcu) return false;  // cached/uncached MEM1 only
+      const auto& mem1=self->memory_.Mem1();
+      const auto physical=AddressSpace::ToPhysical(ea);
+      if(physical>=mem1.size() || mem1.size()-physical<size) return false;
+      const auto* p=mem1.data()+physical;
+      std::uint32_t v=0;
+      for(unsigned i=0;i<size;++i) v=(v<<8u)|p[i];
+      *value=v;
+      return true;
+    }
+    bool Fetch(std::uint32_t ea,std::uint32_t* word) const {return !(ea&3u) && Read(ea,4u,word);}
+    bool Foreign(std::uint32_t target) const {
+      return self->os_hooks_.count(target)!=0u || self->simple_hle_hooks_.count(target)!=0u;
+    }
+  } memory{this};
+  SpinProbeState state;
+  for(unsigned i=0;i<32u;++i) state.gpr[i]=cpu_.gpr[i];
+  state.cr=cpu_.cr;state.xer=cpu_.xer;state.lr=cpu_.lr;state.ctr=cpu_.ctr;
+  ++fixed_point_probes_;
+  std::array<std::uint32_t,3> why{};
+  if(!spin_probe_.FixedPoint(state,pc,memory,&why)) {
+    static const bool trace=RuntimeEnvBool("GEKKOAOT_FIXED_POINT_TRACE",false);
+    static std::vector<std::uint32_t> traced;
+    static const std::uint32_t trace_pc=[] {
+      const char* v=std::getenv("GEKKOAOT_FIXED_POINT_TRACE_PC");
+      return v ? static_cast<std::uint32_t>(std::strtoul(v,nullptr,16)) : 0u;
+    }();
+    static unsigned pc_logs=0u;
+    if(trace && ((pc==trace_pc && pc_logs++<64u) ||
+                 (traced.size()<4096u && std::find(traced.begin(),traced.end(),pc)==traced.end()))) {
+      traced.push_back(pc);
+      std::fprintf(stderr,"GEKKOAOT_FIXED_POINT_TRACE_V346 pc=%08x lr=%08x reason=%u at=%08x word=%08x\n",
+                   pc,cpu_.lr,why[2],why[0],why[1]);
+    }
+    // Unproven sites back off exponentially (64 .. 1M re-entries).
+    entry.cooldown=entry.proven ? 0u : (64u<<std::min<std::uint32_t>(entry.failures,14u));
+    if(!entry.proven) ++entry.failures;
+    entry.hits=0u;return;
+  }
+  entry.proven=true;entry.hits=0u;
+  ++fixed_point_parks_;
+  if(fixed_point_parks_<=8u || (fixed_point_parks_&1023u)==0u)
+    std::fprintf(stderr,"GEKKOAOT_FIXED_POINT_POLL_V346=1 pc=%08x lr=%08x parks=%llu wait=next-event\n",
+                 pc,cpu_.lr,static_cast<unsigned long long>(fixed_point_parks_));
+  const auto park_start=std::chrono::steady_clock::now();
+  WaitForIdleEvent(result);
+  fixed_point_park_ns_+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now()-park_start).count());
+  static const bool deliver=RuntimeEnvBool("GEKKOAOT_FIXED_POINT_DELIVER",true);
+  if(deliver && result.status!=RunStatus::HostRequestedExit && !TryTakeExternalInterrupt())
+    TryTakeDecrementerInterrupt();
+}
+
 void HostRuntime::ParkSdkIdlePoll(RunResult& result) {
   if (!sdk_idle_park_enabled_) return;
 
@@ -8760,7 +9242,8 @@ void HostRuntime::ParkSdkIdlePoll(RunResult& result) {
   // GoldenEye's 10-tick job-worker alarms keep DEC pending almost permanently,
   // so its ~90 DrawDone/frame each waited ~4 ms for an unrelated sync point.
   native_gx_.PublishPendingWrites();
-  if ((cpu_.msr & kPpcMsrEe) == 0u || pi_.InterruptPending() || decrementer_pending_) return;
+  if ((cpu_.msr & kPpcMsrEe) == 0u || pi_.InterruptPending() ||
+      (decrementer_pending_ && !idle_dec_quantum_ticks_)) return;
 
   const std::int16_t offset = probe.idle_offset;
   if (sdk_idle_poll_pc_ != pc || sdk_idle_poll_offset_ != offset) {
@@ -8778,6 +9261,27 @@ void HostRuntime::ParkSdkIdlePoll(RunResult& result) {
   if (!memory_.Read32(queue, &runnable) || runnable != 0u) return;
 
   CountHostEffect();  // already parked by the SDK idle-poll recognizer
+  // v355: with no runnable thread, a decrementer due again within the
+  // coalescing quantum only re-enters this idle loop through a tiny alarm
+  // (EA's THREAD_yieldticks(10) worker loop: ~300k DEC/s in MoH Rising Sun
+  // and GoldenEye). Hold the DEC until the quantum ends or any other device
+  // raises an event, as if the CPU had been busy for that long.
+  if (idle_dec_quantum_ticks_ && idle_event_wait_enabled_) {
+    const std::uint64_t since = cpu_.timebase - idle_dec_last_tb_;
+    const std::uint64_t dec_ticks = static_cast<std::uint64_t>(spr_state_[kSprDec]) + 1ull;
+    if (since < idle_dec_quantum_ticks_ && (decrementer_pending_ || dec_ticks < idle_dec_quantum_ticks_)) {
+      ++idle_dec_coalesced_;
+      WaitForIdleEvent(result, (idle_dec_quantum_ticks_ - since) * kTimerRatio, false, true);
+      if (TryTakeExternalInterrupt()) return;
+      if (TryTakeDecrementerInterrupt()) idle_dec_last_tb_ = cpu_.timebase;
+      return;
+    }
+    if (decrementer_pending_) {
+      TryTakeExternalInterrupt();
+      if (TryTakeDecrementerInterrupt()) idle_dec_last_tb_ = cpu_.timebase;
+      return;
+    }
+  }
   // v158: the guest SDK idle loop gets the same event-driven park as NativeOS.
   // The previous half-line wait woke tens of thousands of times per second and
   // left SelectThread/RunQueue polling as a visible perf hotspot. Sleep until
@@ -8785,6 +9289,11 @@ void HostRuntime::ParkSdkIdlePoll(RunResult& result) {
   // cap), then let the original guest poll/exception path continue unchanged.
   if (idle_event_wait_enabled_) {
     WaitForIdleEvent(result);
+    if (decrementer_pending_ && idle_dec_quantum_ticks_) {
+      TryTakeExternalInterrupt();
+      if (TryTakeDecrementerInterrupt()) idle_dec_last_tb_ = cpu_.timebase;
+      return;
+    }
   } else {
     const auto cycles = vi_.CyclesUntilHalfLine();
     if (cycles == 0u) return;
@@ -8800,6 +9309,9 @@ void HostRuntime::ParkSdkIdlePoll(RunResult& result) {
 
 RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
   RunResult result{};
+  // Host calls inside AOT chains (v344 yield parking) wait on this run.
+  struct ActiveRun { RunResult*& slot; ~ActiveRun() { slot = nullptr; } } active_run{active_result_};
+  active_result_ = &result;
   if (!module_.Descriptor()) {
     result.status = RunStatus::ModuleNotLoaded;
     return result;
@@ -8807,6 +9319,64 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
 
   const auto* descriptor = module_.Descriptor();
   fault_ = {};
+
+  // Diagnostic: GEKKOAOT_STALL_WATCHDOG_S=<n> samples the (racy) guest
+  // registers every n seconds from a host thread, so a guest loop that never
+  // advances hardware time (no stats, no host exit) still shows where it is.
+  // Diagnostic: GEKKOAOT_WATCH_ADDRS=a,b,... samples guest words every 200 us
+  // and logs each change with the current OSThread and the (racy) PC.
+  std::jthread memory_watch;
+  if (const char* watch = std::getenv("GEKKOAOT_WATCH_ADDRS"); watch && *watch) {
+    std::vector<std::uint32_t> addresses;
+    for (const char* p = watch; *p;) {
+      char* end = nullptr;
+      const auto value = std::strtoul(p, &end, 16);
+      if (end == p) break;
+      addresses.push_back(static_cast<std::uint32_t>(value));
+      p = *end == ',' ? end + 1 : end;
+    }
+    memory_watch = std::jthread([this, addresses](std::stop_token stop) {
+      std::vector<std::uint32_t> last(addresses.size(), 0xdeadbeefu);
+      unsigned logs = 0;
+      while (!stop.stop_requested() && logs < 20000u) {
+        for (std::size_t i = 0; i < addresses.size(); ++i) {
+          std::uint32_t value = 0, thread = 0;
+          if (!memory_.Read32(addresses[i], &value) || value == last[i]) continue;
+          memory_.Read32(0x800000e4u, &thread);
+          last[i] = value;
+          ++logs;
+          std::fprintf(stderr, "GEKKOAOT_WATCH addr=%08x value=%08x thread=%08x pc=%08x lr=%08x tb=%llx\n",
+                       addresses[i], value, thread, cpu_.pc, cpu_.lr,
+                       static_cast<unsigned long long>(cpu_.timebase));
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+    });
+  }
+
+  std::jthread stall_watchdog;
+  if (const std::uint32_t period = RuntimeEnvU32("GEKKOAOT_STALL_WATCHDOG_S", 0u, 3600u)) {
+    stall_watchdog = std::jthread([this, period](std::stop_token stop) {
+      unsigned samples = 0;
+      while (!stop.stop_requested() && samples < 600u) {
+        for (std::uint32_t i = 0; i < period * 10u && !stop.stop_requested(); ++i)
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (stop.stop_requested()) break;
+        const CPUState snapshot = cpu_;
+        std::fprintf(stderr,
+                     "GEKKOAOT_STALL_WATCHDOG n=%u pc=%08x lr=%08x ctr=%08x msr=%08x r1=%08x r3=%08x r4=%08x r5=%08x r6=%08x r31=%08x tb=%llx "
+                     "pi=%05x/%04x dsp=%04x aid_ctl=%04x aid_debt=%llu aid_irqs=%llu\n",
+                     ++samples, snapshot.pc, snapshot.lr, snapshot.ctr, snapshot.msr,
+                     snapshot.gpr[1], snapshot.gpr[3], snapshot.gpr[4], snapshot.gpr[5],
+                     snapshot.gpr[6], snapshot.gpr[31],
+                     static_cast<unsigned long long>(snapshot.timebase),
+                     pi_.InterruptCauseValue(), pi_.InterruptMaskValue(), dsp_.Control(),
+                     dsp_.AudioDmaControl(),
+                     static_cast<unsigned long long>(dsp_.AudioDmaPendingBlocks()),
+                     static_cast<unsigned long long>(dsp_.AidInterruptCount()));
+      }
+    });
+  }
 
   // Device MMIO writes and AdvanceRuntimeCycles keep PI causes synchronized.
   // Seed the initial state once, rather than polling every device again before
@@ -8827,12 +9397,20 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
   native_read_poll_enabled_=RuntimeEnvBool("GEKKOAOT_NATIVE_READ_POLL",false);
   native_counter_poll_enabled_=RuntimeEnvBool("GEKKOAOT_NATIVE_COUNTER_POLL",false);
   clock_spin_enabled_=RuntimeEnvBool("GEKKOAOT_CLOCK_SPIN_PARK",true);
+  yield_spin_enabled_=RuntimeEnvBool("GEKKOAOT_YIELD_SPIN_PARK",true);
+  fixed_point_park_enabled_=RuntimeEnvBool("GEKKOAOT_FIXED_POINT_PARK",true);
+  mmio_poll_park_enabled_=RuntimeEnvBool("GEKKOAOT_MMIO_POLL_PARK",true);
+  idle_dec_quantum_ticks_=static_cast<std::uint64_t>(RuntimeEnvU32("GEKKOAOT_IDLE_DEC_QUANTUM_US",100u,10000u))*
+                          (GekkoAOT::HW::VI::NativeVI::CpuClockHz/kTimerRatio)/1000000u;
   // Opt-in power cap: generated code's cycle charge is not a Gekko cycle count
   // (DNDD01 legitimately charges ~1.9 GHz at 60 fps and drops to 38 fps under
   // a 200% cap), so no default ceiling is safe.
   guest_rate_ceiling_pct_=RuntimeEnvU32("GEKKOAOT_GUEST_RATE_CEILING_PCT",0u,100000u);
   aot_poll_park_enabled_ = RuntimeEnvBool("GEKKOAOT_AOT_POLL_PARK", true);
   leaf_tail_enabled_ = RuntimeEnvBool("GEKKOAOT_LEAF_TAIL", true);
+  // Opt-in until measured: the SFA A/B showed no boundary change (the
+  // matrix HLE may reach the host through another callback).
+  gx_matrix_chain_enabled_ = RuntimeEnvBool("GEKKOAOT_GX_MATRIX_CHAIN", false);
   ee_pending_query_enabled_ = RuntimeEnvBool("GEKKOAOT_EE_PENDING_QUERY", true);
   boundary_profile_enabled_ = RuntimeEnvBool("GEKKOAOT_BOUNDARY_PROFILE", false);
   // Diagnostic counters (boundaries, host effects, EE queries, leaf tails,
@@ -8969,6 +9547,7 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
     ParkSdkIdlePoll(result);
     ParkNativeCounterPoll(result);
     ParkNativeReadPoll(result);
+    ParkFixedPointPoll(result);
     if (result.status == RunStatus::HostRequestedExit) break;
 
     const std::uint32_t native_os_pc = cpu_.pc;
@@ -9321,12 +9900,15 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
     };
     result.halt_text_08 = read_guest_text(result.halt_stack_word_08);
     result.halt_text_10 = read_guest_text(result.halt_stack_word_10);
+  }
 
+  if (result.status != RunStatus::Completed && result.status != RunStatus::HostRequestedExit) {
     // PowerPC EABI frames are chained through 0(r1). The callee normally
     // saves its incoming LR in the caller linkage area at caller_sp + 4.
     // Walking that linkage after a terminal SDK PPCHalt reveals the routine
-    // that entered OSPanic without changing guest control flow.
-    std::uint32_t frame_sp = sp;
+    // that entered OSPanic, and after a fault the guest callers of the
+    // faulting routine, without changing guest control flow.
+    std::uint32_t frame_sp = result.stack_pointer;
     for (std::size_t depth = 0; depth < result.halt_frame_sp.size(); ++depth) {
       std::uint32_t caller_sp = 0;
       if (!memory_.Read32(frame_sp, &caller_sp)) break;

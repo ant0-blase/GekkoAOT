@@ -19,6 +19,7 @@ aurora::gfx::EncoderTaskId g_write_task = aurora::gfx::InvalidEncoderTask;
 std::array<std::uint16_t, 4> g_cached{};
 bool g_active = false;
 bool g_valid = true;
+bool g_read = false;
 struct PairWrite { std::uint32_t index, first, second; };
 
 void EncodePair(const aurora::gfx::EncoderTaskContext& ctx,
@@ -55,6 +56,7 @@ extern "C" bool gekkoaot_bbox_active() { return g_active; }
 
 namespace GekkoAOT::GX {
 bool NativeBoundingBoxActive() { return g_active; }
+bool NativeBoundingBoxRead() { return g_read; }
 
 bool WriteNativeBoundingBox(std::uint32_t reg, std::uint32_t value) {
   if (reg != 0x55u && reg != 0x56u) return false;
@@ -84,6 +86,7 @@ bool ReadNativeBoundingBox(std::uint16_t* bounds) {
   // Hardware stops bounding-box accumulation on any PE bbox read. The four
   // sequential GXReadBoundingBox loads must observe one coherent result.
   g_active = false;
+  g_read = true;
   aurora::gx::g_gxState.dirty |= aurora::gx::DirtyPipeline;
   if (!g_valid) {
     const wgpu::BufferDescriptor descriptor{
