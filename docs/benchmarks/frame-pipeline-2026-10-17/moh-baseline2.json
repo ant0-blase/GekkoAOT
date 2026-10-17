@@ -1,0 +1,263 @@
+{
+  "schema": 1,
+  "start_ns": 40462896405565,
+  "end_ns": 40482936740725,
+  "stored_events": 159705,
+  "dropped_trace_events": 0,
+  "aot_trace_stride": 256,
+  "physical_scanout_measured": false,
+  "metrics": [
+    {
+      "name": "aot_main_inclusive",
+      "count": 4827293,
+      "total_ns": 79180782,
+      "p50_ns": 14,
+      "p95_ns": 25,
+      "p99_ns": 59,
+      "max_ns": 54105
+    },
+    {
+      "name": "aot_secondary_inclusive",
+      "count": 4827293,
+      "total_ns": 11777017019,
+      "p50_ns": 387,
+      "p95_ns": 7263,
+      "p99_ns": 24575,
+      "max_ns": 21323399
+    },
+    {
+      "name": "idle_wait",
+      "count": 17350,
+      "total_ns": 6950830434,
+      "p50_ns": 1479,
+      "p95_ns": 2064383,
+      "p99_ns": 2076671,
+      "max_ns": 3906173
+    },
+    {
+      "name": "poll_park_inclusive",
+      "count": 5175067,
+      "total_ns": 1947240245,
+      "p50_ns": 17,
+      "p95_ns": 40,
+      "p99_ns": 151,
+      "max_ns": 4631315
+    },
+    {
+      "name": "gx_queue_full",
+      "count": 14,
+      "total_ns": 37807328,
+      "p50_ns": 595967,
+      "p95_ns": 21364735,
+      "p99_ns": 21364735,
+      "max_ns": 21308352
+    },
+    {
+      "name": "gx_queue_empty",
+      "count": 1233326,
+      "total_ns": 16119435006,
+      "p50_ns": 35,
+      "p95_ns": 13055,
+      "p99_ns": 60799,
+      "max_ns": 21574200
+    },
+    {
+      "name": "gx_parser",
+      "count": 1233326,
+      "total_ns": 3262358525,
+      "p50_ns": 93,
+      "p95_ns": 9023,
+      "p99_ns": 17151,
+      "max_ns": 1921440
+    },
+    {
+      "name": "gx_drain",
+      "count": 2,
+      "total_ns": 18765,
+      "p50_ns": 5839,
+      "p95_ns": 12927,
+      "p99_ns": 12927,
+      "max_ns": 12927
+    },
+    {
+      "name": "render_queue_full",
+      "count": 7885,
+      "total_ns": 178027,
+      "p50_ns": 15,
+      "p95_ns": 44,
+      "p99_ns": 145,
+      "max_ns": 1410
+    },
+    {
+      "name": "render_queue_empty",
+      "count": 24428,
+      "total_ns": 18658355743,
+      "p50_ns": 1056767,
+      "p95_ns": 1077247,
+      "p99_ns": 1101823,
+      "max_ns": 2693962
+    },
+    {
+      "name": "render_work_inclusive",
+      "count": 7888,
+      "total_ns": 1364938142,
+      "p50_ns": 19647,
+      "p95_ns": 823295,
+      "p99_ns": 1122303,
+      "max_ns": 1479470
+    },
+    {
+      "name": "disc_read",
+      "count": 30,
+      "total_ns": 177896,
+      "p50_ns": 4575,
+      "p95_ns": 13119,
+      "p99_ns": 14847,
+      "max_ns": 14843
+    },
+    {
+      "name": "dsp_work",
+      "count": 104272,
+      "total_ns": 22949582,
+      "p50_ns": 45,
+      "p95_ns": 721,
+      "p99_ns": 2983,
+      "max_ns": 51104
+    },
+    {
+      "name": "guest_frame_observed",
+      "count": 1659,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "present_request",
+      "count": 1202,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "pe_command_parsed",
+      "count": 836,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "pe_guest_delivery",
+      "count": 836,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "vi_field_observed",
+      "count": 1201,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "xfb_publish",
+      "count": 1671,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "frame_begin",
+      "count": 1671,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "frame_end",
+      "count": 1671,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "gpu_submit",
+      "count": 1672,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "gpu_staging_ready",
+      "count": 1672,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "render_queue_age",
+      "count": 7885,
+      "total_ns": 3926191099,
+      "p50_ns": 416767,
+      "p95_ns": 1347583,
+      "p99_ns": 1593343,
+      "max_ns": 2096513
+    },
+    {
+      "name": "wsi_success",
+      "count": 831,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "xfb_selected",
+      "count": 1201,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "scanout_duplicate",
+      "count": 370,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "name": "gpu_complete",
+      "count": 1670,
+      "total_ns": 0,
+      "p50_ns": 0,
+      "p95_ns": 0,
+      "p99_ns": 0,
+      "max_ns": 0
+    }
+  ]
+}

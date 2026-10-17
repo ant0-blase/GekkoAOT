@@ -1144,3 +1144,12 @@ endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_LIST_DIR}/aurora_frame_replay_v358.py"
   "${CMAKE_CURRENT_LIST_DIR}/aurora_replay_efb_start_v360.py")
+
+# Capture after all overlays, so events refer to the final frame/worker path.
+configure_file("${CMAKE_CURRENT_LIST_DIR}/../../perf/capture.h"
+  "${GEKKOAOT_AURORA_SOURCE}/lib/gekkoaot_capture.hpp" COPYONLY)
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_capture_profile.py" "${GEKKOAOT_AURORA_SOURCE}"
+  COMMAND_ERROR_IS_FATAL ANY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_LIST_DIR}/aurora_capture_profile.py")

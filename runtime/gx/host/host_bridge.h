@@ -293,6 +293,7 @@ private:
     // v300: ordered host commands share the FIFO queue. MemoryWrites stores
     // `size` (address,bytes) pairs in `bytes`; PresentXfb uses `args`.
     AsyncKind kind = AsyncKind::Burst;
+    std::uint64_t capture_queued = 0;
     std::array<std::uint32_t, 5> args{};
     std::array<ArrayHint,kArrayHints> arrays{};
     unsigned array_count=0;

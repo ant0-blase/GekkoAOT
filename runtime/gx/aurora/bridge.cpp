@@ -14,6 +14,7 @@
 #include "gx/command_processor.hpp"
 #include "gx/regs.hpp"
 #include "gx/gx.hpp"
+#include "../../perf/capture.h"
 #include "gx/texture.hpp"
 #include "gfx/render_worker.hpp"
 #include "gfx/clear.hpp"
@@ -530,6 +531,7 @@ struct XfbZeroCopySlot {
   std::uint64_t generation = 0;
   // Profile only: last generation handed to VI scanout (dead-copy accounting).
   std::uint64_t presented_generation = 0;
+  std::uint64_t capture_frame = 0;
   bool valid = false;
   bool force_43 = false; // v363: recorded at the original 4:3
   // Own the resolved XFB independently from the live EFB.  This is the key
@@ -3458,6 +3460,7 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
   slot->native_height = copy_height;
   slot->span_bytes = static_cast<std::uint64_t>(slot->stride_bytes) * copy_height;
   slot->generation = ++g_xfb_generation;
+  slot->capture_frame = GekkoAOT::Capture::frame_id;
   slot->valid = true;
   slot->force_43 = g_recorded_force_43;
 
@@ -3568,6 +3571,7 @@ bool LatchDisplayCopyCached(std::uint32_t trigger_word, bool clear) {
   }
   if (!g_quit && aurora_begin_frame()) g_frame_open = true;
 
+  GekkoAOT::Capture::Mark(GekkoAOT::Capture::Kind::XfbPublish, slot->capture_frame, g_copy_dest_physical);
   g_frame_ready_xfb.store(g_copy_dest_physical, std::memory_order_release);
 
   const unsigned frame_to_field = static_cast<unsigned>((trigger_word >> 12u) & 3u);
@@ -3904,8 +3908,13 @@ void PresentViXfb(std::uint32_t top, std::uint32_t bottom, bool address_keyed,
     // acquisition/present is retried at the next VI field; only success allows
     // deduplication. This preserves pipelining without a new CPU/GPU wait.
     slot->presented_generation = slot->generation;
-    aurora::gfx::render_worker::enqueue_work([retained = *source, scanout, force_43 = slot->force_43] {
-      if (g_cached_scanout.Duplicate(scanout)) return;
+    aurora::gfx::render_worker::enqueue_work([retained = *source, scanout, force_43 = slot->force_43, captureFrame = slot->capture_frame] {
+      GekkoAOT::Capture::FrameContext context(captureFrame);
+      GekkoAOT::Capture::Mark(GekkoAOT::Capture::Kind::XfbSelected, captureFrame, scanout.generation);
+      if (g_cached_scanout.Duplicate(scanout)) {
+        GekkoAOT::Capture::Mark(GekkoAOT::Capture::Kind::ScanoutDuplicate, captureFrame);
+        return;
+      }
       const auto before = aurora::gfx::presentation_count();
       g_present_force_43 = force_43;
       PresentFinalTexture(retained);
@@ -4695,7 +4704,10 @@ bool ProcessOne(const std::uint8_t* p, std::size_t len, unsigned depth) {
     if((reg>=0x94u&&reg<=0x97u)||(reg>=0xB4u&&reg<=0xB7u)) MapTextureImage3(reg,effective_word);
     if(reg==0x65u) MapTlut();
     if(g_pe&&(reg==0x45u||reg==0x47u||reg==0x48u))
-      g_pe(g_pe_user,reg,effective_word&0x00ffffffu);
+      {
+        GekkoAOT::Capture::Mark(GekkoAOT::Capture::Kind::PeCommandParsed, reg, effective_word&0x00ffffffu);
+        g_pe(g_pe_user,reg,effective_word&0x00ffffffu);
+      }
     return true;
   }
 
@@ -5287,6 +5299,16 @@ bool PrepareX11Embed() {
   return true;
 }
 #endif
+}
+
+GEKKOAOT_GX_EXPORT void gekkoaot_native_gx_capture_sink_v1(
+    const GekkoAOT::Capture::Sink* sink, std::uint32_t bytes) {
+  if (!GekkoAOT::Capture::Compatible(sink, bytes)) {
+    std::fprintf(stderr,"GEKKOAOT_CAPTURE_BIND_V1=0 reason=telemetry-abi-mismatch\n");
+    return;
+  }
+  GekkoAOT::Capture::SetSink(*sink);
+  if(sink->record) std::fprintf(stderr,"GEKKOAOT_CAPTURE_BIND_V1=1\n");
 }
 
 GEKKOAOT_GX_EXPORT bool gekkoaot_native_gx_init(HostResolveFn resolve, void* user) {

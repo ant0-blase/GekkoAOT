@@ -1,0 +1,280 @@
+{
+  "schema": 1,
+  "pid": 295971,
+  "proof": {
+    "stage": "gameplay",
+    "reviewed": true,
+    "capture": "aim-check3.png",
+    "scene": "D-Day shoreline, level camera faces beach, live rifle and HUD. No menu/intro/sky-only data."
+  },
+  "before": {
+    "wall_ns": 40462871821061,
+    "process": {
+      "name": "Main thread",
+      "ticks": 27539,
+      "start_ticks": 4011838
+    },
+    "threads": {
+      "295971": {
+        "name": "Main thread",
+        "ticks": 21745,
+        "start_ticks": 4011838
+      },
+      "295972": {
+        "name": "gekkoaot-native",
+        "ticks": 19,
+        "start_ticks": 4011841
+      },
+      "295973": {
+        "name": "libusb_event",
+        "ticks": 0,
+        "start_ticks": 4011842
+      },
+      "295974": {
+        "name": "libusb",
+        "ticks": 0,
+        "start_ticks": 4011842
+      },
+      "295975": {
+        "name": "gekkoaot-native",
+        "ticks": 13,
+        "start_ticks": 4011850
+      },
+      "295978": {
+        "name": "gekkoao:disk$0",
+        "ticks": 0,
+        "start_ticks": 4011853
+      },
+      "295982": {
+        "name": "gekkoa:traceq0",
+        "ticks": 0,
+        "start_ticks": 4011854
+      },
+      "295983": {
+        "name": "gekkoao:disk$1",
+        "ticks": 0,
+        "start_ticks": 4011854
+      },
+      "295984": {
+        "name": "gekkoao:disk$2",
+        "ticks": 0,
+        "start_ticks": 4011854
+      },
+      "295985": {
+        "name": "gekkoao:disk$3",
+        "ticks": 0,
+        "start_ticks": 4011854
+      },
+      "295986": {
+        "name": "Aurora render w",
+        "ticks": 1673,
+        "start_ticks": 4011855
+      },
+      "295987": {
+        "name": "Main thread",
+        "ticks": 14,
+        "start_ticks": 4011857
+      },
+      "295988": {
+        "name": "Main thread",
+        "ticks": 0,
+        "start_ticks": 4011897
+      },
+      "295989": {
+        "name": "Aurora FIFO pro",
+        "ticks": 0,
+        "start_ticks": 4011897
+      },
+      "295990": {
+        "name": "GekkoAOT-GX",
+        "ticks": 4042,
+        "start_ticks": 4011900
+      },
+      "295991": {
+        "name": "SDLAudioP15",
+        "ticks": 26,
+        "start_ticks": 4011902
+      }
+    }
+  },
+  "after": {
+    "wall_ns": 40482939263171,
+    "process": {
+      "name": "Main thread",
+      "ticks": 29316,
+      "start_ticks": 4011838
+    },
+    "threads": {
+      "295971": {
+        "name": "Main thread",
+        "ticks": 23023,
+        "start_ticks": 4011838
+      },
+      "295972": {
+        "name": "gekkoaot-native",
+        "ticks": 20,
+        "start_ticks": 4011841
+      },
+      "295973": {
+        "name": "libusb_event",
+        "ticks": 0,
+        "start_ticks": 4011842
+      },
+      "295974": {
+        "name": "libusb",
+        "ticks": 0,
+        "start_ticks": 4011842
+      },
+      "295975": {
+        "name": "gekkoaot-native",
+        "ticks": 13,
+        "start_ticks": 4011850
+      },
+      "295978": {
+        "name": "gekkoao:disk$0",
+        "ticks": 0,
+        "start_ticks": 4011853
+      },
+      "295982": {
+        "name": "gekkoa:traceq0",
+        "ticks": 0,
+        "start_ticks": 4011854
+      },
+      "295983": {
+        "name": "gekkoao:disk$1",
+        "ticks": 0,
+        "start_ticks": 4011854
+      },
+      "295984": {
+        "name": "gekkoao:disk$2",
+        "ticks": 0,
+        "start_ticks": 4011854
+      },
+      "295985": {
+        "name": "gekkoao:disk$3",
+        "ticks": 0,
+        "start_ticks": 4011854
+      },
+      "295986": {
+        "name": "Aurora render w",
+        "ticks": 1814,
+        "start_ticks": 4011855
+      },
+      "295987": {
+        "name": "Main thread",
+        "ticks": 14,
+        "start_ticks": 4011857
+      },
+      "295988": {
+        "name": "Main thread",
+        "ticks": 0,
+        "start_ticks": 4011897
+      },
+      "295989": {
+        "name": "Aurora FIFO pro",
+        "ticks": 0,
+        "start_ticks": 4011897
+      },
+      "295990": {
+        "name": "GekkoAOT-GX",
+        "ticks": 4397,
+        "start_ticks": 4011900
+      },
+      "295991": {
+        "name": "SDLAudioP15",
+        "ticks": 27,
+        "start_ticks": 4011902
+      }
+    }
+  },
+  "cpu": {
+    "seconds": 20.06744211,
+    "tick_hz": 100,
+    "threads": {
+      "295971": {
+        "name": "Main thread",
+        "cpu_seconds": 12.78,
+        "percent_one_core": 63.68524662957156
+      },
+      "295972": {
+        "name": "gekkoaot-native",
+        "cpu_seconds": 0.01,
+        "percent_one_core": 0.04983196136899183
+      },
+      "295973": {
+        "name": "libusb_event",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295974": {
+        "name": "libusb",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295975": {
+        "name": "gekkoaot-native",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295978": {
+        "name": "gekkoao:disk$0",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295982": {
+        "name": "gekkoa:traceq0",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295983": {
+        "name": "gekkoao:disk$1",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295984": {
+        "name": "gekkoao:disk$2",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295985": {
+        "name": "gekkoao:disk$3",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295986": {
+        "name": "Aurora render w",
+        "cpu_seconds": 1.41,
+        "percent_one_core": 7.026306553027848
+      },
+      "295987": {
+        "name": "Main thread",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295988": {
+        "name": "Main thread",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295989": {
+        "name": "Aurora FIFO pro",
+        "cpu_seconds": 0.0,
+        "percent_one_core": 0.0
+      },
+      "295990": {
+        "name": "GekkoAOT-GX",
+        "cpu_seconds": 3.55,
+        "percent_one_core": 17.6903462859921
+      },
+      "295991": {
+        "name": "SDLAudioP15",
+        "cpu_seconds": 0.01,
+        "percent_one_core": 0.04983196136899183
+      }
+    },
+    "incomplete_threads": [],
+    "process_cpu_seconds": 17.77,
+    "process_percent_one_core": 88.55139535269848
+  },
+  "scope": "Linux tick accounting; controller arming and flush margin included. No perf samples mixed in."
+}

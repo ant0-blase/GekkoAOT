@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "baseline_commit": "ae0aac267b1dd74fad57676f3f8cae3837bcb0fa",
+  "context": "local uncommitted NativeSDK, CPU-timer experiment and GX coherency work preserved. Both MOH runs use the exact same frozen runner, bridge and modules. Only render event-wait flag differs; health/time-of-mission differ, so FPS changes are not causal gains.",
+  "host": "Linux-7.3.0-rc5-1-cachyos-rc-x86_64-with-glibc2.44",
+  "common_flags": {
+    "native_only": 0,
+    "native_os": 1,
+    "native_hw": 1,
+    "runtime_parallel": 1,
+    "cpu_timer_guest_work": 0,
+    "guest_rate_ceiling_pct": 0,
+    "frame_interpolation": 0,
+    "typed_arrays": 0,
+    "direct_matrices": 1,
+    "width": 1920,
+    "height": 1080,
+    "SDL_audio": "dummy",
+    "window": "private Gamescope headless"
+  },
+  "hashes": {
+    "gekkoaot-native-run": "843ad59742abbe1e11c8e48e9d4d0ead263f504f21fc3d1d2e9e86d2cbd0f6a0",
+    "capture-gx2.so": "5d5ce126132657ae4c2005f4c26f596b4ebdc3e168c605702eb9b995d1881b62",
+    "gGMFE69_recomp.so": "20bf7509b5662310b6d20a615da66f747a2907023854deb3e42348e36fe6f311",
+    "native-intercepts-v21-855cc26ab452b8b8.txt": "80787da83f4af64178046ff88888b8971bea6b25c1b525c4932c40367e56a03b",
+    "gGMFE69_exec_2813def117773ddd.so": "ec898d8851b9598904e34d6111a5b48dffcf62d0326ec882d8d314d04e5f9670",
+    "gGMFE69_exec_eff9e825b40f3def.so": "03f67d0f5dca7a3377d93d7e631222a47815f0a903809d22069dfa1e8b59ef74",
+    "gGMFE69_exec_b9069b956a723fbf.so": "71450e3a29a97b806eeacd3eefc318615ef8e2e85d5fa4a99b45ef56d4c343d8"
+  }
+}

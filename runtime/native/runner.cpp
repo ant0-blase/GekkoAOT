@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "native/runtime.h"
+#include "perf/capture_session.h"
 #include "native/sdk_autoresolver.h"
 
 #include <algorithm>
@@ -310,6 +311,7 @@ int main(int argc, char** argv) {
   if (!options) { Usage(argv[0]); return 2; }
 
   try {
+    GekkoAOT::Capture::Controller capture;
     GekkoAOT::Native::HostRuntime runtime(options->mem2);
     const char* expected = options->game_id.empty() ? nullptr : options->game_id.c_str();
     if (!options->module.empty()) {
@@ -534,6 +536,7 @@ int main(int argc, char** argv) {
 
     // Stop the asynchronous renderer before emitting the final result and
     // before HostRuntime starts tearing down input/disc/memory in its destructor.
+    capture.Finish();
     if (!pgo_stop_observed) runtime.ShutdownNativeGX();
 
     std::cout << "GEKKOAOT_NATIVE_RUN_RESULT status=\""

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gx/host/host_bridge.h"
+#include "perf/capture.h"
 
 #include <algorithm>
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -208,6 +209,9 @@ bool HostBridge::Open(const std::filesystem::path& path, Native::AddressSpace& m
   async_backpressure_waits_ = 0u;
   async_queue_.clear();
 
+  using CaptureSinkFn = void (*)(const Capture::Sink*, std::uint32_t);
+  if (const auto configure = reinterpret_cast<CaptureSinkFn>(FindSymbol("gekkoaot_native_gx_capture_sink_v1")))
+    configure(&Capture::LocalSink(), sizeof(Capture::Sink));
   if (!init_(&HostBridge::ResolveGuest, this)) {
     last_error_ = "native GX plugin initialization failed";
     Close();
@@ -457,6 +461,7 @@ bool HostBridge::EnqueueBurst(const std::uint8_t* bytes, std::uint32_t size,
     std::unique_lock lock(async_mutex_);
     if (async_count_ == async_queue_.size() && !async_stop_ && !async_failed_) {
       ++async_backpressure_waits_;
+      Capture::Scope capture(Capture::Kind::GxQueueFull);
       async_not_full_.wait(lock, [this] {
         return async_count_ < async_queue_.size() || async_stop_ || async_failed_;
       });
@@ -470,6 +475,7 @@ bool HostBridge::EnqueueBurst(const std::uint8_t* bytes, std::uint32_t size,
     TakeArrayHints(slot,chunk);
     async_tail_ = (async_tail_ + 1u) % async_queue_.size();
     ++async_count_;
+    slot.capture_queued = Capture::Enabled() ? Capture::Now() : 0;
     async_pending_bursts_.fetch_add(1u, std::memory_order_relaxed);
     ++async_submitted_bursts_;
     async_peak_depth_ = std::max(async_peak_depth_, async_count_);
@@ -488,13 +494,17 @@ void HostBridge::AsyncWorkerMain() {
     std::size_t index = 0u;
     {
       std::unique_lock lock(async_mutex_);
-      async_not_empty_.wait(lock, [this] { return async_count_ != 0u || async_stop_; });
+      { Capture::Scope capture(Capture::Kind::GxQueueEmpty);
+        async_not_empty_.wait(lock, [this] { return async_count_ != 0u || async_stop_; });
+      }
       if (async_count_ == 0u && async_stop_) break;
       index = async_head_;
       async_active_ = true;
     }
 
-    const bool ok = ExecuteAsyncItem(index);
+    const bool ok = Capture::Invoke(Capture::Kind::GxParser, unsigned(async_queue_[index].kind), [&] {
+      return ExecuteAsyncItem(index);
+    });
 
     {
       std::lock_guard lock(async_mutex_);
@@ -545,6 +555,7 @@ bool HostBridge::FlushBufferedWrites() {
     TakeArrayHints(slot,size);
     async_tail_ = (async_tail_ + 1u) % async_queue_.size();
     ++async_count_;
+    slot.capture_queued = Capture::Enabled() ? Capture::Now() : 0;
     async_pending_bursts_.fetch_add(1u, std::memory_order_relaxed);
     ++async_submitted_bursts_;
     async_peak_depth_ = std::max(async_peak_depth_, async_count_);
@@ -573,6 +584,7 @@ std::uint8_t* HostBridge::WriteBatchBuffer() {
   std::unique_lock lock(async_mutex_);
   if (async_count_ == async_queue_.size() && !async_stop_ && !async_failed_) {
     ++async_backpressure_waits_;
+    Capture::Scope capture(Capture::Kind::GxQueueFull);
     async_not_full_.wait(lock, [this] {
       return async_count_ < async_queue_.size() || async_stop_ || async_failed_;
     });
@@ -598,6 +610,7 @@ bool HostBridge::FlushWrites(SyncReason reason) {
   if (idle_drain_fast_ && async_pending_bursts_.load(std::memory_order_acquire) == 0u)
     return !async_failed_.load(std::memory_order_acquire);
 
+  Capture::Scope capture(Capture::Kind::GxDrain, unsigned(reason));
   const auto start = stat ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point{};
   std::unique_lock lock(async_mutex_);
@@ -618,6 +631,7 @@ bool HostBridge::PublishCommandLocked(std::unique_lock<std::mutex>& lock) {
   // earlier WGPIPE byte first, so this slot is ordered after them.
   if (async_count_ == async_queue_.size() && !async_stop_ && !async_failed_) {
     ++async_backpressure_waits_;
+    Capture::Scope capture(Capture::Kind::GxQueueFull);
     async_not_full_.wait(lock, [this] {
       return async_count_ < async_queue_.size() || async_stop_ || async_failed_;
     });
@@ -668,6 +682,7 @@ bool HostBridge::EnqueueMemoryWrite(std::uint32_t address, std::uint32_t size) {
   memory_write_slot_ = async_tail_;
   async_tail_ = (async_tail_ + 1u) % slots;
   ++async_count_;
+  slot.capture_queued = Capture::Enabled() ? Capture::Now() : 0;
   async_pending_bursts_.fetch_add(1u, std::memory_order_relaxed);
   ++async_submitted_bursts_;
   ++async_memory_writes_;
@@ -690,6 +705,7 @@ bool HostBridge::EnqueuePresentXfb(std::uint32_t top, std::uint32_t bottom,
   slot.args = {top, bottom, width, stride_bytes, field_height};
   async_tail_ = (async_tail_ + 1u) % async_queue_.size();
   ++async_count_;
+  slot.capture_queued = Capture::Enabled() ? Capture::Now() : 0;
   async_pending_bursts_.fetch_add(1u, std::memory_order_relaxed);
   ++async_submitted_bursts_;
   ++async_presents_;
@@ -713,6 +729,8 @@ inline void PrefetchLine(const void* address) {
 
 bool HostBridge::ExecuteAsyncItem(std::size_t index) {
   const auto& slot = async_queue_[index];
+  if(slot.capture_queued && Capture::Enabled())
+    Capture::Record(Capture::Kind::ParserQueueAge, slot.capture_queued, Capture::Now(), unsigned(slot.kind), slot.size);
   switch (slot.kind) {
   case AsyncKind::Burst:
     // v336: the producer core just wrote these lines; a 512-byte batch is too

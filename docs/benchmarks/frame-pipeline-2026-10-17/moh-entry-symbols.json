@@ -1,0 +1,106 @@
+{
+  "elf_sha1": "eb75ebc0073db35e75eba06742b151591d36c004",
+  "scope": "1/256 completed module entry scopes, inclusive wall time; not a host perf or leaf-function profile",
+  "entries": [
+    {
+      "symbol": "GXLoadPosMtxImm",
+      "stored_scopes": 629,
+      "stored_inclusive_wall_ns": 11239718
+    },
+    {
+      "symbol": "sin",
+      "stored_scopes": 8,
+      "stored_inclusive_wall_ns": 3840456
+    },
+    {
+      "symbol": "GXSetChanAmbColor",
+      "stored_scopes": 6200,
+      "stored_inclusive_wall_ns": 2061786
+    },
+    {
+      "symbol": "Link__10CCPTMatBinFP7CDmaTagR10CDmaPacket",
+      "stored_scopes": 4885,
+      "stored_inclusive_wall_ns": 2001400
+    },
+    {
+      "symbol": "DCFlushRange",
+      "stored_scopes": 168,
+      "stored_inclusive_wall_ns": 1597078
+    },
+    {
+      "symbol": "TestCDBBranchNodeCollision<6CLine3>__10CCDBObjectCFRC13CDBBranchNodeRC6CLine3R10CCollisionbRQ23dwi24fast_vec<P11CDBTriGroup>",
+      "stored_scopes": 186,
+      "stored_inclusive_wall_ns": 1246516
+    },
+    {
+      "symbol": "TestCollisionWithTriGroup__FRC11CDBTriGroupRC6CLine3R10CCollisionb",
+      "stored_scopes": 224,
+      "stored_inclusive_wall_ns": 1187470
+    },
+    {
+      "symbol": "__AXOutAiCallback",
+      "stored_scopes": 14,
+      "stored_inclusive_wall_ns": 1049717
+    },
+    {
+      "symbol": "UpdateAnimation__11CAnimObjectFf",
+      "stored_scopes": 43,
+      "stored_inclusive_wall_ns": 983606
+    },
+    {
+      "symbol": "TestCollision__10CVolSphereCFRC6CPlaneR10CCollisionb",
+      "stored_scopes": 134,
+      "stored_inclusive_wall_ns": 851790
+    },
+    {
+      "symbol": "Render__11CRenderListFR10CRenderBinPv",
+      "stored_scopes": 57,
+      "stored_inclusive_wall_ns": 834416
+    },
+    {
+      "symbol": "FinishBin__11CRenderListFP10CRenderBin",
+      "stored_scopes": 720,
+      "stored_inclusive_wall_ns": 690327
+    },
+    {
+      "symbol": "__as__7CMatrixFRC7CMatrix",
+      "stored_scopes": 70,
+      "stored_inclusive_wall_ns": 663425
+    },
+    {
+      "symbol": "AnimFileGetStateAnimList",
+      "stored_scopes": 50,
+      "stored_inclusive_wall_ns": 571633
+    },
+    {
+      "symbol": "Render__10CCPTMatBinFR10CDmaPacketPv",
+      "stored_scopes": 34,
+      "stored_inclusive_wall_ns": 472665
+    },
+    {
+      "symbol": "__destroy_arr",
+      "stored_scopes": 29,
+      "stored_inclusive_wall_ns": 431550
+    },
+    {
+      "symbol": "Update__6CSceneFf",
+      "stored_scopes": 16,
+      "stored_inclusive_wall_ns": 428780
+    },
+    {
+      "symbol": "PROFILE_UPDATE__Fv",
+      "stored_scopes": 35,
+      "stored_inclusive_wall_ns": 419386
+    },
+    {
+      "symbol": "CmpNodePairs__FRCQ26CScene9UNodePairRCQ26CScene9UNodePair",
+      "stored_scopes": 19,
+      "stored_inclusive_wall_ns": 414963
+    },
+    {
+      "symbol": "SFILTER_rsf__FPviPvPvi",
+      "stored_scopes": 42,
+      "stored_inclusive_wall_ns": 396258
+    }
+  ]
+}

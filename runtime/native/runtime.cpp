@@ -2,6 +2,7 @@
 #include "sdk/dvd_fst_service.h"
 #include "sdk/gx_array_service.h"
 #include "native/runtime.h"
+#include "perf/capture.h"
 #include "native/sdk_autoresolver.h"
 #include "native/rel_identity.h"
 #if defined(GEKKOAOT_NATIVE_SDL_INPUT)
@@ -1763,6 +1764,7 @@ void HostRuntime::ShutdownNativeGX() {
 }
 
 void HostRuntime::NativeGXPeEvent(void* user, std::uint32_t reg, std::uint32_t value) {
+  Capture::Mark(Capture::Kind::PeGuestDelivery, reg, value);
   auto* self = static_cast<HostRuntime*>(user);
   if (!self) return;
   static const bool trace_pe=RuntimeEnvBool("GEKKOAOT_TRACE_PE",false);
@@ -3831,6 +3833,7 @@ void HostRuntime::RebuildNativeInterceptIndex() {
 }
 
 bool HostRuntime::DispatchOsHle(GekkoAOT::NativeOS::Kind kind, std::uint32_t address) {
+  Capture::Scope capture(Capture::Kind::NativeOs, address);
   ++hle_calls_;
   ++os_hle_kind_calls_[static_cast<std::size_t>(kind) & 63u];
   static const bool trace_os_hle = RuntimeEnvBool("GEKKOAOT_TRACE_OS_HLE", false);
@@ -3985,6 +3988,7 @@ HostRuntime::GuestRangeStatus HostRuntime::TranslateGuestRange(
 }
 
 bool HostRuntime::DispatchSimpleHle(SimpleHleKind kind, std::uint32_t address) {
+  Capture::Scope capture(Capture::Kind::Sdk, address);
   if ((DisabledSimpleServices() >> static_cast<unsigned>(kind)) & 1u) {
     hle_decline_entry_ = address;  // admit the guest body once (see probe)
     ++hle_guest_declines_;
@@ -6443,6 +6447,7 @@ void HostRuntime::QueueHostPresent(std::uint32_t xfb_top,
                                    std::uint32_t stride_bytes,
                                    std::uint32_t field_height) {
   if (!native_gx_.Ready() || xfb_top == 0u) return;
+  Capture::Mark(Capture::Kind::PresentRequest, xfb_top, host_present_pending_ ? 1u : 0u);
   if (host_present_pending_) ++host_present_dropped_;
   host_present_top_ = xfb_top;
   host_present_bottom_ = xfb_bottom != 0u ? xfb_bottom : xfb_top;
@@ -6454,6 +6459,7 @@ void HostRuntime::QueueHostPresent(std::uint32_t xfb_top,
 
 void HostRuntime::NoteProducedFrame() {
   ++perf_guest_frames_total_;
+  Capture::Mark(Capture::Kind::GuestFrameObserved, perf_guest_frames_total_);
   using Clock = std::chrono::steady_clock;
   // AdvanceRuntimeCycles already sampled monotonic time for the hardware domain.
   // Reuse it here; frame production is allowed to see the most recent sample
@@ -7247,6 +7253,8 @@ void HostRuntime::AdvanceRuntimeCycles(std::uint64_t charged, RunResult& result,
 
   odd_field_boundary = vi_.ConsumeOddFieldBoundary();
   even_field_boundary = vi_.ConsumeEvenFieldBoundary();
+  if (odd_field_boundary || even_field_boundary)
+    Capture::Mark(Capture::Kind::ViFieldObserved, perf_vi_boundaries_total_, odd_field_boundary ? 1u : 2u);
   if (runtime_profile_enabled_ && (odd_field_boundary || even_field_boundary)) {
     // v300 diagnostic: GX display copies produced during each VI field.
     static std::string pattern;
@@ -8536,7 +8544,9 @@ bool HostRuntime::DispatchSecondaryModule(std::uint32_t runtime_address, RunResu
     native_region_probe_capture_ = true;
     const auto* previous_secondary_owner = native_region_secondary_owner_;
     native_region_secondary_owner_ = descriptor;
-    const bool first_dispatch_ok = descriptor->dispatch(&cpu_, address);
+    const bool first_dispatch_ok = Capture::Invoke(Capture::Kind::AotSecondary, address, [&] {
+      return descriptor->dispatch(&cpu_, address);
+    });
     native_region_secondary_owner_ = previous_secondary_owner;
     native_region_probe_capture_ = false;
     if (!first_dispatch_ok) return false;
@@ -8814,8 +8824,13 @@ void HostRuntime::WaitForIdleEvent(RunResult& result,std::uint64_t maximum_cycle
   // VI/maintenance deadline (2 ms) later.
   const auto idle_start = runtime_profile_enabled_ ? std::chrono::steady_clock::now()
                                                   : std::chrono::steady_clock::time_point{};
-  const bool gx_wait = runtime_parallel_workers_ && native_gx_.WaitForWorkerEvent(until);
-  if (!gx_wait) std::this_thread::sleep_until(until);
+  const bool gx_wait = Capture::Invoke(Capture::Kind::IdleWait, 1u, [&] {
+    return runtime_parallel_workers_ && native_gx_.WaitForWorkerEvent(until);
+  });
+  if (!gx_wait) {
+    Capture::Scope capture(Capture::Kind::IdleWait, 2u);
+    std::this_thread::sleep_until(until);
+  }
   if (runtime_profile_enabled_) {
     const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - idle_start).count());
@@ -9541,13 +9556,18 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
     // no-event boundary two cheap latch tests instead of two helper calls.
     if (pi_.InterruptPending()) TryTakeExternalInterrupt();
     if (decrementer_pending_) TryTakeDecrementerInterrupt();
-    if (time_poll_return_ != 0u) ParkClockSpin(result);
+    if (time_poll_return_ != 0u) {
+      Capture::Scope capture(Capture::Kind::ClockPark);
+      ParkClockSpin(result);
+    }
     if (guest_rate_ceiling_pct_ != 0u && rate_charged_ - rate_mark_charged_ >= 65536u)
       ThrottleGuestRate(result);
-    ParkSdkIdlePoll(result);
-    ParkNativeCounterPoll(result);
-    ParkNativeReadPoll(result);
-    ParkFixedPointPoll(result);
+    { Capture::Scope capture(Capture::Kind::PollPark);
+      ParkSdkIdlePoll(result);
+      ParkNativeCounterPoll(result);
+      ParkNativeReadPoll(result);
+      ParkFixedPointPoll(result);
+    }
     if (result.status == RunStatus::HostRequestedExit) break;
 
     const std::uint32_t native_os_pc = cpu_.pc;
@@ -9756,7 +9776,9 @@ RunResult HostRuntime::Run(std::uint64_t dispatch_limit) {
                    "GEKKOAOT_GX_DIAG_GLYPH_ENTRY f1=%.9g f2=%.9g f3=%.9g f4=%.9g r3=%08x r23=%08x fpscr=%08x\n",
                    cpu_.fpr[1], cpu_.fpr[2], cpu_.fpr[3], cpu_.fpr[4],
                    cpu_.gpr[3], cpu_.gpr[23], cpu_.fpscr);
-    if (!descriptor->dispatch(&cpu_, dispatch_pc)) {
+    if (!Capture::Invoke(Capture::Kind::AotMain, dispatch_pc, [&] {
+          return descriptor->dispatch(&cpu_, dispatch_pc);
+        })) {
       // Runtime-loaded RELs live at OSLink-selected addresses that are not part
       // of main.dol. Translate that live PC to the secondary module's stable
       // DolRecomp link address and run its native dispatcher first.

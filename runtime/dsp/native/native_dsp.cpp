@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "dsp/native/native_dsp.h"
+#include "perf/capture.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1153,6 +1154,7 @@ std::uint64_t NativeDSP::CyclesUntilInterrupt() const {
 }
 
 void NativeDSP::AdvanceCycles(std::uint64_t cycles) {
+  GekkoAOT::Capture::Scope capture(GekkoAOT::Capture::Kind::DspWork);
   jaudio_hle_.AdvanceStandardMail(cycles);
   if (cycles == 0u) return;
 
