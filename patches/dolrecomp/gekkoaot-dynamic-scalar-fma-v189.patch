@@ -1,0 +1,103 @@
+--- a/src/backend/llvm/floating_point.cpp
++++ b/src/backend/llvm/floating_point.cpp
+@@ -413,8 +413,6 @@
+                     op == DOLIR_EXACT_FMSUBS || op == DOLIR_EXACT_FNMSUBS;
+     bool negative = op == DOLIR_EXACT_FNMADD || op == DOLIR_EXACT_FNMSUB ||
+                     op == DOLIR_EXACT_FNMADDS || op == DOLIR_EXACT_FNMSUBS;
+-    bool exactSingleInputs =
+-        single && aExactSingle && bExactSingle && cExactSingle;
+ 
+     auto emitLegacyFMA = [&]() {
+       syncState(DOLIR_STATE_FPSCR);
+@@ -448,17 +446,38 @@
+       pending_fprf_valid_ = success;
+     };
+ 
+-    if (exactSingleInputs) {
++    if (single) {
+       Value *fpscr = rawFPSCR();
+-      Value *left = builder_.CreateFPTrunc(stateValue(fprSlot(a)), f32);
+-      Value *multiplier =
+-          builder_.CreateFPTrunc(stateValue(fprSlot(c)), f32);
+-      Value *architecturalAddend =
+-          builder_.CreateFPTrunc(stateValue(fprSlot(b)), f32);
+-      Value *safe = defaultControls(fpscr);
+-      safe = builder_.CreateAnd(safe, finiteF32(left));
+-      safe = builder_.CreateAnd(safe, finiteF32(multiplier));
+-      safe = builder_.CreateAnd(safe, finiteF32(architecturalAddend));
++      Value *wideLeft = stateValue(fprSlot(a));
++      Value *wideMultiplier = stateValue(fprSlot(c));
++      Value *wideAddend = stateValue(fprSlot(b));
++      // v189: provenance is local to a guest basic block. At loop entries and
++      // function boundaries, test exact f32 representability using integer
++      // bits, without rounding an arbitrary f64 or quieting a signalling NaN.
++      // Subnormals use the helper. Check even locally proven values: an
++      // earlier enabled invalid exception can preserve an arbitrary old FPR.
++      auto exactF32 = [&](Value *value) -> Value * {
++        Value *bits = builder_.CreateAnd(builder_.CreateBitCast(value, i64),
++                                        builder_.getInt64(0x7FFFFFFFFFFFFFFFull));
++        Value *exponent = builder_.CreateLShr(bits, 52);
++        Value *normalRange = builder_.CreateICmpULT(
++            builder_.CreateSub(exponent, builder_.getInt64(897)),
++            builder_.getInt64(254));
++        Value *exactMantissa = builder_.CreateICmpEQ(
++            builder_.CreateAnd(bits, builder_.getInt64(0x1FFFFFFFull)),
++            builder_.getInt64(0));
++        return builder_.CreateOr(
++            builder_.CreateICmpEQ(bits, builder_.getInt64(0)),
++            builder_.CreateAnd(normalRange, exactMantissa), "fp.exact-f32");
++      };
++      // RN=nearest is required; NI is safe for normal f32 inputs when the
++      // final result is nonzero and not subnormal. Validate that below before
++      // publishing anything. Tiny results still use the exact helper.
++      Value *safe = builder_.CreateICmpEQ(
++          builder_.CreateAnd(fpscr, builder_.getInt32(3)), builder_.getInt32(0));
++      safe = builder_.CreateAnd(safe, exactF32(wideLeft));
++      safe = builder_.CreateAnd(safe, exactF32(wideMultiplier));
++      safe = builder_.CreateAnd(safe, exactF32(wideAddend));
+ 
+       BasicBlock *fast = BasicBlock::Create(context_, "fma_direct", function_);
+       BasicBlock *slow = BasicBlock::Create(context_, "fma_exact", function_);
+@@ -467,6 +486,9 @@
+                             MDBuilder(context_).createBranchWeights(4096, 1));
+ 
+       builder_.SetInsertPoint(fast);
++      Value *left = builder_.CreateFPTrunc(wideLeft, f32);
++      Value *multiplier = builder_.CreateFPTrunc(wideMultiplier, f32);
++      Value *architecturalAddend = builder_.CreateFPTrunc(wideAddend, f32);
+       Value *addend = subtract
+                           ? builder_.CreateFNeg(architecturalAddend)
+                           : architecturalAddend;
+@@ -476,6 +498,16 @@
+       Value *rounded = constrainedPairFMA(left, multiplier, addend);
+       if (negative)
+         rounded = builder_.CreateFNeg(rounded);
++      Value *ieee = builder_.CreateICmpEQ(
++          builder_.CreateAnd(fpscr, builder_.getInt32(4)), builder_.getInt32(0));
++      Value *nonTiny = builder_.CreateICmpNE(
++          builder_.CreateAnd(builder_.CreateBitCast(rounded, i32),
++                             builder_.getInt32(0x7F800000u)),
++          builder_.getInt32(0));
++      BasicBlock *commit = BasicBlock::Create(context_, "fma_commit", function_);
++      builder_.CreateCondBr(builder_.CreateOr(ieee, nonTiny), commit, slow,
++                            MDBuilder(context_).createBranchWeights(4096, 1));
++      builder_.SetInsertPoint(commit);
+       Value *fastFPSCR = setFPRFF32(fpscr, rounded);
+       Value *wide = builder_.CreateFPExt(rounded, f64);
+       builder_.CreateStore(wide, state_[destination]);
+@@ -485,6 +517,7 @@
+ 
+       builder_.SetInsertPoint(slow);
+       emitLegacyFMA();
++      materializeFPRF();
+       builder_.CreateBr(join);
+       builder_.SetInsertPoint(join);
+       known_state_[destination] = nullptr;
+@@ -526,6 +559,7 @@
+ 
+       builder_.SetInsertPoint(slow);
+       emitLegacyFMA();
++      materializeFPRF();
+       builder_.CreateBr(join);
+ 
+       builder_.SetInsertPoint(join);

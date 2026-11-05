@@ -1,0 +1,147 @@
+--- a/src/backend/llvm/psq_load.cpp	2026-10-12 03:03:40.454818942 +0200
++++ b/src/backend/llvm/psq_load.cpp	2026-10-12 03:03:40.473867665 +0200
+@@ -8,6 +8,7 @@
+ #include <llvm/IR/MDBuilder.h>
+ #include <llvm/IR/Module.h>
+ 
++#include <cstdlib>
+ #include <utility>
+ 
+ namespace dolllvm {
+@@ -51,21 +52,37 @@
+                          alignmentValid),
+       dispatch, slow, MDBuilder(context_).createBranchWeights(1000, 1));
+ 
++  // GEKKOAOT_PSQ_FLOAT_SPECULATION_V320: an unknown GQR used to inline all
++  // five quantization types, each lane with the complete guest-memory ladder
++  // (RAM/flat-VMEM/locked-cache/external/resume). A 57-instruction PSMTX-style
++  // leaf became 160 load sites, ~13k phis and 600 KiB of code whose spill
++  // copies dominated even the f32 path. Retail SDK math runs with float GQRs:
++  // inline only type 0 and let the existing exact helper (same as the
++  // unsupported/misaligned path) handle quantized types.
++  static const bool inlineQuantized = [] {
++    const char *setting = std::getenv("DOLRECOMP_PSQ_INLINE_QUANTIZED");
++    return setting && setting[0] == '1';
++  }();
+   BasicBlock *f32Block =
+       BasicBlock::Create(context_, "psq_load_f32", function_);
+-  BasicBlock *u8Block = BasicBlock::Create(context_, "psq_load_u8", function_);
+-  BasicBlock *u16Block =
+-      BasicBlock::Create(context_, "psq_load_u16", function_);
+-  BasicBlock *s8Block = BasicBlock::Create(context_, "psq_load_s8", function_);
+-  BasicBlock *s16Block =
+-      BasicBlock::Create(context_, "psq_load_s16", function_);
++  BasicBlock *u8Block = nullptr, *u16Block = nullptr, *s8Block = nullptr,
++             *s16Block = nullptr;
++  if (inlineQuantized) {
++    u8Block = BasicBlock::Create(context_, "psq_load_u8", function_);
++    u16Block = BasicBlock::Create(context_, "psq_load_u16", function_);
++    s8Block = BasicBlock::Create(context_, "psq_load_s8", function_);
++    s16Block = BasicBlock::Create(context_, "psq_load_s16", function_);
++  }
+   builder_.SetInsertPoint(dispatch);
+-  SwitchInst *typeSwitch = builder_.CreateSwitch(typeValue, slow, 5);
++  SwitchInst *typeSwitch =
++      builder_.CreateSwitch(typeValue, slow, inlineQuantized ? 5 : 1);
+   typeSwitch->addCase(builder_.getInt32(0), f32Block);
+-  typeSwitch->addCase(builder_.getInt32(4), u8Block);
+-  typeSwitch->addCase(builder_.getInt32(5), u16Block);
+-  typeSwitch->addCase(builder_.getInt32(6), s8Block);
+-  typeSwitch->addCase(builder_.getInt32(7), s16Block);
++  if (inlineQuantized) {
++    typeSwitch->addCase(builder_.getInt32(4), u8Block);
++    typeSwitch->addCase(builder_.getInt32(5), u16Block);
++    typeSwitch->addCase(builder_.getInt32(6), s8Block);
++    typeSwitch->addCase(builder_.getInt32(7), s16Block);
++  }
+ 
+   SmallVector<BasicBlock *, 5> fastEnds;
+   auto emitLoads = [&](BasicBlock *block, u32 width, bool isSigned,
+@@ -104,10 +121,12 @@
+     fastEnds.push_back(builder_.GetInsertBlock());
+   };
+   emitLoads(f32Block, 4, false, true);
+-  emitLoads(u8Block, 1, false, false);
+-  emitLoads(u16Block, 2, false, false);
+-  emitLoads(s8Block, 1, true, false);
+-  emitLoads(s16Block, 2, true, false);
++  if (inlineQuantized) {
++    emitLoads(u8Block, 1, false, false);
++    emitLoads(u16Block, 2, false, false);
++    emitLoads(s8Block, 1, true, false);
++    emitLoads(s16Block, 2, true, false);
++  }
+ 
+   builder_.SetInsertPoint(slow);
+   Value *success = nullptr;
+--- a/src/backend/llvm/psq.cpp	2026-10-12 03:03:40.454872622 +0200
++++ b/src/backend/llvm/psq.cpp	2026-10-12 03:03:40.473916130 +0200
+@@ -9,6 +9,7 @@
+ #include <llvm/IR/MDBuilder.h>
+ #include <llvm/IR/Module.h>
+ 
++#include <cstdlib>
+ #include <utility>
+ 
+ namespace dolllvm {
+@@ -78,21 +79,32 @@
+                          alignmentValid),
+       dispatch, slow);
+ 
++  // GEKKOAOT_PSQ_FLOAT_SPECULATION_V320: see emitPSQLoad. Inline float
++  // stores only; quantized stores use the exact helper.
++  static const bool inlineQuantized = [] {
++    const char *setting = std::getenv("DOLRECOMP_PSQ_INLINE_QUANTIZED");
++    return setting && setting[0] == '1';
++  }();
+   BasicBlock *f32Block =
+       BasicBlock::Create(context_, "psq_store_f32", function_);
+-  BasicBlock *u8Block = BasicBlock::Create(context_, "psq_store_u8", function_);
+-  BasicBlock *u16Block =
+-      BasicBlock::Create(context_, "psq_store_u16", function_);
+-  BasicBlock *s8Block = BasicBlock::Create(context_, "psq_store_s8", function_);
+-  BasicBlock *s16Block =
+-      BasicBlock::Create(context_, "psq_store_s16", function_);
++  BasicBlock *u8Block = nullptr, *u16Block = nullptr, *s8Block = nullptr,
++             *s16Block = nullptr;
++  if (inlineQuantized) {
++    u8Block = BasicBlock::Create(context_, "psq_store_u8", function_);
++    u16Block = BasicBlock::Create(context_, "psq_store_u16", function_);
++    s8Block = BasicBlock::Create(context_, "psq_store_s8", function_);
++    s16Block = BasicBlock::Create(context_, "psq_store_s16", function_);
++  }
+   builder_.SetInsertPoint(dispatch);
+-  SwitchInst *typeSwitch = builder_.CreateSwitch(typeValue, slow, 5);
++  SwitchInst *typeSwitch =
++      builder_.CreateSwitch(typeValue, slow, inlineQuantized ? 5 : 1);
+   typeSwitch->addCase(builder_.getInt32(0), f32Block);
+-  typeSwitch->addCase(builder_.getInt32(4), u8Block);
+-  typeSwitch->addCase(builder_.getInt32(5), u16Block);
+-  typeSwitch->addCase(builder_.getInt32(6), s8Block);
+-  typeSwitch->addCase(builder_.getInt32(7), s16Block);
++  if (inlineQuantized) {
++    typeSwitch->addCase(builder_.getInt32(4), u8Block);
++    typeSwitch->addCase(builder_.getInt32(5), u16Block);
++    typeSwitch->addCase(builder_.getInt32(6), s8Block);
++    typeSwitch->addCase(builder_.getInt32(7), s16Block);
++  }
+ 
+   SmallVector<BasicBlock *, 5> fastEnds;
+   auto emitStores = [&](BasicBlock *block, u32 width, int minValue,
+@@ -119,10 +131,12 @@
+     fastEnds.push_back(builder_.GetInsertBlock());
+   };
+   emitStores(f32Block, 4, 0, 0, true);
+-  emitStores(u8Block, 1, 0, 255, false);
+-  emitStores(u16Block, 2, 0, 65535, false);
+-  emitStores(s8Block, 1, -128, 127, false);
+-  emitStores(s16Block, 2, -32768, 32767, false);
++  if (inlineQuantized) {
++    emitStores(u8Block, 1, 0, 255, false);
++    emitStores(u16Block, 2, 0, 65535, false);
++    emitStores(s8Block, 1, -128, 127, false);
++    emitStores(s16Block, 2, -32768, 32767, false);
++  }
+ 
+   builder_.SetInsertPoint(slow);
+   Value *success = nullptr;

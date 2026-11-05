@@ -1,0 +1,203 @@
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -1129,14 +1129,33 @@
+     ppc_fpscr_updated(cpu);
+     fesetround(rounding[cpu->fpscr & 3u]);
+ #if defined(__x86_64__) || defined(_M_X64)
++    // GEKKOAOT_LFS_STFS_EXACT_V394: NI flushes results (FTZ) but not inputs.
++    // lfs and stfs are architecturally exact whatever NI says, and compilers
++    // copy structures through them: Havok moves 16-bit contact ids that way.
++    // A DAZ here zeroes every integer below 2^23 on its way through lfs, while
++    // a single denormal is an ordinary double in the FPR and so is no denormal
++    // operand for the double arithmetic that follows.
+     u32 csr = _mm_getcsr();
+     csr &= ~0x8040u;
+     if (cpu->fpscr & 4u)
+-        csr |= 0x8040u;
++        csr |= 0x8000u;
+     _mm_setcsr(csr);
+ #endif
+ }
+ 
++// stfs of a value the host conversion returned as zero: FTZ flushes what the
++// architecture denormalizes, by truncation, for FRS[1:11] <= 896.
++u32 ppc_stfs_tiny(f64 value) {
++    u64 bits;
++    memcpy(&bits, &value, sizeof(bits));
++    const u32 sign = (u32)(bits >> 32) & 0x80000000u;
++    const u32 exponent = (u32)(bits >> 52) & 0x7FFu;
++    if (exponent - 874u > 22u)
++        return sign;
++    const u64 fraction = (bits & 0x000FFFFFFFFFFFFFull) | 0x0010000000000000ull;
++    return sign | (u32)(fraction >> (926u - exponent));
++}
++
+ void ppc_mtfsb0_op(CPUState* cpu, u8 bit) {
+     cpu->fpscr &= ~(0x80000000u >> bit);
+     ppc_fpscr_control_updated(cpu);
+--- a/src/cpu/cpu.h
++++ b/src/cpu/cpu.h
+@@ -222,6 +222,7 @@
+ void ppc_tlbie(CPUState* cpu, u32 ea, u32 cia);
+ void ppc_fpscr_updated(CPUState* cpu);
+ void ppc_fpscr_control_updated(CPUState* cpu);
++u32 ppc_stfs_tiny(f64 value);
+ void ppc_mtfsb0_op(CPUState* cpu, u8 bit);
+ void ppc_mtfsb1_op(CPUState* cpu, u8 bit);
+ void ppc_lswx(CPUState* cpu, u8 rD, u8 rA, u8 rB, u32 cia);
+--- a/src/backend/llvm/instructions.cpp
++++ b/src/backend/llvm/instructions.cpp
+@@ -5,6 +5,7 @@
+ #include <llvm/IR/Constants.h>
+ #include <llvm/IR/Function.h>
+ #include <llvm/IR/Intrinsics.h>
++#include <llvm/IR/MDBuilder.h>
+ #include <llvm/IR/Module.h>
+ #include <llvm/Support/Format.h>
+ #include <llvm/Support/raw_ostream.h>
+@@ -275,7 +276,7 @@
+   case DOLIR_OP_BITCAST:
+     return builder_.CreateBitCast(value, resultType);
+   case DOLIR_OP_FPTRUNC:
+-    return builder_.CreateFPTrunc(value, resultType);
++    return truncateForStore(value, resultType);
+   case DOLIR_OP_FPEXT:
+     return builder_.CreateFPExt(value, resultType);
+   default:
+@@ -283,6 +284,44 @@
+   }
+ }
+ 
++// GEKKOAOT_LFS_STFS_EXACT_V394: stfs is exact under FPSCR[NI], the host
++// conversion is not (FTZ). A result of the host conversion other than zero
++// needs nothing, and neither does a value single arithmetic produced under
++// the same controls, so only a zero result leaves the fast path.
++Value *FunctionEmitter::truncateForStore(Value *value, Type *resultType) {
++  Value *single = builder_.CreateFPTrunc(value, resultType);
++  if (isa<Constant>(value))
++    return single;
++  if (auto *load = dyn_cast<LoadInst>(value)) {
++    Value *pointer = load->getPointerOperand();
++    for (u32 reg = 0; reg < 32; reg++) {
++      if (pointer == state_[DOLIR_STATE_FPR0 + reg] && fp_denormal_safe_[reg])
++        return single;
++    }
++  }
++  Type *i32 = Type::getInt32Ty(context_);
++  Value *bits = builder_.CreateBitCast(single, i32);
++  Value *zero = builder_.CreateICmpEQ(
++      builder_.CreateAnd(bits, builder_.getInt32(0x7FFFFFFFu)),
++      builder_.getInt32(0));
++  BasicBlock *fast = builder_.GetInsertBlock();
++  BasicBlock *cold = BasicBlock::Create(context_, "stfs_tiny", function_);
++  BasicBlock *join = BasicBlock::Create(context_, "stfs_join", function_);
++  builder_.CreateCondBr(zero, cold, join,
++                        MDBuilder(context_).createBranchWeights(1, 4096));
++  builder_.SetInsertPoint(cold);
++  auto callee = module_.getOrInsertFunction(
++      "ppc_stfs_tiny",
++      FunctionType::get(i32, {Type::getDoubleTy(context_)}, false));
++  Value *exact = builder_.CreateCall(callee, {value});
++  builder_.CreateBr(join);
++  builder_.SetInsertPoint(join);
++  PHINode *merged = builder_.CreatePHI(i32, 2, "stfs.bits");
++  merged->addIncoming(bits, fast);
++  merged->addIncoming(exact, cold);
++  return builder_.CreateBitCast(merged, resultType);
++}
++
+ Value *FunctionEmitter::bswap(Value *value) {
+   auto *integer = cast<IntegerType>(value->getType());
+   if (integer->getBitWidth() == 8)
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -128,6 +128,7 @@
+   bool isPurePollingLoop(u32 header) const;
+   bool emitRegion(u32 index, llvm::raw_ostream &diagnostics);
+   llvm::Value *operand(const DolIRInstruction &instruction, u32 index);
++  llvm::Value *truncateForStore(llvm::Value *value, llvm::Type *resultType);
+   llvm::Value *castValue(DolIROp op, llvm::Type *result_type,
+                          llvm::Value *value);
+   llvm::Value *bswap(llvm::Value *value);
+--- a/src/backend/llvm/floating_point.cpp
++++ b/src/backend/llvm/floating_point.cpp
+@@ -336,7 +336,7 @@
+       Value *fpscr = rawFPSCR();
+       // GEKKOAOT_NATIVE_MATH_ANY_CONTROLS_V340: the finite native path also
+       // serves non-IEEE mode and every rounding mode. FPSCR[RN] and [NI] are
+-      // mirrored into MXCSR (rounding control, DAZ+FTZ) by
++      // mirrored into MXCSR (rounding control, FTZ) by
+       // ppc_fpscr_control_updated, so the helper's double arithmetic and float
+       // conversion run under the same controls as this code. The one NI
+       // difference is handled below: the helper flushes |exact| < 2^-126 to
+--- a/tests/llvm_fixture.cpp
++++ b/tests/llvm_fixture.cpp
+@@ -330,6 +330,12 @@
+   };
+   CHECK(add_chunk(&module, property_words, 10, 0x80003000u));
+ 
++  // lfs f1,0(r4); stfs f1,4(r4); then the same pair with a branch between them
++  const u32 single_copy_words[] = {
++      0xC0240000u, 0xD0240004u, 0xC0440008u, 0x48000004u, 0xD044000Cu, 0x4E800020u,
++  };
++  CHECK(add_chunk(&module, single_copy_words, 6, 0x80003F00u));
++
+   const u32 memory_words[] = {
+       0x80640000u,
+       0x90640004u,
+--- a/tests/llvm_semantics_test.c
++++ b/tests/llvm_semantics_test.c
+@@ -20,6 +20,7 @@
+ void func_80003760(CPUState* cpu);
+ void func_80003800(CPUState* cpu);
+ void func_80003D20(CPUState* cpu);
++void func_80003F00(CPUState* cpu);
+ 
+ #define CHECK(x) do { if (!(x)) { fprintf(stderr, "check failed: %s:%d: %s\n", \
+     __FILE__, __LINE__, #x); return 1; } } while (0)
+@@ -134,6 +135,34 @@
+     CHECK(cpu_init(&reference));
+     CHECK(integer_properties(&cpu, &reference));
+ 
++    // lfs/stfs copy any word exactly under FPSCR[NI]: ids, pointers, denormals.
++    {
++        static const u32 words[] = {
++            0u, 1u, 4u, 5u, 255u, 0x1234u, 0x007FFFFFu, 0x00800000u, 0x80000000u,
++            0x80000001u, 0x8053E768u, 0x809AB480u, 0x7E001000u, 0x3F800000u,
++        };
++        cpu.msr = 1u << 13;
++        cpu.fpscr |= 4u;
++        ppc_fpscr_control_updated(&cpu);
++        for (u32 i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
++            prepare(&cpu, 0x80003F00u);
++            cpu.gpr[4] = GC_RAM_BASE + 0x400u;
++            mem_write32(&cpu, cpu.gpr[4], words[i]);
++            mem_write32(&cpu, cpu.gpr[4] + 4u, 0xDEADBEEFu);
++            mem_write32(&cpu, cpu.gpr[4] + 8u, words[i]);
++            mem_write32(&cpu, cpu.gpr[4] + 12u, 0xDEADBEEFu);
++            func_80003F00(&cpu);
++            CHECK(mem_read32(&cpu, cpu.gpr[4] + 4u) == words[i]);
++            CHECK(mem_read32(&cpu, cpu.gpr[4] + 12u) == words[i]);
++        }
++        cpu.fpr[1] = 1e-30;
++        cpu.fpr[2] = 1e-30;
++        ppc_fmuls(&cpu, 0, 1, 2);
++        CHECK(cpu.fpr[0] == 0.0);
++        cpu.fpscr &= ~4u;
++        ppc_fpscr_control_updated(&cpu);
++    }
++
+     prepare(&cpu, 0x80001004u);
+     cpu.gpr[3] = 0;
+     cpu.gpr[1] = GC_RAM_BASE;
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -57,7 +57,7 @@
+ #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
+ #define DOLLLVM_DEFAULT_WORKER_BATCH 1u
+ // SSA regions, ABI v4 variants and ThinLTO summaries.
+-#define DOLLLVM_CACHE_VERSION "dolllvm-v29-gekkoaot-memory-restart-v14-compatcall391"
++#define DOLLLVM_CACHE_VERSION "dolllvm-v29-gekkoaot-memory-restart-v14-compatcall391-stfs394"
+ 
+ typedef struct {
+     const PPCInst* insts;

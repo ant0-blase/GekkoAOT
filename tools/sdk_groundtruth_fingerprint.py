@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Generate runtime/sdk/sdk_groundtruth_v1.h from a skeleton-word table.
+
+Usage: tools/sdk_groundtruth_fingerprint.py <source header> [-o output]
+
+The source is a header in the former format, whose kGroundTruthSkeletonWords
+array held the normalized instruction words of every reference body. The
+output keeps no instruction word: per reference body it stores counters
+(instruction count, primary-opcode histogram, direct calls, branches,
+returns), a 64-bit hash of the whole skeleton, 64-bit hashes of its two- and
+three-word prefixes, and one byte per instruction in a strict and a relaxed
+channel. The hash functions are the ones of runtime/sdk/structural_signature.h
+(StructuralMix64, StructuralWordHash, StructuralSequenceHash), which the runtime
+applies to candidate functions of the user's own executable.
+"""
+import argparse
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_OUTPUT = os.path.join(ROOT, 'runtime', 'sdk', 'sdk_groundtruth_v1.h')
+
+MASK = (1 << 64) - 1
+STRICT_SALT = 0x5d1f0c3a9b2e4f67
+RELAXED_SALT = 0xa3c59e1d07f2b846
+SEQUENCE_SALT = 0x2f8e6b4d1c9a7053
+GOLDEN = 0x9e3779b97f4a7c15
+WORD_HASH_BITS = 8  # kStructuralWordHashBits in structural_signature.h
+
+
+def mix64(x):
+    x &= MASK
+    x ^= x >> 30
+    x = (x * 0xbf58476d1ce4e5b9) & MASK
+    x ^= x >> 27
+    x = (x * 0x94d049bb133111eb) & MASK
+    x ^= x >> 31
+    return x
+
+
+def word_hash(word, salt):
+    return mix64(salt ^ word) & ((1 << WORD_HASH_BITS) - 1)
+
+
+def sequence_hash(words):
+    h = mix64(SEQUENCE_SALT ^ len(words))
+    for word in words:
+        h = mix64(h ^ ((word + GOLDEN) & MASK))
+    return h
+
+
+def relaxed_word(word):
+    op = word >> 26
+    if op == 18:
+        return word & 0xfc000003
+    if op == 16:
+        return word & 0xffff0003
+    if op in (10, 11, 14, 15, 24, 25) or 32 <= op <= 47:
+        return word & 0xffff0000
+    return word
+
+
+def block(text, name):
+    """Return the full `inline constexpr ... name = {...};` block."""
+    match = re.search(r'^inline constexpr [^\n]*\b' + name + r' = \{\{?\n.*?^\}\}?;\n', text, re.M | re.S)
+    if not match:
+        sys.exit('missing table ' + name)
+    return match.group(0)
+
+
+def parse(text):
+    words_block = block(text, 'kGroundTruthSkeletonWords')
+    words = [int(w, 16) for w in re.findall(r'0x([0-9a-fA-F]+)u', words_block.split('=', 1)[1])]
+    exemplars = []
+    for m in re.finditer(r'^  \{"([^"]+)", (true|false), (\d+)u, (\d+)u, (\d+)u, (\d+)u, (-?\d+), (\d+)u\},$',
+                         block(text, 'kGroundTruthExemplars'), re.M):
+        exemplars.append({
+            'name': m.group(1), 'critical': m.group(2), 'offset': int(m.group(3)),
+            'count': int(m.group(4)), 'call_offset': int(m.group(5)),
+            'call_count': int(m.group(6)), 'frame': int(m.group(7)), 'variant': int(m.group(8)),
+        })
+    if not exemplars:
+        sys.exit('no exemplars parsed')
+    return words, exemplars, block(text, 'kGroundTruthCallNames'), block(text, 'kGroundTruthIdentityNames')
+
+
+def rows(values, per_line, fmt):
+    out = []
+    for i in range(0, len(values), per_line):
+        out.append('  ' + ', '.join(fmt(v) for v in values[i:i + per_line]) + ',')
+    return '\n'.join(out)
+
+
+def fingerprint(words, exemplars):
+    strict, relaxed, ops, table = [], [], [], []
+    for ex in exemplars:
+        skeleton = words[ex['offset']:ex['offset'] + ex['count']]
+        if len(skeleton) != ex['count']:
+            sys.exit('exemplar out of range: ' + ex['name'])
+        histogram = [0] * 64
+        calls = branches = returns = 0
+        for w in skeleton:
+            op = w >> 26
+            histogram[op] += 1
+            if op == 18 and (w & 1):
+                calls += 1
+            if op in (16, 18, 19):
+                branches += 1
+            if w == 0x4e800020:
+                returns += 1
+        p2 = sequence_hash(skeleton[:2]) if len(skeleton) == 2 else 0
+        p3 = sequence_hash(skeleton[:3]) if len(skeleton) >= 3 else 0
+        table.append(dict(ex, hash_offset=len(strict), ops_offset=len(ops) // 2,
+                          skeleton_hash=sequence_hash(skeleton), prefix2=p2, prefix3=p3,
+                          calls=calls, branches=branches, returns=returns))
+        strict += [word_hash(w, STRICT_SALT) for w in skeleton]
+        relaxed += [word_hash(relaxed_word(w), RELAXED_SALT) for w in skeleton]
+        # Sparse histogram: (primary opcode, count) pairs.
+        nonzero = [(op, n) for op, n in enumerate(histogram) if n]
+        table[-1]['ops_count'] = len(nonzero)
+        if len(ops) // 2 + len(nonzero) > 0xffff:
+            sys.exit('primary-opcode table exceeds 16-bit offsets')
+        for op, n in nonzero:
+            ops += [op, n]
+    return strict, relaxed, ops, table
+
+
+HEADER = '''#pragma once
+// GENERATED by tools/sdk_groundtruth_fingerprint.py; do not edit by hand.
+
+#include "structural_signature.h"
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <set>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace GekkoAOTSdk {
+
+// SDK reference fingerprints for structural identification of SDK functions
+// in the user's own executable.
+//
+// Content: for every reference body, its SDK function name, the names of the
+// functions it calls, its stack frame size and source build index, and
+// non-reversible fingerprints of its normalized instructions: instruction
+// count, primary-opcode histogram, direct-call/branch/return counters, a
+// 64-bit hash of the whole normalized body, 64-bit hashes of its first two and
+// three normalized words, and one short hash per instruction in a strict and a
+// relaxed channel (StructuralWordHash, kStructuralWordHashBits wide; see
+// structural_signature.h). No
+// instruction word, code byte or address is stored.
+//
+// source_variant numbers the independent builds the bodies were fingerprinted
+// from: 0=Pikmin, 1=MKDD, 2=SMS, 3=Pokemon XD, 4=Paper Mario TTYD,
+// 5=MOH European Assault, 6=MOH Frontline, 7=MOH Rising Sun,
+// 8=King Kong, 9=007 Agent Under Fire, 10=Top Gun: Combat Zones,
+// 11=Scooby-Doo! Mystery Mayhem, 12=Scooby-Doo! Unmasked,
+// 13=Terminator 3: The Redemption, 14=The Legend of Spyro, 15=The Sims 2,
+// 16=Animal Crossing, 17=Spyro: A Hero's Tail, 18=GoldenEye: Rogue Agent,
+// 19=Finding Nemo, 20=Cars, 21=NFS Underground, 22=NFS Underground preview,
+// 23=NFS Underground 2, 24=NFS Most Wanted. Duplicate bodies are stored once.
+struct GroundTruthExemplar {
+  std::string_view name;
+  bool critical = false;
+  std::uint16_t instruction_count = 0;
+  std::uint16_t call_offset = 0;
+  std::uint16_t call_count = 0;
+  std::int32_t stack_frame = 0;
+  std::uint8_t source_variant = 0;
+  std::uint32_t hash_offset = 0;    // into kGroundTruthStrictHash / kGroundTruthRelaxedHash
+  std::uint16_t ops_offset = 0;     // into kGroundTruthPrimaryOps, in (opcode, count) pairs
+  std::uint8_t ops_count = 0;
+  std::uint16_t direct_calls = 0;
+  std::uint16_t branches = 0;
+  std::uint16_t returns = 0;
+  std::uint64_t skeleton_hash = 0;
+  std::uint64_t prefix2_hash = 0;   // bodies of exactly two instructions
+  std::uint64_t prefix3_hash = 0;   // bodies of three or more instructions
+};
+
+'''
+
+FOOTER = '''
+inline std::span<const std::string_view> GroundTruthCalls(const GroundTruthExemplar& exemplar) {
+  return {kGroundTruthCallNames.data() + exemplar.call_offset,
+          exemplar.call_count};
+}
+
+inline const std::vector<StructuralShape>& GroundTruthShapes() {
+  static const std::vector<StructuralShape> shapes = [] {
+    std::vector<StructuralShape> out;
+    out.reserve(kGroundTruthExemplars.size());
+    for (const auto& exemplar : kGroundTruthExemplars) {
+      StructuralShape shape;
+      shape.size = static_cast<std::uint32_t>(exemplar.instruction_count) * 4u;
+      shape.instruction_count = exemplar.instruction_count;
+      shape.stack_frame = exemplar.stack_frame;
+      for (unsigned i = 0; i < exemplar.ops_count; ++i) {
+        const auto pair = 2u * (exemplar.ops_offset + i);
+        shape.primary_ops[kGroundTruthPrimaryOps[pair]] = kGroundTruthPrimaryOps[pair + 1u];
+      }
+      shape.direct_calls = exemplar.direct_calls;
+      shape.branches = exemplar.branches;
+      shape.returns = exemplar.returns;
+      shape.skeleton_hash = exemplar.skeleton_hash;
+      const auto first = exemplar.hash_offset;
+      shape.strict_hash.assign(kGroundTruthStrictHash.begin() + first,
+                             kGroundTruthStrictHash.begin() + first + exemplar.instruction_count);
+      shape.relaxed_hash.assign(kGroundTruthRelaxedHash.begin() + first,
+                              kGroundTruthRelaxedHash.begin() + first + exemplar.instruction_count);
+      out.push_back(std::move(shape));
+    }
+    return out;
+  }();
+  return shapes;
+}
+
+inline double GroundTruthSimilarity(const StructuralShape& candidate,
+                                    const StructuralShape& reference) {
+  if (!candidate.instruction_count || !reference.instruction_count)
+    return 0.0;
+  const double size = StructuralRatio(candidate.instruction_count,
+                                      reference.instruction_count);
+  if (size < 0.45)
+    return 0.0;
+  const double histogram = StructuralHistogramSimilarity(candidate, reference);
+  const double strict_sequence = StructuralWindowedAgreementPair(
+      candidate.strict_hash, candidate.relaxed_hash, reference.strict_hash, reference.relaxed_hash, 2);
+  const double relaxed_sequence =
+      StructuralWindowedAgreement(candidate.relaxed_hash, reference.relaxed_hash, 3);
+  const double calls = StructuralRatio(candidate.direct_calls + 1u,
+                                       reference.direct_calls + 1u);
+  const double branches = StructuralRatio(candidate.branches + 1u,
+                                          reference.branches + 1u);
+  const double frame = candidate.stack_frame == reference.stack_frame ? 1.0 :
+      (candidate.stack_frame == 0 || reference.stack_frame == 0 ? 0.70 : 0.25);
+  const double returns = candidate.returns == reference.returns ? 1.0 : 0.5;
+  return 0.10 * size + 0.16 * histogram + 0.18 * strict_sequence +
+         0.36 * relaxed_sequence + 0.08 * calls + 0.05 * branches +
+         0.04 * frame + 0.03 * returns;
+}
+
+inline bool GroundTruthExact(const StructuralShape& candidate,
+                             const StructuralShape& reference) {
+  return candidate.instruction_count == reference.instruction_count &&
+         candidate.skeleton_hash == reference.skeleton_hash;
+}
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('source')
+    parser.add_argument('-o', '--output', default=DEFAULT_OUTPUT)
+    parser.add_argument('--bits', type=int, default=WORD_HASH_BITS, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if not 1 <= args.bits <= 8:
+        sys.exit('per-instruction hashes must be 1 to 8 bits wide (non-reversible)')
+    globals()['WORD_HASH_BITS'] = args.bits
+    text = open(args.source, encoding='utf-8').read()
+    words, exemplars, calls_block, identity_block = parse(text)
+    identity_block = identity_block.replace(
+        '// Exact-only semantic anchors added from the v8 debug corpus.', '// Exact-only semantic anchors.')
+    strict, relaxed, ops, table = fingerprint(words, exemplars)
+    resolve = text[text.index('inline std::size_t GroundTruthExactIdentityCount'):]
+    out = [HEADER]
+    out.append(f'inline constexpr std::array<std::uint16_t, {len(strict)}> kGroundTruthStrictHash = {{\n'
+               + rows(strict, 24, lambda v: f'{v}') + '\n};\n\n')
+    out.append(f'inline constexpr std::array<std::uint16_t, {len(relaxed)}> kGroundTruthRelaxedHash = {{\n'
+               + rows(relaxed, 24, lambda v: f'{v}') + '\n};\n\n')
+    out.append(f'inline constexpr std::array<std::uint16_t, {len(ops)}> kGroundTruthPrimaryOps = {{\n'
+               + rows(ops, 24, lambda v: f'{v}') + '\n};\n\n')
+    out.append(calls_block + '\n')
+    lines = []
+    for e in table:
+        lines.append(f'  {{"{e["name"]}", {e["critical"]}, {e["count"]}u, {e["call_offset"]}u, {e["call_count"]}u, '
+                     f'{e["frame"]}, {e["variant"]}u, {e["hash_offset"]}u, {e["ops_offset"]}u, {e["ops_count"]}u, '
+                     f'{e["calls"]}u, {e["branches"]}u, {e["returns"]}u, 0x{e["skeleton_hash"]:016x}ull, '
+                     f'0x{e["prefix2"]:016x}ull, 0x{e["prefix3"]:016x}ull}},')
+    out.append(f'inline constexpr std::array<GroundTruthExemplar, {len(table)}> kGroundTruthExemplars = {{{{\n'
+               + '\n'.join(lines) + '\n}};\n\n')
+    out.append(identity_block)
+    out.append(FOOTER + '\n' + resolve)
+    with open(args.output, 'w', encoding='utf-8') as f:
+        f.write(''.join(out))
+    print(f'wrote {args.output}: {len(table)} bodies, {len(strict)} instructions fingerprinted')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

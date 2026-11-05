@@ -1,0 +1,10 @@
+diff --git a/lib/window.cpp b/lib/window.cpp
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -443 +443,5 @@
+-  SDL_Quit();
++  // Aurora is embedded inside a host process that also owns SDL gamepad,
++  // haptic, event and audio state. A process-global SDL_Quit() tears those
++  // host-owned objects down before GekkoAOT can release them. Release only
++  // the subsystems acquired by window::initialize().
++  SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);

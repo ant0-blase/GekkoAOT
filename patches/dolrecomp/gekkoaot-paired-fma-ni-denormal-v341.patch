@@ -1,0 +1,45 @@
+--- a/src/backend/llvm/paired_fma.cpp
++++ b/src/backend/llvm/paired_fma.cpp
+@@ -8,6 +8,8 @@
+ #include <llvm/IR/MDBuilder.h>
+ #include <llvm/IR/Module.h>
+ 
++#include <cstdlib>
++
+ namespace dolllvm {
+ 
+ using namespace llvm;
+@@ -69,7 +71,33 @@
+ 
+   Value *rounded;
+   if (hasSingle && !singleSafe) {
++    // GEKKOAOT_PAIRED_FMA_NI_DENORMAL_V341: the single-precision path differs
++    // from the architectural one only when non-IEEE mode (MXCSR DAZ) would
++    // zero an f32-denormal input; tiny results flush identically in both
++    // (same SSE tininess rule, tie-corrected single rounding). Keep the strict
++    // path for exactly that case instead of for all of NI mode (CoD runs NI=1).
+     Value *nonIEEE = niEnabled();
++    static const bool denormalGate = [] {
++      const char *setting = std::getenv("DOLRECOMP_PAIRED_FMA_NI_DENORMAL");
++      return !setting || setting[0] != '0';
++    }();
++    if (denormalGate) {
++      Type *integerPair = FixedVectorType::get(Type::getInt32Ty(context_), 2);
++      auto splat = [&](u32 value) {
++        return ConstantVector::getSplat(ElementCount::getFixed(2), builder_.getInt32(value));
++      };
++      Value *anyDenormal = builder_.getFalse();
++      for (u32 reg : {a, b, c}) {
++        Value *bits = builder_.CreateBitCast(pairF32(reg), integerPair);
++        Value *denormal = builder_.CreateAnd(
++            builder_.CreateICmpEQ(builder_.CreateAnd(bits, splat(0x7F800000u)), splat(0u)),
++            builder_.CreateICmpNE(builder_.CreateAnd(bits, splat(0x007FFFFFu)), splat(0u)));
++        anyDenormal = builder_.CreateOr(anyDenormal,
++            builder_.CreateOr(builder_.CreateExtractElement(denormal, uint64_t{0}),
++                              builder_.CreateExtractElement(denormal, 1u)));
++      }
++      nonIEEE = builder_.CreateAnd(nonIEEE, anyDenormal, "fma.ni.denormal");
++    }
+     BasicBlock *fast = BasicBlock::Create(context_, "fma_single", function_);
+     BasicBlock *strict =
+         BasicBlock::Create(context_, "fma_non_ieee", function_);

@@ -1,0 +1,174 @@
+diff --git a/src/ir/dolir_address.c b/src/ir/dolir_address.c
+--- a/src/ir/dolir_address.c
++++ b/src/ir/dolir_address.c
+@@ -11,0 +11,2 @@
++    bool relocatable_mem1;
++    u32 relocatable_base;
+@@ -29,1 +31,1 @@
+-    ConstantValue value = {0, false};
++    ConstantValue value = {0, false, false, 0};
+@@ -34,1 +36,1 @@
+-    ConstantValue value = {truncate_bits(bits, width), true};
++    ConstantValue value = {truncate_bits(bits, width), true, false, 0};
+@@ -38,0 +40,12 @@
++static ConstantValue relocatable_mem1_value(u32 base) {
++    ConstantValue value = {0, false, true, base};
++    return value;
++}
++
++static bool is_mem1_constant(u64 bits) {
++    const u32 address = (u32)bits;
++    const u32 normalized = address & ~0x40000000u;
++    return normalized >= GC_RAM_BASE &&
++           normalized < GC_RAM_BASE + GC_MAIN_RAM_SIZE;
++}
++
+@@ -41,0 +55,4 @@
++    if (operand.relocatable_mem1 && width == 32 &&
++        (instruction->op == DOLIR_OP_TRUNC ||
++         instruction->op == DOLIR_OP_ZEXT))
++        return operand;
+@@ -63,1 +81,1 @@
+-    if (!left.known || !right.known || !width)
++    if (!width)
+@@ -65,0 +83,27 @@
++
++    // v171: preserve proof that an effective address was formed from a static
++    // MEM1 base plus a runtime index. REL code frequently accesses relocated
++    // tables with lwzx/stwx. The final EA is dynamic, but it still needs the
++    // canonical->OSLink translation. A pointer loaded from guest RAM carries no
++    // such proof and therefore remains identity-mapped.
++    if (width == 32 && instruction->op == DOLIR_OP_ADD) {
++        if (left.relocatable_mem1 && !right.relocatable_mem1)
++            return relocatable_mem1_value(left.relocatable_base);
++        if (right.relocatable_mem1 && !left.relocatable_mem1)
++            return relocatable_mem1_value(right.relocatable_base);
++        if (left.known && !right.known && !right.relocatable_mem1 &&
++            is_mem1_constant(left.bits))
++            return relocatable_mem1_value((u32)left.bits);
++        if (right.known && !left.known && !left.relocatable_mem1 &&
++            is_mem1_constant(right.bits))
++            return relocatable_mem1_value((u32)right.bits);
++    } else if (width == 32 && instruction->op == DOLIR_OP_SUB) {
++        if (left.relocatable_mem1 && !right.relocatable_mem1)
++            return relocatable_mem1_value(left.relocatable_base);
++        if (left.known && !right.known && !right.relocatable_mem1 &&
++            is_mem1_constant(left.bits))
++            return relocatable_mem1_value((u32)left.bits);
++    }
++
++    if (!left.known || !right.known)
++        return unknown_value();
+@@ -157,0 +202,3 @@
++        if (yes.relocatable_mem1 && no.relocatable_mem1 &&
++            yes.relocatable_base == no.relocatable_base)
++            return yes;
+@@ -184,7 +232,14 @@
+-            if ((instruction->op == DOLIR_OP_GUEST_LOAD ||
+-                 instruction->op == DOLIR_OP_GUEST_STORE) &&
+-                values[instruction->operands[0]].known) {
+-                u32 address = (u32)values[instruction->operands[0]].bits;
+-                instruction->address_domain = classify_address(address);
+-                instruction->address_lower = address;
+-                instruction->address_upper = address;
++            if (instruction->op == DOLIR_OP_GUEST_LOAD ||
++                instruction->op == DOLIR_OP_GUEST_STORE) {
++                ConstantValue address_value = values[instruction->operands[0]];
++                if (address_value.known) {
++                    u32 address = (u32)address_value.bits;
++                    instruction->address_domain = classify_address(address);
++                    instruction->address_lower = address;
++                    instruction->address_upper = address;
++                } else if (address_value.relocatable_mem1) {
++                    instruction->address_domain = DOLIR_ADDRESS_MEM1;
++                    instruction->address_lower = address_value.relocatable_base;
++                    // Sentinel: static MEM1 base is proven, final indexed EA is dynamic.
++                    instruction->address_upper = 0xffffffffu;
++                }
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -59,5 +59,4 @@
+-  // REL AOT is compiled from a synthetic linked image. Only addresses that
+-  // DolIR proved to be constant MEM1 values can originate from those static
+-  // relocations. Dynamic pointers (heap/stack/loaded data pointers) already
+-  // contain the live OSLink address and must never be canonical-remapped just
+-  // because their numeric value overlaps the synthetic REL window.
++  // REL AOT is compiled from a synthetic linked image. Translate exact static
++  // MEM1 addresses and EAs proven to be static-base + dynamic-index. Dynamic
++  // pointers loaded from heap/stack/guest RAM carry no provenance sentinel and
++  // remain identity-mapped even if their numeric value overlaps the REL window.
+@@ -66,1 +65,2 @@
+-      instruction.address_lower == instruction.address_upper) {
++      (instruction.address_lower == instruction.address_upper ||
++       instruction.address_upper == 0xffffffffu)) {
+@@ -170,5 +170,2 @@
+-  // REL AOT is compiled from a synthetic linked image. Only addresses that
+-  // DolIR proved to be constant MEM1 values can originate from those static
+-  // relocations. Dynamic pointers (heap/stack/loaded data pointers) already
+-  // contain the live OSLink address and must never be canonical-remapped just
+-  // because their numeric value overlaps the synthetic REL window.
++  // Same provenance rule as loads: indexed table accesses derived from a
++  // static REL base need translation, while loaded/heap pointers stay live EAs.
+@@ -177,1 +174,2 @@
+-      instruction.address_lower == instruction.address_upper) {
++      (instruction.address_lower == instruction.address_upper ||
++       instruction.address_upper == 0xffffffffu)) {
+diff --git a/tests/test_dolir.c b/tests/test_dolir.c
+--- a/tests/test_dolir.c
++++ b/tests/test_dolir.c
+@@ -97,0 +97,54 @@
++    // Static REL table base + runtime index must retain enough provenance for
++    // GekkoAOT's canonical->OSLink bridge.  The effective address itself is not
++    // constant, so address_upper uses the dynamic-index sentinel.
++    PPCInst indexed_insts[] = {
++        decode(0x3C808050u, 0x80002520u), // lis r4, 0x8050
++        decode(0x7C64282Eu, 0x80002524u), // lwzx r3, r4, r5
++        decode(0x7C64292Eu, 0x80002528u), // stwx r3, r4, r5
++        decode(0x4E800020u, 0x8000252Cu),
++    };
++    dolir_module_init(&module);
++    CHECK(dolir_build_chunk(&module, indexed_insts, 4, 0x80002520u));
++    CHECK(dolir_verify(&module, stderr));
++    memory_ops = 0;
++    for (u32 b = 0; b < module.functions[0].block_count; b++) {
++        DolIRBlock* block = &module.functions[0].blocks[b];
++        for (u32 i = 0; i < block->instruction_count; i++) {
++            DolIRInstruction* instruction = &block->instructions[i];
++            if (instruction->op != DOLIR_OP_GUEST_LOAD &&
++                instruction->op != DOLIR_OP_GUEST_STORE)
++                continue;
++            CHECK(instruction->address_domain == DOLIR_ADDRESS_MEM1);
++            CHECK(instruction->address_lower == 0x80500000u);
++            CHECK(instruction->address_upper == 0xffffffffu);
++            memory_ops++;
++        }
++    }
++    CHECK(memory_ops == 2);
++    dolir_module_free(&module);
++
++    // A pointer fetched from guest RAM is already an OSLink/runtime address.
++    // Even if its eventual numeric value lands inside 0x805xxxxx, analysis must
++    // not invent REL provenance for a subsequent indexed access.
++    PPCInst loaded_pointer_insts[] = {
++        decode(0x80830000u, 0x80002540u), // lwz r4, 0(r3)
++        decode(0x7CA4302Eu, 0x80002544u), // lwzx r5, r4, r6
++        decode(0x4E800020u, 0x80002548u),
++    };
++    dolir_module_init(&module);
++    CHECK(dolir_build_chunk(&module, loaded_pointer_insts, 3, 0x80002540u));
++    CHECK(dolir_verify(&module, stderr));
++    memory_ops = 0;
++    for (u32 b = 0; b < module.functions[0].block_count; b++) {
++        DolIRBlock* block = &module.functions[0].blocks[b];
++        for (u32 i = 0; i < block->instruction_count; i++) {
++            DolIRInstruction* instruction = &block->instructions[i];
++            if (instruction->op != DOLIR_OP_GUEST_LOAD)
++                continue;
++            CHECK(instruction->address_domain == DOLIR_ADDRESS_UNKNOWN);
++            memory_ops++;
++        }
++    }
++    CHECK(memory_ops == 2);
++    dolir_module_free(&module);
++

@@ -1,0 +1,135 @@
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -21,7 +21,7 @@
+ struct StaticIntercept {
+   u32 address = 0;
+   u32 direct_token = 0;
+-  u32 gx_pixel_family = UINT32_MAX;
++  std::string native_binding;
+ };
+ 
+ struct StaticInterceptTable {
+@@ -63,13 +63,18 @@
+           return StaticInterceptTable{};
+         token = static_cast<u32>(parsed);
+       }
+-      u32 gxPixelFamily=UINT32_MAX;
+-      std::string abiClass, lowering;
+-      if(row >> abiClass >> lowering){
+-        if(lowering.size()==10 && lowering.compare(0,9,"gx-pixel:")==0 &&
+-           lowering[9]>='0' && lowering[9]<='3')gxPixelFamily=lowering[9]-'0';
+-      }
+-      result.entries.push_back({static_cast<u32>(address), token,gxPixelFamily});
++      std::string abiClass, lowering, nativeBinding, extra;
++      if(row >> abiClass){
++        if(abiClass!="leaf" && abiClass!="context-capture" && abiClass!="full-fp-context")return StaticInterceptTable{};
++        if(row >> lowering){
++          if(lowering.compare(0,7,"native:")!=0 || lowering.size()>128 || lowering.size()<=7)return StaticInterceptTable{};
++          nativeBinding=lowering.substr(7);
++          if(nativeBinding.compare(0,7,"simple_")!=0 && nativeBinding.compare(0,3,"os_")!=0)return StaticInterceptTable{};
++          for(const auto ch:nativeBinding)if(!((ch>='A'&&ch<='Z')||(ch>='a'&&ch<='z')||(ch>='0'&&ch<='9')||ch=='_'))return StaticInterceptTable{};
++          if(row >> extra)return StaticInterceptTable{};
++        }
++      }
++      result.entries.push_back({static_cast<u32>(address),token,nativeBinding});
+     }
+     std::sort(result.entries.begin(), result.entries.end(),
+               [](const StaticIntercept& a, const StaticIntercept& b) {
+@@ -245,15 +250,15 @@
+           continue;
+         }
+ 
+-        // GEKKOAOT_NATIVE_SDK_BINDINGS_V370: an explicit resolver annotation
+-        // selects a named, ABI-checked native service. The module negotiates
+-        // that service at load; no generic token dispatcher on this path.
++        // GEKKOAOT_NATIVE_SDK_MASS_BINDINGS_V371: one named symbol per
++        // resolver-admitted service. Generated bindings negotiate the registry
++        // and ABI; no token or family switch crosses this boundary.
+         Value* handled=nullptr;
+-        if(entry.gx_pixel_family<4u){
+-          auto service=module_.getOrInsertFunction("gekkoaot_sdk_gx_pixel",
+-            FunctionType::get(builder_.getInt32Ty(),{pointer,builder_.getInt32Ty()},false));
+-          auto* accepted=builder_.CreateCall(service,{ctx_,builder_.getInt32(entry.gx_pixel_family)});
+-          handled=builder_.CreateICmpNE(accepted,builder_.getInt32(0));
++        if(!entry.native_binding.empty()){
++          auto service=module_.getOrInsertFunction("gekkoaot_sdk_"+entry.native_binding,
++            FunctionType::get(builder_.getInt32Ty(),{pointer},false));
++          auto* result=builder_.CreateCall(service,{ctx_});
++          handled=builder_.CreateICmpNE(result,builder_.getInt32(0));
+         }else{
+           handled=builder_.CreateCall(hostCallType,hostCall,{ctx_,builder_.getInt32(entry.direct_token)});
+         }
+--- a/src/backend/llvm/side_exit_analysis.cpp
++++ b/src/backend/llvm/side_exit_analysis.cpp
+@@ -74,8 +74,10 @@
+       if(extra!="leaf" && extra!="context-capture" && extra!="full-fp-context")return false;
+       std::string lowering;
+       if(row >> lowering){
+-        if(lowering.size()!=10 || lowering.compare(0,9,"gx-pixel:")!=0 ||
+-           lowering[9]<'0' || lowering[9]>'3' || extra!="leaf")return false;
++        if(lowering.compare(0,7,"native:")!=0 || lowering.size()<=7 || lowering.size()>128)return false;
++        const auto binding=lowering.substr(7);
++        if(binding.compare(0,7,"simple_")!=0 && binding.compare(0,3,"os_")!=0)return false;
++        for(const auto ch:binding)if(!((ch>='A'&&ch<='Z')||(ch>='a'&&ch<='z')||(ch>='0'&&ch<='9')||ch=='_'))return false;
+         if(row >> extra)return false;
+       }
+     }
+--- a/src/backend/dispatch.c
++++ b/src/backend/dispatch.c
+@@ -22,9 +22,11 @@
+     return DISPATCH_LOOKUP_LINEAR;
+ }
+ 
++typedef struct {u32 address; int native_binding;} StaticSdkEntry;
++
+ static int static_intercept_compare(const void* left, const void* right) {
+-    const u32 a = *(const u32*)left;
+-    const u32 b = *(const u32*)right;
++    const u32 a = ((const StaticSdkEntry*)left)->address;
++    const u32 b = ((const StaticSdkEntry*)right)->address;
+     return a < b ? -1 : a > b ? 1 : 0;
+ }
+ 
+@@ -36,7 +38,7 @@
+ static void emit_static_hostcall_filter(FILE* out) {
+     const char* path = getenv("DOLRECOMP_STATIC_INTERCEPTS");
+     FILE* in = path && path[0] ? fopen(path, "r") : NULL;
+-    u32* addresses = NULL;
++    StaticSdkEntry* addresses = NULL;
+     u32 count = 0u, capacity = 0u;
+     int valid = in != NULL;
+     char line[1024];
+@@ -50,12 +52,16 @@
+         if (end == p || value > 0xfffffffful) { valid = 0; break; }
+         if (count == capacity) {
+             u32 next = capacity ? capacity * 2u : 64u;
+-            u32* grown = (u32*)realloc(addresses, next * sizeof(*addresses));
++            StaticSdkEntry* grown = (StaticSdkEntry*)realloc(addresses, next * sizeof(*addresses));
+             if (!grown) { valid = 0; break; }
+             addresses = grown;
+             capacity = next;
+         }
+-        addresses[count++] = (u32)value;
++        /* LLVM owns named native entry calls. A generic pre-probe would
++         * intercept them before their generated service executes. Portable C
++         * keeps its existing interception path. */
++        addresses[count].address=(u32)value;
++        addresses[count++].native_binding=strstr(end," native:")!=NULL;
+     }
+     if (in) fclose(in);
+ 
+@@ -71,9 +77,11 @@
+     u32 previous = 0u;
+     int have_previous = 0;
+     for (u32 i = 0; i < count; ++i) {
+-        if (have_previous && addresses[i] == previous) continue;
+-        previous = addresses[i]; have_previous = 1;
+-        fprintf(out, "    case 0x%08Xu: return 1;\n", addresses[i]);
++        if (have_previous && addresses[i].address == previous) continue;
++        previous = addresses[i].address; have_previous = 1;
++        if(addresses[i].native_binding)
++            fprintf(out,"#if defined(DOLRECOMP_BACKEND_LLVM)\n    case 0x%08Xu: return 0;\n#else\n    case 0x%08Xu: return 1;\n#endif\n",addresses[i].address,addresses[i].address);
++        else fprintf(out, "    case 0x%08Xu: return 1;\n", addresses[i].address);
+     }
+     fprintf(out, "    default: return 0;\n    }\n}\n");
+     free(addresses);

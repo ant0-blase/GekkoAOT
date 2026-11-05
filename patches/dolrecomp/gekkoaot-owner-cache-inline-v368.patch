@@ -1,0 +1,82 @@
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -312,13 +312,52 @@
+     const char* window = std::getenv("DOLRECOMP_NATIVE_ADDRESS_LOWERING");
+     if (window && std::string(window) == "1") {
+       Type* wide = builder_.getInt64Ty();
+-      auto getter = module_.getOrInsertFunction("gekkoaot_native_address_base",
+-          FunctionType::get(pointer, {ctx_->getType()}, false));
+-      auto* service = llvm::cast<Function>(getter.getCallee());
+-      service->setDoesNotAccessMemory();
+-      service->setDoesNotThrow();
+-      service->addFnAttr(Attribute::WillReturn);
+-      Value* base = builder_.CreateCall(getter, {ctx_}, "host.address.base");
++      const char* lc = std::getenv("DOLRECOMP_NATIVE_LOCKED_CACHE");
++      const char* flat = std::getenv("DOLRECOMP_NATIVE_FLAT_VMEM");
++      const bool wantLockedCache = !lc || lc[0] != '0';
++      const bool wantFlatVmem = !flat || flat[0] != '0';
++      // GEKKOAOT_OWNER_CACHE_INLINE_V368: the three owner services are read
++      // from the module's owner cache (owner, address base, locked-cache base,
++      // flat-VM view) after one compare; the services run only on a miss.
++      // Three calls per guest function were ~11% of HPCOS process CPU.
++      const char* ownerInline = std::getenv("DOLRECOMP_OWNER_CACHE_INLINE");
++      const bool inlineOwner = !ownerInline || ownerInline[0] != '0';
++      Value* base = nullptr;
++      if (inlineOwner) {
++        StructType* cacheType = StructType::get(context_, {pointer, pointer, pointer, pointer});
++        auto* cache = module_.getOrInsertGlobal("gekkoaot_native_owner_cache", cacheType);
++        auto fill = module_.getOrInsertFunction("gekkoaot_native_owner_fill",
++            FunctionType::get(builder_.getVoidTy(), {pointer}, false));
++        Value* owner = builder_.CreateLoad(pointer, builder_.CreateStructGEP(cacheType, cache, 0), "host.owner");
++        Value* hit = builder_.CreateCall(expect, {builder_.CreateICmpEQ(owner, ctx_), builder_.getTrue()});
++        BasicBlock* miss = BasicBlock::Create(context_, "host.owner.miss", function_);
++        BasicBlock* ready = BasicBlock::Create(context_, "host.owner.ready", function_);
++        builder_.CreateCondBr(hit, ready, miss);
++        builder_.SetInsertPoint(miss);
++        builder_.CreateCall(fill, {ctx_});
++        builder_.CreateBr(ready);
++        builder_.SetInsertPoint(ready);
++        base = builder_.CreateLoad(pointer, builder_.CreateStructGEP(cacheType, cache, 1), "host.address.base");
++        if (wantLockedCache) {
++          native_locked_cache_base_ = builder_.CreateLoad(pointer,
++              builder_.CreateStructGEP(cacheType, cache, 2), "host.locked.cache.base");
++          function_->addFnAttr("dolrecomp-native-locked-cache", "308");
++        }
++        if (wantFlatVmem) {
++          native_flat_vmem_view_ = builder_.CreateLoad(pointer,
++              builder_.CreateStructGEP(cacheType, cache, 3), "host.flat.vmem.view");
++          function_->addFnAttr("dolrecomp-native-flat-vmem", "304");
++        }
++        function_->addFnAttr("dolrecomp-owner-cache-inline", "368");
++      } else {
++        auto getter = module_.getOrInsertFunction("gekkoaot_native_address_base",
++            FunctionType::get(pointer, {ctx_->getType()}, false));
++        auto* service = llvm::cast<Function>(getter.getCallee());
++        service->setDoesNotAccessMemory();
++        service->setDoesNotThrow();
++        service->addFnAttr(Attribute::WillReturn);
++        base = builder_.CreateCall(getter, {ctx_}, "host.address.base");
++      }
+       Value* ready = builder_.CreateIsNotNull(base);
+       Value* mapped = builder_.CreatePtrToInt(base, wide);
+       native_mem1_bias_ = builder_.CreateSelect(ready, mapped,
+@@ -330,8 +369,7 @@
+       function_->addFnAttr("dolrecomp-native-address-lowering", "287");
+       // GEKKOAOT_NATIVE_LOCKED_CACHE_V308: stable owner storage shared with
+       // SDK DMA. Resolve once per body; no CPUState publication per access.
+-      const char* lc = std::getenv("DOLRECOMP_NATIVE_LOCKED_CACHE");
+-      if (!lc || lc[0] != '0') {
++      if (!inlineOwner && wantLockedCache) {
+         auto lcGetter = module_.getOrInsertFunction("gekkoaot_native_locked_cache_base",
+             FunctionType::get(pointer, {pointer}, false));
+         auto* lcService = cast<Function>(lcGetter.getCallee());
+@@ -343,8 +381,7 @@
+       }
+       // GEKKOAOT_NATIVE_FLAT_VMEM_V304: obtain a stable owner-specific cell,
+       // not a cached mapping permission. Its size is reloaded at each access.
+-      const char* flat = std::getenv("DOLRECOMP_NATIVE_FLAT_VMEM");
+-      if (!flat || flat[0] != '0') {
++      if (!inlineOwner && wantFlatVmem) {
+         auto viewGetter = module_.getOrInsertFunction("gekkoaot_native_flat_vmem_view",
+             FunctionType::get(pointer, {pointer}, false));
+         auto* viewService = cast<Function>(viewGetter.getCallee());

@@ -1,0 +1,149 @@
+--- a/src/backend/llvm/memory_service.cpp
++++ b/src/backend/llvm/memory_service.cpp
+@@ -1,4 +1,5 @@
+ #include "backend/llvm/emitter.h"
++#include "backend/llvm/wgpipe_inline.h"
+ #include "cpu/cpu.h"
+ #include <cstdlib>
+ #include <cstring>
+@@ -226,10 +227,10 @@
+         FunctionType::get(Type::getInt32Ty(context_),
+             {pointer, Type::getInt32Ty(context_), Type::getInt64Ty(context_),
+              Type::getInt8Ty(context_), Type::getInt32Ty(context_)}, false));
+-    Value *accepted = builder_.CreateCall(tryWrite,
+-        {ctx_, address, stored, builder_.getInt8(width), builder_.getInt32(current_pc_)});
++    Value *accepted = emitWgpipeTry(builder_, module_, function_, ctx_, tryWrite,
++                                    address, stored, width, current_pc_);
+     BasicBlock *full = BasicBlock::Create(context_, "wgpipe_full_boundary", function_);
+-    builder_.CreateCondBr(builder_.CreateICmpNE(accepted, builder_.getInt32(0)), done, full);
++    builder_.CreateCondBr(accepted, done, full);
+     builder_.SetInsertPoint(full);
+     function_->addFnAttr("dolrecomp-native-wgpipe-try", "244");
+   } else if (!nativeSymbol &&
+@@ -256,9 +257,9 @@
+           builder_.getInt32(0x0c008000u));
+       builder_.CreateCondBr(aperture, gather, full);
+       builder_.SetInsertPoint(gather);
+-      Value *accepted = builder_.CreateCall(tryWrite,
+-          {ctx_, address, stored, builder_.getInt8(width), builder_.getInt32(current_pc_)});
+-      builder_.CreateCondBr(builder_.CreateICmpNE(accepted, builder_.getInt32(0)), done, full,
++      Value *accepted = emitWgpipeTry(builder_, module_, function_, ctx_, tryWrite,
++                                      address, stored, width, current_pc_);
++      builder_.CreateCondBr(accepted, done, full,
+                             MDBuilder(context_).createBranchWeights(2000, 1));
+       builder_.SetInsertPoint(full);
+       function_->addFnAttr("dolrecomp-dynamic-wgpipe-try", "338");
+--- a/src/backend/llvm/psq.cpp
++++ b/src/backend/llvm/psq.cpp
+@@ -1,5 +1,6 @@
+ #include "backend/llvm/emitter.h"
+ #include "backend/llvm/psq_convert.h"
++#include "backend/llvm/wgpipe_inline.h"
+ #include "cpu/cpu.h"
+ 
+ #include <llvm/ADT/SmallVector.h>
+@@ -203,13 +204,11 @@
+               laneBits(1));
+           clearReservation(builder_.CreateAdd(address, builder_.getInt32(width)));
+         }
+-        Value *accepted = builder_.CreateCall(
+-            tryWrite, {ctx_, address, packed,
+-                       builder_.getInt8(w ? width : width * 2),
+-                       builder_.getInt32(inst.guest_pc)});
+-        builder_.CreateCondBr(
+-            builder_.CreateICmpNE(accepted, builder_.getInt32(0)), join, exact,
+-            MDBuilder(context_).createBranchWeights(2000, 1));
++        Value *accepted = emitWgpipeTry(builder_, module_, function_, ctx_,
++                                        tryWrite, address, packed,
++                                        w ? width : width * 2, inst.guest_pc);
++        builder_.CreateCondBr(accepted, join, exact,
++                              MDBuilder(context_).createBranchWeights(2000, 1));
+         fastEnds.push_back(builder_.GetInsertBlock());
+       };
+       offer(0, 4, 0, 0);
+--- /dev/null
++++ b/src/backend/llvm/wgpipe_inline.h
+@@ -0,0 +1,83 @@
++#ifndef DOLRECOMP_LLVM_WGPIPE_INLINE_H
++#define DOLRECOMP_LLVM_WGPIPE_INLINE_H
++
++#include <cstdlib>
++#include <llvm/IR/Function.h>
++#include <llvm/IR/IRBuilder.h>
++#include <llvm/IR/MDBuilder.h>
++#include <llvm/IR/Module.h>
++
++namespace dolllvm {
++
++// GEKKOAOT_WGPIPE_INLINE_GATHER_V372: a write-gather store that neither
++// starts nor completes the current 32-byte line only appends bytes to the
++// runtime's private partial gather. Generated code does that append itself,
++// through the module's gekkoaot_wgpipe_inline_window ({owner CPU, bytes,
++// size}); the first store of a line (which checks every routing condition)
++// and the store that completes it still call gekkoaot_try_wgpipe_write.
++// Returns i1 accepted, exactly as the try call would.
++inline llvm::Value *emitWgpipeTry(llvm::IRBuilder<> &builder,
++                                  llvm::Module &module,
++                                  llvm::Function *function, llvm::Value *ctx,
++                                  llvm::FunctionCallee tryWrite,
++                                  llvm::Value *address, llvm::Value *value,
++                                  unsigned width, unsigned pc) {
++  using namespace llvm;
++  static const bool enabled = [] {
++    const char *setting = std::getenv("DOLRECOMP_WGPIPE_INLINE");
++    return !setting || setting[0] != '0';
++  }();
++  auto callTry = [&] {
++    return builder.CreateICmpNE(
++        builder.CreateCall(tryWrite, {ctx, address, value,
++                                      builder.getInt8(width),
++                                      builder.getInt32(pc)}),
++        builder.getInt32(0));
++  };
++  if (!enabled || (width != 1u && width != 2u && width != 4u && width != 8u))
++    return callTry();
++  LLVMContext &context = module.getContext();
++  Type *pointer = PointerType::getUnqual(context);
++  StructType *windowType = StructType::get(context, {pointer, pointer, pointer});
++  auto *window = module.getOrInsertGlobal("gekkoaot_wgpipe_inline_window", windowType);
++  MDBuilder md(context);
++  BasicBlock *check = BasicBlock::Create(context, "wgpipe_inline_check", function);
++  BasicBlock *append = BasicBlock::Create(context, "wgpipe_inline_append", function);
++  BasicBlock *host = BasicBlock::Create(context, "wgpipe_inline_host", function);
++  BasicBlock *join = BasicBlock::Create(context, "wgpipe_inline_join", function);
++  Value *owner = builder.CreateLoad(pointer, builder.CreateStructGEP(windowType, window, 0));
++  builder.CreateCondBr(builder.CreateICmpEQ(owner, ctx), check, host,
++                       md.createBranchWeights(2000, 1));
++  builder.SetInsertPoint(check);
++  Value *sizeSlot = builder.CreateLoad(pointer, builder.CreateStructGEP(windowType, window, 2));
++  Value *size = builder.CreateLoad(builder.getInt32Ty(), sizeSlot);
++  Value *next = builder.CreateAdd(size, builder.getInt32(width));
++  Value *partial = builder.CreateAnd(builder.CreateICmpNE(size, builder.getInt32(0)),
++                                     builder.CreateICmpULT(next, builder.getInt32(32)));
++  builder.CreateCondBr(partial, append, host, md.createBranchWeights(6, 2));
++  builder.SetInsertPoint(append);
++  Value *bytes = builder.CreateLoad(pointer, builder.CreateStructGEP(windowType, window, 1));
++  Value *target = builder.CreateGEP(builder.getInt8Ty(), bytes,
++                                    builder.CreateZExt(size, builder.getInt64Ty()));
++  // The gather holds FIFO (big-endian) byte order.
++  Value *stored = builder.CreateTrunc(value, IntegerType::get(context, width * 8u));
++  if (width > 1u)
++    stored = builder.CreateUnaryIntrinsic(Intrinsic::bswap, stored);
++  builder.CreateAlignedStore(stored, target, MaybeAlign(1));
++  builder.CreateStore(next, sizeSlot);
++  builder.CreateBr(join);
++  builder.SetInsertPoint(host);
++  Value *accepted = callTry();
++  BasicBlock *hostEnd = builder.GetInsertBlock();
++  builder.CreateBr(join);
++  builder.SetInsertPoint(join);
++  PHINode *result = builder.CreatePHI(builder.getInt1Ty(), 2, "wgpipe_accepted");
++  result->addIncoming(builder.getTrue(), append);
++  result->addIncoming(accepted, hostEnd);
++  function->addFnAttr("dolrecomp-wgpipe-inline", "372");
++  return result;
++}
++
++} // namespace dolllvm
++
++#endif

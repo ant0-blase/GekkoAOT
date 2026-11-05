@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/fannymonori/TF-ESPCN",
+  "revision": "5c628eca82028161a53e1265cc3a5b571ab8625f",
+  "license": "Apache-2.0",
+  "models": {
+    "2": {
+      "upstream_sha256": "59f77351e1d7c0057bf6fe088b4a8a07e42c468c8c8aebb674a6b4ea1823221d",
+      "parameters": 21284,
+      "float32_bytes": 85136
+    },
+    "4": {
+      "upstream_sha256": "e403f06309229cf36009cd8fb0da032ba7643fae9f15cf94fe562e8edf8fef47",
+      "parameters": 24752,
+      "float32_bytes": 99008
+    }
+  }
+}

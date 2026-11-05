@@ -1,0 +1,220 @@
+diff --git a/src/ir/dolir_address.c b/src/ir/dolir_address.c
+--- a/src/ir/dolir_address.c
++++ b/src/ir/dolir_address.c
+@@ -206,8 +206,153 @@
+     return unknown_value();
+ }
+ 
++static void analyze_address_block(DolIRBlock* block, ConstantValue* values,
++                              ConstantValue* state) {
++    for (u32 index = 0; index < block->instruction_count; index++) {
++        DolIRInstruction* instruction = &block->instructions[index];
++        instruction->address_domain = DOLIR_ADDRESS_UNKNOWN;
++        instruction->address_lower = 0;
++        instruction->address_upper = 0;
++        if (instruction->op == DOLIR_OP_GUEST_STORE)
++            instruction->aux &= 0x7fffffffu;
++        if (instruction->op == DOLIR_OP_GUEST_LOAD ||
++            instruction->op == DOLIR_OP_GUEST_STORE) {
++            ConstantValue address_value = values[instruction->operands[0]];
++            if (address_value.known) {
++                u32 address = (u32)address_value.bits;
++                instruction->address_domain = classify_address(address);
++                instruction->address_lower = address;
++                instruction->address_upper = address;
++            } else if (address_value.relocatable_mem1) {
++                instruction->address_domain = DOLIR_ADDRESS_MEM1;
++                instruction->address_lower = address_value.relocatable_base;
++                // Sentinel: static MEM1 base is proven, final indexed EA is dynamic.
++                instruction->address_upper = 0xffffffffu;
++            }
++        }
++        // A REL can materialize a canonical pointer and store it into guest
++        // memory (for example an interface/data pointer published by its
++        // prolog).  Mark only 32-bit store values with static MEM1 proof;
++        // the LLVM backend will run them through the same canonical->live
++        // OSLink translator used for proven REL effective addresses.
++        if (instruction->op == DOLIR_OP_GUEST_STORE &&
++            instruction->operand_count >= 2u) {
++            ConstantValue stored_value = values[instruction->operands[1]];
++            // v199: this is only a cheap compile-time *candidate* bit.
++            // A classic REL prolog (lis/addi/stw) folds its relocated
++            // address to a known constant, losing v171's dynamic-index
++            // provenance. The generated per-REL helper performs the
++            // authoritative own-data + cross-module check at runtime, so
++            // known MEM1 values are safe to admit here without repeating
++            // v195's broad rewrite.
++            if (stored_value.relocatable_mem1 ||
++                (stored_value.known && is_mem1_constant(stored_value.bits)))
++                instruction->aux |= 0x80000000u;
++        }
++        ConstantValue result =
++            instruction_value(instruction, values, state);
++        if (instruction->result)
++            values[instruction->result] = result;
++        if (instruction->op == DOLIR_OP_STATE_WRITE)
++            state[instruction->aux] =
++                values[instruction->operands[0]];
++        for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++)
++            if (dolir_state_mask_test(instruction->state_defs,
++                                      (DolIRStateSlot)slot) &&
++                !(instruction->op == DOLIR_OP_STATE_WRITE &&
++                  instruction->aux == slot))
++                state[slot] = unknown_value();
++    }
++}
++
++// v221: REL static bases survive control-flow edges. A linear region scan
++// erased r3 at loop leaders, so an invariant relocated base became an ordinary
++// heap pointer and its next load read the synthetic compilation window.
++static bool analyze_rel_cfg_addresses(DolIRFunction* function) {
++    const u32 count = function->block_count;
++    const size_t slots = (size_t)count * DOLIR_STATE_COUNT;
++    ConstantValue* inputs = calloc(slots, sizeof(*inputs));
++    ConstantValue* values = calloc(function->value_count, sizeof(*values));
++    bool* initialized = calloc(count, sizeof(*initialized));
++    bool* dirty = calloc(count, sizeof(*dirty));
++    u32* predecessors = calloc(count, sizeof(*predecessors));
++    if (!inputs || !values || !initialized || !dirty || !predecessors) {
++        free(inputs); free(values); free(initialized); free(dirty); free(predecessors);
++        return false;
++    }
++    for (u32 i = 0; i < count; i++) {
++        const DolIRTerminator* term = &function->blocks[i].terminator;
++        for (u32 slot = 0; slot < terminator_target_count(term->kind); slot++) {
++            u32 target = term->targets[slot];
++            if (target < count) predecessors[target]++;
++        }
++        if (term->kind == DOLIR_TERM_FALLTHROUGH && i + 1u < count)
++            predecessors[i + 1u]++;
++    }
++    // Calls/fallbacks may return with arbitrary architectural register values.
++    // Seed their continuations independently rather than carrying caller proof.
++    initialized[0] = dirty[0] = true;
++    for (u32 i = 0; i < count; i++) {
++        const DolIRTerminator* term = &function->blocks[i].terminator;
++        if (!predecessors[i] || term->kind == DOLIR_TERM_FALLBACK)
++            initialized[i] = dirty[i] = true;
++        if (i + 1u < count && (term->linked ||
++            (term->kind != DOLIR_TERM_FALLTHROUGH &&
++             term->kind != DOLIR_TERM_BRANCH &&
++             term->kind != DOLIR_TERM_COND_BRANCH)))
++            initialized[i + 1u] = dirty[i + 1u] = true;
++    }
++    bool pending = true;
++    while (pending) {
++        pending = false;
++        for (u32 i = 0; i < count; i++) {
++            if (!dirty[i]) continue;
++            dirty[i] = false;
++            ConstantValue state[DOLIR_STATE_COUNT];
++            memcpy(state, inputs + (size_t)i * DOLIR_STATE_COUNT, sizeof(state));
++            analyze_address_block(&function->blocks[i], values, state);
++            const DolIRTerminator* term = &function->blocks[i].terminator;
++            if (term->linked || term->kind == DOLIR_TERM_INDIRECT ||
++                term->kind == DOLIR_TERM_FALLBACK)
++                memset(state, 0, sizeof(state));
++            u32 targets[2] = {DOLIR_NO_BLOCK, DOLIR_NO_BLOCK};
++            u32 edges = terminator_target_count(term->kind);
++            for (u32 slot = 0; slot < edges; slot++) targets[slot] = term->targets[slot];
++            if (term->kind == DOLIR_TERM_FALLTHROUGH && i + 1u < count) {
++                targets[0] = i + 1u; edges = 1;
++            }
++            for (u32 edge = 0; edge < edges; edge++) {
++                const u32 target = targets[edge];
++                if (target >= count) continue;
++                ConstantValue* in = inputs + (size_t)target * DOLIR_STATE_COUNT;
++                bool changed = false;
++                if (!initialized[target]) {
++                    memcpy(in, state, sizeof(state));
++                    initialized[target] = true; changed = true;
++                } else {
++                    for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
++                        ConstantValue old = in[slot], next = state[slot];
++                        const bool equal = (old.known && next.known && old.bits == next.bits) ||
++                            (old.relocatable_mem1 && next.relocatable_mem1 &&
++                             old.relocatable_base == next.relocatable_base);
++                        if ((old.known || old.relocatable_mem1) && !equal) {
++                            in[slot] = unknown_value(); changed = true;
++                        }
++                    }
++                }
++                if (changed) { dirty[target] = true; pending = true; }
++            }
++        }
++    }
++    free(inputs); free(values); free(initialized); free(dirty); free(predecessors);
++    return true;
++}
++
+ void dolir_analyze_addresses(DolIRFunction* function) {
+     if (!function || !function->block_count || !function->value_count)
++        return;
++    const char* rel = getenv("DOLRECOMP_REL_RUNTIME_TRANSLATE");
++    if (rel && rel[0] && rel[0] != '0' && analyze_rel_cfg_addresses(function))
+         return;
+     bool* leaders = (bool*)calloc(function->block_count, sizeof(*leaders));
+     ConstantValue* values =
+@@ -224,61 +369,7 @@
+         DolIRBlock* block = &function->blocks[block_index];
+         if (leaders[block_index])
+             memset(state, 0, sizeof(state));
+-        for (u32 index = 0; index < block->instruction_count; index++) {
+-            DolIRInstruction* instruction = &block->instructions[index];
+-            instruction->address_domain = DOLIR_ADDRESS_UNKNOWN;
+-            instruction->address_lower = 0;
+-            instruction->address_upper = 0;
+-            if (instruction->op == DOLIR_OP_GUEST_STORE)
+-                instruction->aux &= 0x7fffffffu;
+-            if (instruction->op == DOLIR_OP_GUEST_LOAD ||
+-                instruction->op == DOLIR_OP_GUEST_STORE) {
+-                ConstantValue address_value = values[instruction->operands[0]];
+-                if (address_value.known) {
+-                    u32 address = (u32)address_value.bits;
+-                    instruction->address_domain = classify_address(address);
+-                    instruction->address_lower = address;
+-                    instruction->address_upper = address;
+-                } else if (address_value.relocatable_mem1) {
+-                    instruction->address_domain = DOLIR_ADDRESS_MEM1;
+-                    instruction->address_lower = address_value.relocatable_base;
+-                    // Sentinel: static MEM1 base is proven, final indexed EA is dynamic.
+-                    instruction->address_upper = 0xffffffffu;
+-                }
+-            }
+-            // A REL can materialize a canonical pointer and store it into guest
+-            // memory (for example an interface/data pointer published by its
+-            // prolog).  Mark only 32-bit store values with static MEM1 proof;
+-            // the LLVM backend will run them through the same canonical->live
+-            // OSLink translator used for proven REL effective addresses.
+-            if (instruction->op == DOLIR_OP_GUEST_STORE &&
+-                instruction->operand_count >= 2u) {
+-                ConstantValue stored_value = values[instruction->operands[1]];
+-                // v199: this is only a cheap compile-time *candidate* bit.
+-                // A classic REL prolog (lis/addi/stw) folds its relocated
+-                // address to a known constant, losing v171's dynamic-index
+-                // provenance. The generated per-REL helper performs the
+-                // authoritative own-data + cross-module check at runtime, so
+-                // known MEM1 values are safe to admit here without repeating
+-                // v195's broad rewrite.
+-                if (stored_value.relocatable_mem1 ||
+-                    (stored_value.known && is_mem1_constant(stored_value.bits)))
+-                    instruction->aux |= 0x80000000u;
+-            }
+-            ConstantValue result =
+-                instruction_value(instruction, values, state);
+-            if (instruction->result)
+-                values[instruction->result] = result;
+-            if (instruction->op == DOLIR_OP_STATE_WRITE)
+-                state[instruction->aux] =
+-                    values[instruction->operands[0]];
+-            for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++)
+-                if (dolir_state_mask_test(instruction->state_defs,
+-                                          (DolIRStateSlot)slot) &&
+-                    !(instruction->op == DOLIR_OP_STATE_WRITE &&
+-                      instruction->aux == slot))
+-                    state[slot] = unknown_value();
+-        }
++        analyze_address_block(block, values, state);
+     }
+     free(leaders);
+     free(values);

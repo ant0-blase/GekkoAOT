@@ -1,0 +1,145 @@
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -2,6 +2,7 @@
+ #include "backend/llvm/emitter.h"
+ 
+ #include <llvm/ADT/SmallVector.h>
++#include <llvm/Analysis/ValueTracking.h>
+ #include "cpu/cpu.h"
+ #include <cstdlib>
+ 
+@@ -16,6 +17,77 @@
+ namespace dolllvm {
+ 
+ using namespace llvm;
++
++// Materialization has already converted this SSA pointer to the live OSLink
++// domain. Preserve that provenance through pointer arithmetic and merges;
++// numerical overlap with the canonical window cannot justify rebasing twice.
++static bool relLiveAddress(Value* value, Value* ctx, unsigned depth = 0) {
++  if (!value || depth > 24) return false;
++  if (auto* call = dyn_cast<CallBase>(value)) {
++    auto* callee = call->getCalledFunction();
++    return callee && callee->getName() == "gekkoaot_rel_translate_address";
++  }
++  if (auto* load = dyn_cast<LoadInst>(value)) {
++    const auto& layout = load->getModule()->getDataLayout();
++    int64_t loadOffset = 0;
++    Value* loadBase = GetPointerBaseWithConstantOffset(load->getPointerOperand(), loadOffset, layout);
++    const auto loadBytes = layout.getTypeStoreSize(load->getType()).getFixedValue();
++    // Modern REL entry/resume boundaries expose full pointers as live GPRs.
++    // Relocation-bearing memory instructions are handled separately below.
++    if (loadBase == ctx && loadBytes == 4 && loadOffset >= 0 &&
++        loadOffset < 32 * 4 && (loadOffset & 3) == 0) return true;
++    for (Instruction* prior = load->getPrevNode(); prior; prior = prior->getPrevNode()) {
++      if (auto* store = dyn_cast<StoreInst>(prior)) {
++        int64_t storeOffset = 0;
++        Value* storeBase = GetPointerBaseWithConstantOffset(store->getPointerOperand(), storeOffset, layout);
++        const auto storeBytes = layout.getTypeStoreSize(store->getValueOperand()->getType()).getFixedValue();
++        if (loadBase == storeBase) {
++          if (loadOffset == storeOffset && loadBytes == storeBytes)
++            return relLiveAddress(store->getValueOperand(), ctx, depth + 1);
++          if (loadOffset + int64_t(loadBytes) <= storeOffset ||
++              storeOffset + int64_t(storeBytes) <= loadOffset) continue;
++        } else if (isa<AllocaInst>(loadBase) && isa<AllocaInst>(storeBase)) continue;
++        return false;
++      }
++      if (prior->mayWriteToMemory()) return false;
++    }
++    return false;
++  }
++  if (auto* phi = dyn_cast<PHINode>(value)) {
++    if (!phi->getNumIncomingValues()) return false;
++    for (Value* incoming : phi->incoming_values())
++      if (!relLiveAddress(incoming, ctx, depth + 1)) return false;
++    return true;
++  }
++  if (auto* select = dyn_cast<SelectInst>(value))
++    return relLiveAddress(select->getTrueValue(), ctx, depth + 1) &&
++           relLiveAddress(select->getFalseValue(), ctx, depth + 1);
++  if (auto* cast = dyn_cast<CastInst>(value))
++    return cast->getSrcTy()->isIntegerTy(32) && cast->getDestTy()->isIntegerTy(32) &&
++           relLiveAddress(cast->getOperand(0), ctx, depth + 1);
++  if (auto* binary = dyn_cast<BinaryOperator>(value)) {
++    const bool left = relLiveAddress(binary->getOperand(0), ctx, depth + 1);
++    const bool right = relLiveAddress(binary->getOperand(1), ctx, depth + 1);
++    if (binary->getOpcode() == Instruction::Add) return left != right;
++    if (binary->getOpcode() == Instruction::Sub) return left && !right;
++  }
++  return false;
++}
++
++void simplifyRelLiveAddresses(Module& module) {
++  SmallVector<CallInst*, 32> candidates;
++  for (Function& function : module)
++    for (BasicBlock& block : function)
++      for (Instruction& instruction : block)
++        if (auto* call = dyn_cast<CallInst>(&instruction))
++          if (call->getMetadata("gekkoaot.rel.effective") || call->getMetadata("gekkoaot.rel.publication")) candidates.push_back(call);
++  for (CallInst* call : candidates) {
++    const unsigned argument = call->getMetadata("gekkoaot.rel.publication") ? 2u : 1u;
++    if (!relLiveAddress(call->getArgOperand(argument), call->getArgOperand(0))) continue;
++    call->replaceAllUsesWith(call->getArgOperand(argument));
++    call->eraseFromParent();
++  }
++}
+ 
+ // The range/width guards remain at each admission point. Once admitted, use
+ // one 64-bit host addition with a zero-extended canonical EA. A null service
+@@ -352,7 +424,10 @@
+         i32, {ctx_->getType(), i32}, false);
+     auto translate = module_.getOrInsertFunction(
+         "gekkoaot_rel_translate_address", translateType);
+-    address = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
++    auto* relocated = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
++    if (relPointerKindV222(instruction.guest_pc) != 'a')
++      relocated->setMetadata("gekkoaot.rel.effective", MDNode::get(context_, {}));
++    address = relocated;
+   }
+ 
+   if (const char *symbol = provenHardwareSymbol(instruction, address, width, true)) {
+@@ -635,7 +710,10 @@
+         i32, {ctx_->getType(), i32}, false);
+     auto translate = module_.getOrInsertFunction(
+         "gekkoaot_rel_translate_address", translateType);
+-    address = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
++    auto* relocated = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
++    if (relPointerKindV222(instruction.guest_pc) != 'a')
++      relocated->setMetadata("gekkoaot.rel.effective", MDNode::get(context_, {}));
++    address = relocated;
+   }
+ 
+   // v199: a REL prolog can publish a self-data pointer using lis/addi/stw.
+@@ -664,8 +742,10 @@
+         knownDestination ? instruction.address_lower : 0xffffffffu);
+     Value *stored = value->getType() == i32
+         ? value : builder_.CreateZExtOrTrunc(value, i32);
+-    value = builder_.CreateCall(publish, {ctx_, destination, stored},
+-                                "rel.published_address");
++    auto* published = builder_.CreateCall(publish, {ctx_, destination, stored},
++                                          "rel.published_address");
++    published->setMetadata("gekkoaot.rel.publication", MDNode::get(context_, {}));
++    value = published;
+   }
+ 
+   Value *directOffset = nullptr;
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -23,6 +23,8 @@
+ #include <llvm/Support/FileSystem.h>
+ #include <llvm/Support/raw_ostream.h>
+ #include <llvm/Target/TargetMachine.h>
++
++namespace dolllvm { void simplifyRelLiveAddresses(llvm::Module&); }
+ 
+ namespace {
+ 
+@@ -194,6 +196,8 @@
+     fprintf(diagnostics, "%s", text.c_str());
+     return false;
+   }
++  dolllvm::simplifyRelLiveAddresses(module);
++  if (verifyModule(module, &stream)) return false;
+   report("optimize");
+   if (!writeIR(module, options, diagnostics) ||
+       !writeThinLTO(module, options, diagnostics) ||

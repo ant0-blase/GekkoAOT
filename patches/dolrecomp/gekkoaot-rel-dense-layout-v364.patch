@@ -1,0 +1,55 @@
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -2087,6 +2087,29 @@
+     return (u32)result;
+ }
+ 
++/* GekkoAOT v364: DOLRECOMP_REL_ALIGN (a power of two, 0x20..64 KiB) packs
++ * the batch at that alignment, ending each REL at its last section, so the
++ * caller's dense canonical layout (Twilight Princess: 757 RELs) stays within
++ * REL24 range of the DOL. Unset keeps the 64 KiB slots. */
++static u32 rel_dense_align(void) {
++    static int parsed = 0;
++    static u32 align = 0;
++    if (!parsed) {
++        const char* text = getenv("DOLRECOMP_REL_ALIGN");
++        parsed = 1;
++        if (text && *text) {
++            char* stop = NULL;
++            unsigned long value = strtoul(text, &stop, 0);
++            if (stop && *stop == 0 && value >= 0x20u && value <= REL_AUTO_ALIGN &&
++                (value & (value - 1u)) == 0)
++                align = (u32)value;
++            else
++                fprintf(stderr, "warning: ignoring DOLRECOMP_REL_ALIGN=%s\n", text);
++        }
++    }
++    return align;
++}
++
+ int next_rel_base(const RELFile* rel, u32* cursor) {
+     u32 end;
+     int ok = 1;
+@@ -2097,7 +2120,21 @@
+     }
+ 
+     end = rel->base_address + rel->file_size + rel->bss_size;
+-    *cursor = align_up_cli(end, REL_AUTO_ALIGN, &ok);
++    const u32 dense = rel_dense_align();
++    if (dense) {
++        for (u32 i = 0; i < rel->section_count; i++) {
++            const RELSection* section = &rel->sections[i];
++            if (section->size == 0)
++                continue;
++            if (section->size > 0xFFFFFFFFu - section->address) {
++                fprintf(stderr, "error: REL auto address range overflow\n");
++                return 0;
++            }
++            if (section->address + section->size > end)
++                end = section->address + section->size;
++        }
++    }
++    *cursor = align_up_cli(end, dense ? dense : REL_AUTO_ALIGN, &ok);
+     if (!ok) {
+         fprintf(stderr, "error: REL auto address range overflow\n");
+         return 0;

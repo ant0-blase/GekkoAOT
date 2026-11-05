@@ -1,0 +1,77 @@
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -745,0 +746,47 @@
++/* v34b: universal raw-f32 PSQ pair fast path.
++ * Collapse the common two-lane type-0 pair into one contiguous host access.
++ * The generic quantized/MMIO path remains the exact fallback. */
++static bool psq_raw_f32_load_pair(CPUState* cpu, u32 ea, f64* ps0, f64* ps1) {
++    u32 avail;
++    u8* host = resolve_addr(cpu, ea, &avail);
++    if (!host || avail < 8)
++        return false;
++    u64 packed = read_be64(host);
++    *ps0 = extend_f32_bits((u32)(packed >> 32));
++    *ps1 = extend_f32_bits((u32)packed);
++    return true;
++}
++
++static u32 psq_raw_f32_store_bits(f64 value) {
++    f32 single = (f32)value;
++    return f32_is_denormal(single) ? 0u : f32_bits(single);
++}
++
++static bool psq_raw_f32_store_pair(CPUState* cpu, u32 ea, f64 ps0, f64 ps1) {
++    const u32 first = psq_raw_f32_store_bits(ps0);
++    const u32 second = psq_raw_f32_store_bits(ps1);
++    const u64 packed = ((u64)first << 32) | second;
++    u32 avail;
++    u8* host = resolve_addr(cpu, ea, &avail);
++    if (host && avail >= 8) {
++        clear_matching_reservation(cpu, ea);
++        clear_matching_reservation(cpu, ea + 4u);
++        if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size) {
++            u32 offset = (u32)(host - cpu->ram);
++            g_mem_write_journal(offset, 4, g_mem_write_journal_user);
++            g_mem_write_journal(offset + 4u, 4, g_mem_write_journal_user);
++        }
++        write_be64(host, packed);
++        return true;
++    }
++
++    /* Flipper WGPIPE aperture: preserve the ordered eight-byte stream while
++     * crossing the host callback boundary once for a PSQ pair. */
++    if (cpu->external_write && (ea & 0x3fffffe0u) == 0x0c008000u &&
++        (ea & 31u) <= 24u) {
++        cpu->external_write(cpu, ea, packed, 8);
++        return true;
++    }
++    return false;
++}
++
+@@ -756,0 +804,13 @@
++    if (type == 0) {
++        if (w) {
++            cpu->fpr[frD] = extend_f32_bits(mem_read32(cpu, ea));
++            cpu->ps1[frD] = 1.0;
++            return true;
++        }
++        if (psq_raw_f32_load_pair(cpu, ea, &cpu->fpr[frD], &cpu->ps1[frD]))
++            return true;
++        cpu->fpr[frD] = extend_f32_bits(mem_read32(cpu, ea));
++        cpu->ps1[frD] = extend_f32_bits(mem_read32(cpu, ea + 4u));
++        return true;
++    }
++
+@@ -778,0 +839,12 @@
++
++    if (type == 0) {
++        if (w) {
++            mem_write32(cpu, ea, psq_raw_f32_store_bits(cpu->fpr[frS]));
++            return true;
++        }
++        if (psq_raw_f32_store_pair(cpu, ea, cpu->fpr[frS], cpu->ps1[frS]))
++            return true;
++        mem_write32(cpu, ea, psq_raw_f32_store_bits(cpu->fpr[frS]));
++        mem_write32(cpu, ea + 4u, psq_raw_f32_store_bits(cpu->ps1[frS]));
++        return true;
++    }

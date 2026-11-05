@@ -1,0 +1,164 @@
+diff --git a/src/frontend/container/rel.c b/src/frontend/container/rel.c
+--- a/src/frontend/container/rel.c
++++ b/src/frontend/container/rel.c
+@@ -2,6 +2,7 @@
+ // Copyright (C) 2026 ExpansionPak
+ 
+ #include "rel.h"
++#include "../decoder.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -201,6 +202,18 @@
+     return 1;
+ }
+ 
++/* GekkoAOT v395: an aligned branch whose synthetic placement is out of its
++ * displacement range keeps a zero displacement in the image; the decoder
++ * returns the recorded absolute target instead (decoder_far_branch). On the
++ * console the game's OSLink places the module within range, so only the AOT
++ * layout is affected. */
++static int far_rel_branch(s64 delta, s64 min, s64 max, u32 patch_address, u32 target) {
++    if ((delta & 3) != 0 || (delta >= min && delta <= max))
++        return 0;
++    decoder_add_far_branch(patch_address, target);
++    return 1;
++}
++
+ static int check_rel_delta(s64 delta, s64 min, s64 max, const char* type) {
+     if ((delta & 3) != 0 || delta < min || delta > max) {
+         fprintf(stderr, "error: REL %s relocation target is out of range\n", type);
+@@ -256,6 +269,10 @@
+         return 1;
+     case R_PPC_REL24: {
+         s64 delta = (s64)(s32)(target - patch_address);
++        if (far_rel_branch(delta, -0x02000000ll, 0x01FFFFFCll, patch_address, target)) {
++            write_be32(patch, read_be32(patch) & 0xFC000003u);
++            return 1;
++        }
+         if (!check_rel_delta(delta, -0x02000000ll, 0x01FFFFFCll, "REL24"))
+             return 0;
+         write_be32(patch, (read_be32(patch) & 0xFC000003u) |
+@@ -264,6 +281,10 @@
+     }
+     case R_PPC_REL14: {
+         s64 delta = (s64)(s32)(target - patch_address);
++        if (far_rel_branch(delta, -0x8000ll, 0x7FFCll, patch_address, target)) {
++            write_be32(patch, read_be32(patch) & 0xFFFF0003u);
++            return 1;
++        }
+         if (!check_rel_delta(delta, -0x8000ll, 0x7FFCll, "REL14"))
+             return 0;
+         write_be32(patch, (read_be32(patch) & 0xFFFF0003u) |
+diff --git a/src/frontend/decoder.c b/src/frontend/decoder.c
+--- a/src/frontend/decoder.c
++++ b/src/frontend/decoder.c
+@@ -2,6 +2,7 @@
+ // Copyright (C) 2026 ExpansionPak
+ 
+ #include "decoder.h"
++#include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -25,6 +26,65 @@
+ #define PPC_SIMM(raw)      ((s16)((raw) & 0xFFFF))
+ #define PPC_UIMM(raw)      ((u16)((raw) & 0xFFFF))
+ 
++/* GekkoAOT v395: far REL branch targets (see decoder.h). Filled before the
++ * REL batch forks its workers, read-only afterwards. */
++static u32* g_far_keys;
++static u32* g_far_values;
++static size_t g_far_capacity;
++static size_t g_far_count;
++
++static size_t far_slot(u32 address, size_t capacity) {
++    return (size_t)((address >> 2) * 2654435761u) & (capacity - 1u);
++}
++
++void decoder_add_far_branch(u32 address, u32 target) {
++    if ((g_far_count + 1u) * 2u > g_far_capacity) {
++        size_t capacity = g_far_capacity ? g_far_capacity * 2u : 1024u;
++        u32* keys = (u32*)calloc(capacity, sizeof(u32));
++        u32* values = (u32*)calloc(capacity, sizeof(u32));
++        if (!keys || !values) {
++            free(keys);
++            free(values);
++            return;
++        }
++        for (size_t i = 0; i < g_far_capacity; i++) {
++            if (!g_far_keys[i])
++                continue;
++            size_t slot = far_slot(g_far_keys[i], capacity);
++            while (keys[slot])
++                slot = (slot + 1u) & (capacity - 1u);
++            keys[slot] = g_far_keys[i];
++            values[slot] = g_far_values[i];
++        }
++        free(g_far_keys);
++        free(g_far_values);
++        g_far_keys = keys;
++        g_far_values = values;
++        g_far_capacity = capacity;
++    }
++    size_t slot = far_slot(address, g_far_capacity);
++    while (g_far_keys[slot] && g_far_keys[slot] != address)
++        slot = (slot + 1u) & (g_far_capacity - 1u);
++    if (!g_far_keys[slot])
++        g_far_count++;
++    g_far_keys[slot] = address;
++    g_far_values[slot] = target;
++}
++
++int decoder_far_branch(u32 address, u32* target) {
++    if (!g_far_count || !address)
++        return 0;
++    size_t slot = far_slot(address, g_far_capacity);
++    while (g_far_keys[slot]) {
++        if (g_far_keys[slot] == address) {
++            *target = g_far_values[slot];
++            return 1;
++        }
++        slot = (slot + 1u) & (g_far_capacity - 1u);
++    }
++    return 0;
++}
++
+ static void decode_d_rt_ra(PPCInst* inst, PPCOpcode op, u32 raw) {
+     inst->op = op;
+     inst->rD = PPC_RD(raw);
+@@ -420,6 +480,8 @@
+         inst.branch_target = inst.aa
+             ? (u32)displacement
+             : address + (u32)displacement;
++        if (!inst.aa)
++            decoder_far_branch(address, &inst.branch_target);
+         break;
+     }
+ 
+@@ -436,6 +498,8 @@
+         inst.branch_target = inst.aa
+             ? (u32)displacement
+             : address + (u32)displacement;
++        if (!inst.aa)
++            decoder_far_branch(address, &inst.branch_target);
+         break;
+     }
+ 
+diff --git a/src/frontend/decoder.h b/src/frontend/decoder.h
+--- a/src/frontend/decoder.h
++++ b/src/frontend/decoder.h
+@@ -301,6 +301,13 @@
+ // disassemble to buf, returns buf
+ char* ppc_disasm(char* buf, size_t buf_size, const PPCInst* inst);
+ 
++/* GekkoAOT v395: REL modules are placed at synthetic addresses; with many or
++ * large RELs a REL24/REL14 branch to the DOL or another module no longer fits
++ * its displacement field. The REL loader records the real target here and the
++ * decoder returns it for that branch instead of the encoded displacement. */
++void decoder_add_far_branch(u32 address, u32 target);
++int decoder_far_branch(u32 address, u32* target);
++
+ #ifdef __cplusplus
+ }
+ #endif

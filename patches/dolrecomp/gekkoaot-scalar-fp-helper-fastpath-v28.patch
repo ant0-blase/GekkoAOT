@@ -1,0 +1,75 @@
+diff --git a/src/cpu/cpu.c b/src/cpu/cpu.c
+index 27297aa..0000000 100644
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -1207,0 +1208,21 @@
++/* GekkoAOT v28b: keep exact scalar-FP semantics, but make the overwhelmingly
++ * common finite RN/IEEE path cheap inside the already-native helper.  This is
++ * intentionally implemented in cpu.c rather than by injecting control-flow
++ * into every generated LLVM guest function: it keeps chunk IR size bounded.
++ * Special values, subnormals, NI mode, non-nearest rounding and FMA tie cases
++ * fall through to the original implementation byte-for-byte below. */
++static inline bool gekkoaot_scalar_normal_or_zero_f64(f64 value) {
++    u64 bits = f64_bits(value) & 0x7FFFFFFFFFFFFFFFull;
++    u64 exponent = bits & 0x7FF0000000000000ull;
++    return exponent != 0x7FF0000000000000ull &&
++           (exponent != 0 || bits == 0);
++}
++
++static inline bool gekkoaot_scalar_normal_or_zero_f32(f32 value) {
++    u32 bits;
++    memcpy(&bits, &value, sizeof(bits));
++    bits &= 0x7FFFFFFFu;
++    u32 exponent = bits & 0x7F800000u;
++    return exponent != 0x7F800000u && (exponent != 0 || bits == 0);
++}
++
+@@ -1212,0 +1234,26 @@ bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
++    if (single && (cpu->fpscr & 7u) == 0u &&
++        gekkoaot_scalar_normal_or_zero_f64(a) &&
++        gekkoaot_scalar_normal_or_zero_f64(b) &&
++        gekkoaot_scalar_normal_or_zero_f64(c)) {
++        f64 rounded_c = force_25_bit(c);
++#if defined(__clang__) || defined(__GNUC__)
++        f64 candidate = __builtin_fma(a, rounded_c, addend);
++#else
++        f64 candidate = fma(a, rounded_c, addend);
++#endif
++        u64 candidate_bits = f64_bits(candidate);
++        bool tie = (candidate_bits & 0x000000001FFFFFFFull) ==
++                   0x0000000010000000ull;
++        if (!tie && gekkoaot_scalar_normal_or_zero_f64(candidate)) {
++            f32 rounded = (f32)candidate;
++            if (gekkoaot_scalar_normal_or_zero_f32(rounded)) {
++                result = (f64)rounded;
++                if (negative)
++                    result = -result;
++                set_fprf(cpu, classify_f32((f32)result));
++                *output = result;
++                return true;
++            }
++        }
++    }
++
+@@ -1495 +1542,20 @@ void ppc_fmuls(CPUState* cpu, u8 d, u8 a, u8 c) {
+-    binary_single(cpu, d, cpu->fpr[a], force_25_bit(cpu->fpr[c]), FP_MUL);
++    f64 left = cpu->fpr[a];
++    f64 architectural_multiplier = cpu->fpr[c];
++
++    if ((cpu->fpscr & 7u) == 0u &&
++        gekkoaot_scalar_normal_or_zero_f64(left) &&
++        gekkoaot_scalar_normal_or_zero_f64(architectural_multiplier)) {
++        f64 multiplier = force_25_bit(architectural_multiplier);
++        f64 exact = left * multiplier;
++        if (gekkoaot_scalar_normal_or_zero_f64(exact)) {
++            f32 rounded = (f32)exact;
++            if (gekkoaot_scalar_normal_or_zero_f32(rounded)) {
++                set_fi_fr(cpu, exact, (f64)rounded);
++                write_single_result(cpu, d, rounded);
++                return;
++            }
++        }
++    }
++
++    binary_single(cpu, d, left, force_25_bit(architectural_multiplier),
++                  FP_MUL);

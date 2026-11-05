@@ -1,0 +1,47 @@
+<RCC>
+  <qresource prefix="/launcher">
+    <file alias="fonts/Doto-Variable.ttf">../assets/fonts/Doto-Variable.ttf</file>
+    <file alias="fonts/Doto-OFL.txt">../assets/fonts/Doto-OFL.txt</file>
+    <file alias="fonts/GoogleSansFlex-Variable.ttf">../assets/fonts/GoogleSansFlex-Variable.ttf</file>
+    <file alias="fonts/GoogleSansFlex-OFL.txt">../assets/fonts/GoogleSansFlex-OFL.txt</file>
+    <file alias="fonts/GoogleSansFlex-TRADEMARKS.md">../assets/fonts/GoogleSansFlex-TRADEMARKS.md</file>
+    <file alias="fonts/GoogleSansFlex-SOURCE.txt">../assets/fonts/GoogleSansFlex-SOURCE.txt</file>
+    <file alias="app-icon.png">../assets/platform/gekkoaot.png</file>
+    <file alias="logo.png">../assets/gekkoaot-logo.png</file>
+    <file alias="icons/arrow-left.png">../assets/icons/lucide/arrow-left.png</file>
+    <file alias="icons/check.png">../assets/icons/lucide/check.png</file>
+    <file alias="icons/clock.png">../assets/icons/lucide/clock.png</file>
+    <file alias="icons/cpu.png">../assets/icons/lucide/cpu.png</file>
+    <file alias="icons/disc-3.png">../assets/icons/lucide/disc-3.png</file>
+    <file alias="icons/file-text.png">../assets/icons/lucide/file-text.png</file>
+    <file alias="icons/folder-open.png">../assets/icons/lucide/folder-open.png</file>
+    <file alias="icons/folder-plus.png">../assets/icons/lucide/folder-plus.png</file>
+    <file alias="icons/gamepad-2.png">../assets/icons/lucide/gamepad-2.png</file>
+    <file alias="icons/library.png">../assets/icons/lucide/library.png</file>
+    <file alias="icons/list-video.png">../assets/icons/lucide/list-video.png</file>
+    <file alias="icons/maximize.png">../assets/icons/lucide/maximize.png</file>
+    <file alias="icons/monitor.png">../assets/icons/lucide/monitor.png</file>
+    <file alias="icons/pause.png">../assets/icons/lucide/pause.png</file>
+    <file alias="icons/play.png">../assets/icons/lucide/play.png</file>
+    <file alias="icons/rotate-cw.png">../assets/icons/lucide/rotate-cw.png</file>
+    <file alias="icons/scan-search.png">../assets/icons/lucide/scan-search.png</file>
+    <file alias="icons/search.png">../assets/icons/lucide/search.png</file>
+    <file alias="icons/settings-2.png">../assets/icons/lucide/settings-2.png</file>
+    <file alias="icons/sliders-horizontal.png">../assets/icons/lucide/sliders-horizontal.png</file>
+    <file alias="icons/sparkles.png">../assets/icons/lucide/sparkles.png</file>
+    <file alias="icons/square.png">../assets/icons/lucide/square.png</file>
+    <file alias="icons/trash.png">../assets/icons/lucide/trash.png</file>
+    <file alias="icons/tv-minimal.png">../assets/icons/lucide/tv-minimal.png</file>
+    <file alias="icons/wind.png">../assets/icons/lucide/wind.png</file>
+    <file alias="icons/x.png">../assets/icons/lucide/x.png</file>
+    <file alias="licenses/Lucide.txt">../assets/icons/lucide/LICENSE</file>
+    <file alias="icons/memory-stick.png">../assets/icons/lucide/memory-stick.png</file>
+    <file alias="icons/file-input.png">../assets/icons/lucide/file-input.png</file>
+    <file alias="icons/file-output.png">../assets/icons/lucide/file-output.png</file>
+    <file alias="icons/menu.png">../assets/icons/lucide/menu.png</file>
+    <file alias="icons/messages-square.png">../assets/icons/lucide/messages-square.png</file>
+    <file alias="icons/chevron-down.png">../assets/icons/lucide/chevron-down.png</file>
+    <file alias="icons/chevron-up.png">../assets/icons/lucide/chevron-up.png</file>
+    <file alias="icons/check-dark.png">../assets/icons/lucide/check-dark.png</file>
+  </qresource>
+</RCC>

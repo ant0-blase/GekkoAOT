@@ -1,0 +1,233 @@
+diff --color -ruN a/src/app/pipeline.c b/src/app/pipeline.c
+--- a/src/app/pipeline.c	2026-10-30 13:50:24.175664593 +0100
++++ b/src/app/pipeline.c	2026-10-30 14:08:31.617253503 +0100
+@@ -57,7 +57,7 @@
+ #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
+ #define DOLLLVM_DEFAULT_WORKER_BATCH 1u
+ // SSA regions, ABI v4 variants and ThinLTO summaries.
+-#define DOLLLVM_CACHE_VERSION "dolllvm-v29-gekkoaot-memory-restart-v14"
++#define DOLLLVM_CACHE_VERSION "dolllvm-v29-gekkoaot-memory-restart-v14-compatcall391"
+ 
+ typedef struct {
+     const PPCInst* insts;
+@@ -316,6 +316,10 @@
+     if (job->profile_generate_path)
+         hash = hash_bytes(hash, job->profile_generate_path,
+                           strlen(job->profile_generate_path));
++    hash = hash_file_contents(hash, getenv("DOLRECOMP_INTERIOR_HOOKS"));
++    const char* compat_native_calls = getenv("DOLRECOMP_COMPAT_NATIVE_CALLS");
++    if (compat_native_calls)
++        hash = hash_bytes(hash, compat_native_calls, strlen(compat_native_calls));
+     const char* codegen_level = getenv("DOLRECOMP_LLVM_CODEGEN_LEVEL");
+     if (!codegen_level || !codegen_level[0])
+         codegen_level = "2";
+diff --color -ruN a/src/backend/llvm/branch_targets.cpp b/src/backend/llvm/branch_targets.cpp
+--- a/src/backend/llvm/branch_targets.cpp	2026-10-30 13:50:24.169759899 +0100
++++ b/src/backend/llvm/branch_targets.cpp	2026-10-30 13:50:24.191013548 +0100
+@@ -69,6 +69,74 @@
+   return nullptr;
+ }
+ 
++// A compat body cannot enter a native body directly: a cold escape unwinds to
++// the setjmp frame owned by the native entry wrapper. Calling that wrapper
++// keeps the call inside the chain instead of returning to the dispatcher and
++// re-entering this function through its resume switch for every call. The
++// wrapper loads its inputs from CPUState, settles its own cycles into downcount
++// and leaves the next PC in CPUState, so an escape looks like a PC mismatch.
++BasicBlock *FunctionEmitter::compatNativeCall(const DolIRTerminator &term,
++                                              const DolLLVMFunctionRange *range,
++                                              u32 target) {
++  static const bool enabled = [] {
++    const char *setting = std::getenv("DOLRECOMP_COMPAT_NATIVE_CALLS");
++    return !setting || std::string(setting) != "0";
++  }();
++  const u32 continuation = term.guest_pc + 4u;
++  const bool local = continuation >= source_.guest_start &&
++                     continuation < source_.guest_end &&
++                     ((continuation - source_.guest_start) & 3u) == 0;
++  const u32 continuationBlock =
++      local ? (continuation - source_.guest_start) / 4u : 0u;
++  if (!enabled || modern_runtime_ || !term.linked || !local ||
++      continuationBlock >= blocks_.size())
++    return nullptr;
++  BasicBlock *callBlock =
++      BasicBlock::Create(context_, "compat_native_call", function_);
++  IRBuilderBase::InsertPoint saved = builder_.saveIP();
++  builder_.SetInsertPoint(callBlock);
++  emitBudgetGuard(target);
++  materialize(target);
++  char name[64];
++  snprintf(name, sizeof(name), "func_%08X", range->start);
++  auto *pointer = PointerType::getUnqual(context_);
++  auto callee = module_.getOrInsertFunction(
++      symbolName(name),
++      FunctionType::get(Type::getVoidTy(context_), {pointer}, false));
++  if (auto *calleeFunction = dyn_cast<Function>(callee.getCallee())) {
++    calleeFunction->setCallingConv(CallingConv::C);
++    calleeFunction->setVisibility(GlobalValue::HiddenVisibility);
++    calleeFunction->setDSOLocal(true);
++  }
++  Value *before =
++      loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
++  CallInst *call = builder_.CreateCall(callee, {ctx_});
++  call->setCallingConv(CallingConv::C);
++  Value *after =
++      loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
++  // The callee's cycles count against this chain's guard like a direct call.
++  builder_.CreateStore(
++      builder_.CreateAdd(
++          builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_local_),
++          builder_.CreateSub(before, after)),
++      guard_cycles_local_);
++  BasicBlock *resume = BasicBlock::Create(context_, "call_resume", function_);
++  BasicBlock *mismatch =
++      BasicBlock::Create(context_, "call_mismatch", function_);
++  Value *returnedPC =
++      loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, pc));
++  builder_.CreateCondBr(
++      builder_.CreateICmpEQ(returnedPC, builder_.getInt32(continuation)),
++      resume, mismatch);
++  builder_.SetInsertPoint(mismatch);
++  returnFromBody();
++  builder_.SetInsertPoint(resume);
++  reloadUsedState();
++  builder_.CreateBr(blocks_[continuationBlock]);
++  builder_.restoreIP(saved);
++  return callBlock;
++}
++
+ BasicBlock *FunctionEmitter::externalDestination(const DolIRTerminator &term,
+                                                  u32 slot) {
+   u32 target = term.target_addresses[slot];
+@@ -80,7 +148,7 @@
+   if (native_abi_ && !nativeTarget)
+     return nullptr;
+   if (!native_abi_ && nativeTarget && cold_escapes_)
+-    return nullptr;
++    return compatNativeCall(term, range, target);
+   if (nativeTarget) {
+     for (u32 state = 0; state < DOLIR_STATE_COUNT; state++) {
+       auto stateSlot = static_cast<DolIRStateSlot>(state);
+diff --color -ruN a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+--- a/src/backend/llvm/emitter.h	2026-10-30 13:50:24.172609257 +0100
++++ b/src/backend/llvm/emitter.h	2026-10-30 14:08:31.616891718 +0100
+@@ -3,6 +3,7 @@
+ 
+ #include "backend/llvm/llvm_backend.h"
+ 
++#include <unordered_map>
+ #include <array>
+ #include <cstddef>
+ #include <string>
+@@ -31,6 +32,8 @@
+ 
+ namespace dolllvm {
+ 
++const std::unordered_map<u32, u32> &interiorHooks();
++
+ class FunctionEmitter final {
+ public:
+   FunctionEmitter(llvm::LLVMContext &context, llvm::Module &module,
+@@ -219,6 +222,10 @@
+   llvm::BasicBlock *directDestination(const DolIRTerminator &terminator,
+                                       u32 slot);
+   const DolLLVMFunctionRange *rangeFor(u32 address) const;
++  void emitInteriorHook(u32 pc, u32 token);
++  llvm::BasicBlock *compatNativeCall(const DolIRTerminator &terminator,
++                                     const DolLLVMFunctionRange *range,
++                                     u32 target);
+   llvm::BasicBlock *externalDestination(const DolIRTerminator &terminator,
+                                         u32 slot);
+   llvm::BasicBlock *exitDestination(u32 pc);
+diff --color -ruN a/src/backend/llvm/instructions.cpp b/src/backend/llvm/instructions.cpp
+--- a/src/backend/llvm/instructions.cpp	2026-10-30 14:08:31.599917825 +0100
++++ b/src/backend/llvm/instructions.cpp	2026-10-30 14:33:48.276837241 +0100
+@@ -1,4 +1,5 @@
+ #include "backend/llvm/emitter.h"
++#include "cpu/cpu.h"
+ #include "backend/llvm/native_abi.h"
+ 
+ #include <llvm/IR/Constants.h>
+@@ -8,6 +9,10 @@
+ #include <llvm/Support/Format.h>
+ #include <llvm/Support/raw_ostream.h>
+ 
++#include <cstdlib>
++#include <fstream>
++#include <unordered_map>
++
+ namespace dolllvm {
+ 
+ using namespace llvm;
+@@ -160,6 +165,44 @@
+   return false;
+ }
+ 
++// GEKKOAOT_INTERIOR_HOOK_V391: DOLRECOMP_INTERIOR_HOOKS lists "pc token" rows.
++// A hand-written host service may take over at that guest PC: it either
++// returns true with the next PC in CPUState, or declines and the guest code
++// runs on as if nothing happened.
++const std::unordered_map<u32, u32> &interiorHooks() {
++  static const std::unordered_map<u32, u32> hooks = [] {
++    std::unordered_map<u32, u32> result;
++    const char *path = std::getenv("DOLRECOMP_INTERIOR_HOOKS");
++    if (!path || !*path)
++      return result;
++    std::ifstream input(path);
++    unsigned long pc = 0, token = 0;
++    while (input >> std::hex >> pc >> token)
++      result[static_cast<u32>(pc)] = static_cast<u32>(token);
++    return result;
++  }();
++  return hooks;
++}
++
++void FunctionEmitter::emitInteriorHook(u32 pc, u32 token) {
++  Type *pointer = PointerType::getUnqual(context_);
++  materialize(pc);
++  Value *hostCall = loadOffset(pointer, offsetof(CPUState, host_call));
++  auto *hostCallType = FunctionType::get(
++      Type::getInt1Ty(context_), {pointer, Type::getInt32Ty(context_)}, false);
++  Value *handled =
++      builder_.CreateCall(hostCallType, hostCall, {ctx_, builder_.getInt32(token)});
++  BasicBlock *accepted =
++      BasicBlock::Create(context_, "interior_hook_accepted", function_);
++  BasicBlock *declined =
++      BasicBlock::Create(context_, "interior_hook_declined", function_);
++  builder_.CreateCondBr(handled, accepted, declined);
++  builder_.SetInsertPoint(accepted);
++  returnFromBody();
++  builder_.SetInsertPoint(declined);
++  reloadUsedState();
++}
++
+ bool FunctionEmitter::emitRegion(u32 index, raw_ostream &diagnostics) {
+   resetFPRepresentations();
+   known_state_.fill(nullptr);
+@@ -181,6 +224,11 @@
+       const bool pollLoop = isPurePollingLoop(current);
+       emitBudgetGuard(block.guest_address, pollLoop);
+     }
++    if (current == index && !modern_runtime_) {
++      const auto hook = interiorHooks().find(block.guest_address);
++      if (hook != interiorHooks().end())
++        emitInteriorHook(block.guest_address, hook->second);
++    }
+     chargeCycles(block.cycle_cost);
+     if (useService) {
+       emitInstructionService(block.guest_address);
+diff --color -ruN a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+--- a/src/backend/llvm/register_state.cpp	2026-10-30 14:08:31.602666369 +0100
++++ b/src/backend/llvm/register_state.cpp	2026-10-30 14:08:31.616847137 +0100
+@@ -373,6 +373,11 @@
+         region_leaders_[term.targets[edge]] = true;
+     }
+   }
++  for (const auto &hook : interiorHooks()) {
++    if (hook.first >= source_.guest_start && hook.first < source_.guest_end &&
++        ((hook.first - source_.guest_start) & 3u) == 0)
++      region_leaders_[(hook.first - source_.guest_start) / 4u] = true;
++  }
+   for (u32 i = 0; i < entry_point_count_; i++) {
+     u32 address = entry_points_[i];
+     if (address < source_.guest_start || address >= source_.guest_end ||

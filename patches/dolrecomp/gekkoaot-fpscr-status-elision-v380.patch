@@ -1,0 +1,126 @@
+--- a/src/backend/llvm/floating_point.cpp
++++ b/src/backend/llvm/floating_point.cpp
+@@ -1,4 +1,5 @@
+ #include "backend/llvm/emitter.h"
++#include "backend/llvm/fpscr_status.h"
+ #include "cpu/cpu.h"
+ 
+ #include <llvm/ADT/SmallVector.h>
+@@ -229,7 +230,8 @@
+     fpscr = builder_.CreateOr(
+         builder_.CreateAnd(fpscr, builder_.getInt32(~(0xFu << 12))),
+         builder_.CreateShl(compare, builder_.getInt32(12)));
+-    builder_.CreateStore(fpscr, state_[DOLIR_STATE_FPSCR]);
++    if (!fpscrStatusElided())
++      builder_.CreateStore(fpscr, state_[DOLIR_STATE_FPSCR]);
+     builder_.CreateStore(compare, state_[crSlot]);
+     builder_.CreateBr(join);
+ 
+@@ -400,17 +402,19 @@
+       if (directSingle || nativeFinite) {
+         auto result = nativeFinite ? nativeResult : directBinary(op, left, right);
+         rounded = result.second;
+-        fastFPSCR = setSingleRoundFlags(fastFPSCR, result.first, rounded);
+-      } else {
++        if (!fpscrStatusElided())
++          fastFPSCR = setSingleRoundFlags(fastFPSCR, result.first, rounded);
++      } else if (!fpscrStatusElided()) {
+         fastFPSCR = builder_.CreateAnd(
+             fastFPSCR,
+             builder_.getInt32(~(0x00020000u | 0x00040000u)));
+       }
+-      fastFPSCR = setFPRFF32(fastFPSCR, rounded);
+       Value *wide = builder_.CreateFPExt(rounded, f64);
+       builder_.CreateStore(wide, state_[destination]);
+       builder_.CreateStore(wide, state_[ps1Slot(d)]);
+-      builder_.CreateStore(fastFPSCR, state_[DOLIR_STATE_FPSCR]);
++      if (!fpscrStatusElided())
++        builder_.CreateStore(setFPRFF32(fastFPSCR, rounded),
++                             state_[DOLIR_STATE_FPSCR]);
+       builder_.CreateBr(join);
+ 
+       builder_.SetInsertPoint(slow);
+@@ -496,7 +500,8 @@
+       reloadState(DOLIR_STATE_FPSCR);
+       // v187: ppc_fma leaves FPRF deferred.  If the helper returns false due
+       // to an enabled FP exception, keep the architectural FPRF unchanged.
+-      pending_fprf_ = single ? builder_.CreateFPTrunc(fused, f32) : fused;
++      pending_fprf_ = fpscrStatusElided()  ? nullptr
++                      : single ? builder_.CreateFPTrunc(fused, f32) : fused;
+       pending_fprf_valid_ = success;
+     };
+ 
+@@ -562,11 +567,12 @@
+       builder_.CreateCondBr(builder_.CreateOr(ieee, nonTiny), commit, slow,
+                             MDBuilder(context_).createBranchWeights(4096, 1));
+       builder_.SetInsertPoint(commit);
+-      Value *fastFPSCR = setFPRFF32(fpscr, rounded);
+       Value *wide = builder_.CreateFPExt(rounded, f64);
+       builder_.CreateStore(wide, state_[destination]);
+       builder_.CreateStore(wide, state_[ps1Slot(d)]);
+-      builder_.CreateStore(fastFPSCR, state_[DOLIR_STATE_FPSCR]);
++      if (!fpscrStatusElided())
++        builder_.CreateStore(setFPRFF32(fpscr, rounded),
++                             state_[DOLIR_STATE_FPSCR]);
+       builder_.CreateBr(join);
+ 
+       builder_.SetInsertPoint(slow);
+@@ -606,9 +612,10 @@
+       Value *fused = constrainedPairFMA(left, multiplier, addend);
+       if (negative)
+         fused = builder_.CreateFNeg(fused);
+-      Value *fastFPSCR = setFPRFF64(fpscr, fused);
+       builder_.CreateStore(fused, state_[destination]);
+-      builder_.CreateStore(fastFPSCR, state_[DOLIR_STATE_FPSCR]);
++      if (!fpscrStatusElided())
++        builder_.CreateStore(setFPRFF64(fpscr, fused),
++                             state_[DOLIR_STATE_FPSCR]);
+       builder_.CreateBr(join);
+ 
+       builder_.SetInsertPoint(slow);
+--- a/src/backend/llvm/fpr_state.cpp
++++ b/src/backend/llvm/fpr_state.cpp
+@@ -1,4 +1,5 @@
+ #include "backend/llvm/emitter.h"
++#include "backend/llvm/fpscr_status.h"
+ 
+ #include "backend/llvm/fp_fixups.h"
+ 
+@@ -196,6 +197,11 @@
+ }
+ 
+ void FunctionEmitter::updateFPRF(Value *lane0) {
++  if (fpscrStatusElided()) {
++    pending_fprf_ = nullptr;
++    pending_fprf_valid_ = nullptr;
++    return;
++  }
+   pending_fprf_ = lane0;
+   pending_fprf_valid_ = ConstantInt::getTrue(context_);
+ }
+--- /dev/null
++++ b/src/backend/llvm/fpscr_status.h
+@@ -0,0 +1,23 @@
++#ifndef DOLRECOMP_LLVM_FPSCR_STATUS_H
++#define DOLRECOMP_LLVM_FPSCR_STATUS_H
++
++#include <cstdlib>
++
++namespace dolllvm {
++
++// GEKKOAOT_FPSCR_STATUS_ELISION_V380: when the host proves that no guest code
++// reads FPSCR status (no mcrfs or record-form FP, and mffs only inside the OS
++// FPU-context save that copies it verbatim), arithmetic need not maintain
++// FPRF/FPCC/FI/FR/XX/FX/VX/FEX. Results, rounding and FPSCR controls (RN, NI)
++// are unchanged; only the unobservable status bits stop being computed.
++inline bool fpscrStatusElided() {
++  static const bool elided = [] {
++    const char *setting = std::getenv("DOLRECOMP_FPSCR_STATUS");
++    return setting && setting[0] == '0';
++  }();
++  return elided;
++}
++
++} // namespace dolllvm
++
++#endif

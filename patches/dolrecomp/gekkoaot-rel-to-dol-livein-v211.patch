@@ -1,0 +1,132 @@
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -524,6 +524,120 @@
+     }
+ }
+ 
++
++/*
++ * GekkoAOT v211
++ *
++ * A REL can legally call a DOL address which is an interior/static entrypoint.
++ * v206 makes those addresses real LLVM range starts.  When such an entry is
++ * reached from HostRuntime, preserved PPC registers must be imported from
++ * CPUState even if local LLVM liveness did not discover the hidden live-in.
++ *
++ * Scope is deliberately narrow:
++ *   - enabled only when GekkoAOT supplies the REL->DOL manifest;
++ *   - exact range starts only;
++ *   - preserved GPRs r14-r31 only.
++ */
++static int rel_to_dol_livein_v211_hex(char c) {
++    return (c >= '0' && c <= '9') ||
++           (c >= 'a' && c <= 'f') ||
++           (c >= 'A' && c <= 'F');
++}
++
++static int rel_to_dol_livein_v211_mark(
++    DolLLVMFunctionRange* ranges, u32 range_count, u32 address) {
++    if (address < 0x80000000u || address >= 0x81800000u)
++        return 0;
++
++    for (u32 i = 0; i < range_count; i++) {
++        if (ranges[i].start != address)
++            continue;
++
++        int changed = 0;
++        for (u32 reg = 14u; reg < 32u; reg++) {
++            const u32 slot = (u32)DOLIR_STATE_GPR0 + reg;
++            const u64 bit = 1ull << (slot & 63u);
++            const u32 word = slot >> 6u;
++
++            if (!(ranges[i].input_state[word] & bit)) {
++                ranges[i].input_state[word] |= bit;
++                changed = 1;
++            }
++        }
++        return changed;
++    }
++
++    return 0;
++}
++
++static int rel_to_dol_livein_v211_apply(
++    DolLLVMFunctionRange* ranges, u32 range_count) {
++    const char* path = getenv("DOLRECOMP_REL_TO_DOL_LIVEINS");
++    if (!path || !path[0])
++        return 1;
++
++    FILE* file = fopen(path, "r");
++    if (!file) {
++        fprintf(stderr,
++                "error: cannot open REL->DOL live-in manifest: %s\n",
++                path);
++        return 0;
++    }
++
++    char line[1024];
++    u32 marked = 0;
++
++    while (fgets(line, sizeof(line), file)) {
++        char* p = line;
++
++        while (*p) {
++            char* digits = p;
++
++            if (p[0] == '0' &&
++                (p[1] == 'x' || p[1] == 'X') &&
++                rel_to_dol_livein_v211_hex(p[2])) {
++                digits = p + 2;
++            } else if (!rel_to_dol_livein_v211_hex(*p)) {
++                p++;
++                continue;
++            }
++
++            char* end = digits;
++            u32 count = 0;
++
++            while (rel_to_dol_livein_v211_hex(*end) && count < 9u) {
++                end++;
++                count++;
++            }
++
++            if (count == 8u && !rel_to_dol_livein_v211_hex(*end)) {
++                char value_text[9];
++                memcpy(value_text, digits, 8u);
++                value_text[8] = '\0';
++
++                const unsigned long value =
++                    strtoul(value_text, NULL, 16);
++
++                if (value <= 0xfffffffful)
++                    marked += rel_to_dol_livein_v211_mark(
++                        ranges, range_count, (u32)value);
++            }
++
++            p = end > p ? end : p + 1;
++        }
++    }
++
++    fclose(file);
++
++    printf(
++        "DOLRECOMP_REL_TO_DOL_LIVEIN_V211=1 "
++        "marked=%u preserved_gpr=r14-r31 "
++        "policy=manifest-exact-range-start+host-entry-state\n",
++        marked);
++
++    return 1;
++}
++
+ static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
+                                       u32 section_count,
+                                       DolLLVMFunctionRange* ranges,
+@@ -611,6 +725,8 @@
+     if (rel_crossmodule_live && rel_external_edges)
+         printf("DOLRECOMP_REL_CROSSMODULE_LIVE_V208=1 external_edges=%u preserved_gpr=r14-r31 policy=undefined-before-only+native-abi-propagation\n",
+                rel_external_edges);
++    if (!rel_to_dol_livein_v211_apply(ranges, range_count))
++        goto fail;
+     if (runtime == DOLLLVM_RUNTIME_MODERNGEKKO)
+         dolllvm_enable_native_services(ranges, range_count);
+     if (!dolllvm_propagate_function_abis(ranges, range_count, edges,

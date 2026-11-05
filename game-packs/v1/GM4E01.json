@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "disc_id": "GM4E01",
+  "name": "Mario Kart: Double Dash!! (USA)",
+  "pack_version": 1,
+  "compatibility": {
+    "snapshot": "0.0.1",
+    "state": "menu",
+    "note": "Reaches the menu; loading remains stuck before gameplay."
+  },
+  "runtime_features": [],
+  "planned_runtime_features": [],
+  "ui": {
+    "title": "Mario Kart: Double Dash!!",
+    "options": []
+  }
+}

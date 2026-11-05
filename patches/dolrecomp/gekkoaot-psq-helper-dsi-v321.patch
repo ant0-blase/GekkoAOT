@@ -1,0 +1,93 @@
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -801,28 +801,46 @@
+     if (!psq_access_is_valid(cpu, type, ea, cia))
+         return false;
+ 
++    /* GEKKOAOT_PSQ_HELPER_DSI_V321: a lane read that reaches the external bus
++       can raise a DSI (paged VMEM miss). The access must not complete: report
++       failure so generated code unwinds to the vector instead of continuing
++       with a garbage value while the exception latch stays pending. */
+     if (type == 0) {
+         if (w) {
+-            cpu->fpr[frD] = extend_f32_bits(mem_read32(cpu, ea));
++            const u32 bits = mem_read32(cpu, ea);
++            if (cpu->exception)
++                return false;
++            cpu->fpr[frD] = extend_f32_bits(bits);
+             cpu->ps1[frD] = 1.0;
+             return true;
+         }
+         if (psq_raw_f32_load_pair(cpu, ea, &cpu->fpr[frD], &cpu->ps1[frD]))
+             return true;
+-        cpu->fpr[frD] = extend_f32_bits(mem_read32(cpu, ea));
+-        cpu->ps1[frD] = extend_f32_bits(mem_read32(cpu, ea + 4u));
++        const u32 bits0 = mem_read32(cpu, ea);
++        if (cpu->exception)
++            return false;
++        const u32 bits1 = mem_read32(cpu, ea + 4u);
++        if (cpu->exception)
++            return false;
++        cpu->fpr[frD] = extend_f32_bits(bits0);
++        cpu->ps1[frD] = extend_f32_bits(bits1);
+         return true;
+     }
+ 
+-    cpu->fpr[frD] = psq_load_value(cpu, ea, type, scale);
+-    if (w) {
+-        cpu->ps1[frD] = 1.0;
+-    } else {
++    const f64 ps0 = psq_load_value(cpu, ea, type, scale);
++    if (cpu->exception)
++        return false;
++    f64 ps1 = 1.0;
++    if (!w) {
+         u32 ps1_ea = ea + size;
+         if (!psq_access_is_valid(cpu, type, ps1_ea, cia))
+             return false;
+-        cpu->ps1[frD] = psq_load_value(cpu, ps1_ea, type, scale);
++        ps1 = psq_load_value(cpu, ps1_ea, type, scale);
++        if (cpu->exception)
++            return false;
+     }
++    cpu->fpr[frD] = ps0;
++    cpu->ps1[frD] = ps1;
+     return true;
+ }
+ 
+@@ -837,26 +855,32 @@
+     if (!psq_access_is_valid(cpu, type, ea, cia))
+         return false;
+ 
++    /* GEKKOAOT_PSQ_HELPER_DSI_V321: see ppc_psq_load. A faulting lane store
++       is restarted by the guest handler; report it so the caller unwinds. */
+     if (type == 0) {
+         if (w) {
+             mem_write32(cpu, ea, psq_raw_f32_store_bits(cpu->fpr[frS]));
+-            return true;
++            return cpu->exception == 0;
+         }
+         if (psq_raw_f32_store_pair(cpu, ea, cpu->fpr[frS], cpu->ps1[frS]))
+             return true;
+         mem_write32(cpu, ea, psq_raw_f32_store_bits(cpu->fpr[frS]));
++        if (cpu->exception)
++            return false;
+         mem_write32(cpu, ea + 4u, psq_raw_f32_store_bits(cpu->ps1[frS]));
+-        return true;
++        return cpu->exception == 0;
+     }
+ 
+     psq_store_value(cpu, ea, type, scale, cpu->fpr[frS]);
++    if (cpu->exception)
++        return false;
+     if (!w) {
+         u32 ps1_ea = ea + size;
+         if (!psq_access_is_valid(cpu, type, ps1_ea, cia))
+             return false;
+         psq_store_value(cpu, ps1_ea, type, scale, cpu->ps1[frS]);
+     }
+-    return true;
++    return cpu->exception == 0;
+ }
+ 
+ void ppc_rfi(CPUState* cpu, u32 cia) {

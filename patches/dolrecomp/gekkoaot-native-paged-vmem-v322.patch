@@ -1,0 +1,171 @@
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -254,6 +254,11 @@
+   llvm::Value *native_flat_vmem_view_ = nullptr; // GEKKOAOT_NATIVE_FLAT_VMEM_V304
+   llvm::Value *native_locked_cache_base_ = nullptr; // GEKKOAOT_NATIVE_LOCKED_CACHE_V308
+   llvm::Value *nativeMemoryPointer(llvm::Value*, llvm::Value*, llvm::Value*);
++  // GEKKOAOT_NATIVE_PAGED_VMEM_V322: host pointer for a resident paged-VM
++  // access from the runtime's DTLB mirror; branches to miss otherwise.
++  llvm::Value *pagedVmemPointer(llvm::Value *address, u32 width, bool write,
++                                llvm::BasicBlock *miss);
++  llvm::Value *pagedVmemState(DolIRStateSlot slot);
+   llvm::Value *ram_ = nullptr;
+   llvm::Value *ram_size_ = nullptr;
+   llvm::Value *mem2_ = nullptr;
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -27,6 +27,87 @@
+                                 PointerType::getUnqual(context_));
+ }
+ 
++static bool nativePagedVmemEnabled() {
++  static const bool enabled = [] {
++    const char *setting = std::getenv("DOLRECOMP_NATIVE_PAGED_VMEM");
++    return !setting || setting[0] != '0';
++  }();
++  return enabled;
++}
++
++// Architectural state read by the paged-VM admission. A slot this function
++// never touches still holds its entry value: the native-ABI argument when
++// present, otherwise CPUState.
++Value *FunctionEmitter::pagedVmemState(DolIRStateSlot slot) {
++  if (used_[slot] && state_[slot])
++    return stateValue(slot);
++  if (native_abi_ && native_inputs_[slot])
++    return native_inputs_[slot];
++  return loadContext(slot);
++}
++
++// GEKKOAOT_NATIVE_PAGED_VMEM_V322: real VM paging used to send every 0x7e/0x7f
++// access through the external memory service (state sync, call, DTLB lookup,
++// state reload): ~3M calls/s in HPPOA/CoD. The runtime publishes exactly the
++// resident DTLB entries (frame | read | write-with-C | way) in the view and
++// withdraws them on eviction/tlbie, so a hit here is the same translation the
++// service would use. Misses, page-crossing scalars, user mode, DR=0 and a
++// changed SR7 keep the original exact service path (which fills/faults).
++Value *FunctionEmitter::pagedVmemPointer(Value *address, u32 width, bool write,
++                                         BasicBlock *miss) {
++  Type *pointer = PointerType::getUnqual(context_);
++  Type *i32 = builder_.getInt32Ty();
++  auto *viewType = StructType::get(context_, {pointer, i32, i32, pointer, pointer});
++  Value *offset = builder_.CreateSub(address, builder_.getInt32(0x7e000000u));
++  Value *pageOffset = builder_.CreateAnd(address, builder_.getInt32(0xfffu));
++  Value *candidate = builder_.CreateAnd(
++      builder_.CreateICmpULT(offset, builder_.getInt32(0x02000000u)),
++      builder_.CreateICmpULE(pageOffset, builder_.getInt32(0x1000u - width)));
++  auto *probe = BasicBlock::Create(
++      context_, write ? "store_paged_vmem_probe" : "load_paged_vmem_probe", function_);
++  builder_.CreateCondBr(candidate, probe, miss);
++
++  builder_.SetInsertPoint(probe);
++  Value *pages = builder_.CreateLoad(
++      pointer, builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 3));
++  Value *index = builder_.CreateZExt(builder_.CreateLShr(offset, 12u),
++                                     builder_.getInt64Ty());
++  Value *entry = builder_.CreateLoad(i32, builder_.CreateInBoundsGEP(i32, pages, index),
++                                     "paged.vmem.entry");
++  Value *segment = builder_.CreateLoad(
++      i32, builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 2));
++  Value *msr = pagedVmemState(DOLIR_STATE_MSR);
++  Value *sr7 = pagedVmemState(static_cast<DolIRStateSlot>(DOLIR_STATE_SR0 + 7));
++  Value *admitted = builder_.CreateAnd(
++      builder_.CreateICmpNE(builder_.CreateAnd(entry, builder_.getInt32(write ? 2u : 1u)),
++                            builder_.getInt32(0)),
++      builder_.CreateAnd(
++          builder_.CreateICmpEQ(builder_.CreateAnd(msr, builder_.getInt32(0x4010u)),
++                                builder_.getInt32(0x10u)),
++          builder_.CreateICmpEQ(sr7, segment)));
++  auto *hit = BasicBlock::Create(
++      context_, write ? "store_paged_vmem" : "load_paged_vmem", function_);
++  builder_.CreateCondBr(admitted, hit, miss,
++                        MDBuilder(context_).createBranchWeights(2000, 1));
++
++  builder_.SetInsertPoint(hit);
++  // Same 2-way LRU update as a runtime DTLB hit.
++  Value *mru = builder_.CreateLoad(
++      pointer, builder_.CreateStructGEP(viewType, native_flat_vmem_view_, 4));
++  Value *set = builder_.CreateZExt(
++      builder_.CreateAnd(builder_.CreateLShr(address, 12u), builder_.getInt32(0x3fu)),
++      builder_.getInt64Ty());
++  builder_.CreateStore(
++      builder_.CreateTrunc(builder_.CreateAnd(builder_.CreateLShr(entry, 2u),
++                                              builder_.getInt32(1u)),
++                           builder_.getInt8Ty()),
++      builder_.CreateInBoundsGEP(builder_.getInt8Ty(), mru, set));
++  Value *physical = builder_.CreateOr(
++      builder_.CreateAnd(entry, builder_.getInt32(0xfffff000u)), pageOffset);
++  return builder_.CreateInBoundsGEP(builder_.getInt8Ty(), ram_,
++                                    builder_.CreateZExt(physical, builder_.getInt64Ty()));
++}
++
+ Value *FunctionEmitter::normalizeAddress(Value *address) {
+   return builder_.CreateAnd(address, builder_.getInt32(~0x40000000u));
+ }
+@@ -337,6 +418,16 @@
+     builder_.CreateBr(join);
+     builder_.SetInsertPoint(fallback);
+   }
++  Value* pagedValue = nullptr;
++  BasicBlock* pagedEnd = nullptr;
++  if (native_flat_vmem_view_ && nativePagedVmemEnabled()) {
++    auto* miss = BasicBlock::Create(context_, "load_paged_vmem_miss", function_);
++    Value* host = pagedVmemPointer(address, width, false, miss);
++    pagedValue = endianLoad(host, resultType, width, loopPollingLoad);
++    pagedEnd = builder_.GetInsertBlock();
++    builder_.CreateBr(join);
++    builder_.SetInsertPoint(miss);
++  }
+   // FPRF only has to be committed before a host-visible service call. The hot
+   // MEM1/MEM2 paths are pure native memory accesses and must not pay this
+   // synchronization cost.
+@@ -347,9 +438,11 @@
+   builder_.CreateBr(join);
+ 
+   builder_.SetInsertPoint(join);
+-  PHINode *phi = builder_.CreatePHI(resultType, 3 + (flatValue ? 1 : 0) + (lcValue ? 1 : 0));
++  PHINode *phi = builder_.CreatePHI(resultType, 3 + (flatValue ? 1 : 0) + (lcValue ? 1 : 0) +
++                                                    (pagedValue ? 1 : 0));
+   if (lcValue) phi->addIncoming(lcValue, lcEnd);
+   if (flatValue) phi->addIncoming(flatValue, flatEnd);
++  if (pagedValue) phi->addIncoming(pagedValue, pagedEnd);
+   phi->addIncoming(mem1Value, mem1Block);
+   phi->addIncoming(mem2Value, mem2Block);
+   phi->addIncoming(slowValue, slowEnd);
+@@ -600,6 +693,13 @@
+     builder_.CreateBr(join);
+     builder_.SetInsertPoint(fallback);
+   }
++  if (native_flat_vmem_view_ && nativePagedVmemEnabled()) {
++    // The service path stores paged frames without journal/epoch effects.
++    auto* miss = BasicBlock::Create(context_, "store_paged_vmem_miss", function_);
++    endianStore(pagedVmemPointer(address, width, true, miss), value, width);
++    builder_.CreateBr(join);
++    builder_.SetInsertPoint(miss);
++  }
+   materializeFPRF();
+   externalWrite(address, value, width);
+   builder_.CreateBr(join);
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -240,7 +240,7 @@
+       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+       "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
+       "x86-return-registers=3|"
+-      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s%s%s%s%s",
++      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s%s%s%s%s%s%s",
+       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+       static_cast<unsigned>(options ? options->native_abi_policy
+@@ -273,6 +273,10 @@
+           ? "|native-locked-cache=308-on" : "|native-locked-cache=308-off",
+       std::getenv("DOLRECOMP_NATIVE_SCALAR_MATH") &&
+           std::string(std::getenv("DOLRECOMP_NATIVE_SCALAR_MATH")) == "1"
+-          ? "|native-scalar-math=316-on" : "|native-scalar-math=316-off");
++          ? "|native-scalar-math=316-on" : "|native-scalar-math=316-off",
++      // GEKKOAOT_NATIVE_PAGED_VMEM_V322: inline DTLB-mirror admission.
++      std::getenv("DOLRECOMP_NATIVE_PAGED_VMEM") &&
++          std::string(std::getenv("DOLRECOMP_NATIVE_PAGED_VMEM")) == "0"
++          ? "|native-paged-vmem=322-off" : "|native-paged-vmem=322-on");
+   return written >= 0 && static_cast<size_t>(written) < size;
+ }

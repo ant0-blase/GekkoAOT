@@ -1,0 +1,56 @@
+diff --git a/src/backend/llvm/special_instructions.cpp b/src/backend/llvm/special_instructions.cpp
+index c2cafb7..37f56fe 100644
+--- a/src/backend/llvm/special_instructions.cpp
++++ b/src/backend/llvm/special_instructions.cpp
+@@ -41,13 +41,47 @@ void FunctionEmitter::emitStateWrite(const DolIRInstruction &inst) {
+   // for 0->1 transitions. Exit on either transition so the original PPC
+   // interrupt leaves remain guest-AOT while exposing the architectural
+   // interrupt-state transition to the host dispatcher immediately.
+-  Value *eeChanged = builder_.CreateXor(old, value);
+-  eeChanged = builder_.CreateICmpNE(
+-      builder_.CreateAnd(eeChanged, builder_.getInt32(0x8000)),
++  if (modern_runtime_) {
++    Value *eeChanged = builder_.CreateXor(old, value);
++    eeChanged = builder_.CreateICmpNE(
++        builder_.CreateAnd(eeChanged, builder_.getInt32(0x8000)),
++        builder_.getInt32(0));
++    BasicBlock *exit = BasicBlock::Create(context_, "msr_ee_exit", function_);
++    BasicBlock *resume = BasicBlock::Create(context_, "msr_ee_resume", function_);
++    builder_.CreateCondBr(eeChanged, exit, resume);
++    builder_.SetInsertPoint(exit);
++    sideExit(inst.guest_pc + 4u);
++    builder_.SetInsertPoint(resume);
++    return;
++  }
++
++  // GEKKOAOT_DOLRECOMP_EE_PENDING_QUERY_V274:
++  // Clearing MSR[EE] can never make an interrupt deliverable, so it no longer
++  // leaves AOT code. Setting it only needs the host when an external or
++  // decrementer interrupt is already latched: ask through CPUState::host_call
++  // (token 0xFFFFFFF4, no guest state read or written) and side-exit only on
++  // "pending", exactly as v17 did for every transition. A null host_call or a
++  // host that does not know the token keeps native execution, which matches a
++  // runtime without pending interrupts.
++  Value *rising = builder_.CreateICmpNE(
++      builder_.CreateAnd(builder_.CreateAnd(builder_.CreateNot(old), value),
++                         builder_.getInt32(0x8000)),
+       builder_.getInt32(0));
++  BasicBlock *query = BasicBlock::Create(context_, "msr_ee_query", function_);
++  BasicBlock *ask = BasicBlock::Create(context_, "msr_ee_ask", function_);
+   BasicBlock *exit = BasicBlock::Create(context_, "msr_ee_exit", function_);
+   BasicBlock *resume = BasicBlock::Create(context_, "msr_ee_resume", function_);
+-  builder_.CreateCondBr(eeChanged, exit, resume);
++  builder_.CreateCondBr(rising, query, resume);
++  builder_.SetInsertPoint(query);
++  Type *pointer = PointerType::getUnqual(context_);
++  Value *hostCall = loadOffset(pointer, offsetof(CPUState, host_call));
++  builder_.CreateCondBr(builder_.CreateIsNull(hostCall), resume, ask);
++  builder_.SetInsertPoint(ask);
++  auto *hostCallType = FunctionType::get(Type::getInt1Ty(context_),
++                                         {pointer, Type::getInt32Ty(context_)}, false);
++  Value *pending =
++      builder_.CreateCall(hostCallType, hostCall, {ctx_, builder_.getInt32(0xFFFFFFF4u)});
++  builder_.CreateCondBr(pending, exit, resume);
+   builder_.SetInsertPoint(exit);
+   sideExit(inst.guest_pc + 4u);
+   builder_.SetInsertPoint(resume);

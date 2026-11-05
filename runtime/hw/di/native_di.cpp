@@ -1,0 +1,429 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "hw/di/native_di.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace GekkoAOT::HW::DI {
+
+namespace {
+constexpr std::uint8_t kCmdSeek = 0xabu;
+constexpr std::uint8_t kCmdRequestError = 0xe0u;
+constexpr std::uint8_t kCmdAudioStream = 0xe1u;
+constexpr std::uint8_t kCmdRequestAudioStatus = 0xe2u;
+constexpr std::uint8_t kCmdStopMotor = 0xe3u;
+constexpr std::uint8_t kCmdAudioBufferConfig = 0xe4u;
+constexpr std::uint32_t kInvalidCommandError = 0x00052000u;
+constexpr std::uint32_t kNoMediumError = 0x00023a00u;
+bool TraceDvd() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GEKKOAOT_TRACE_DVD");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+std::int16_t DecodeDtkNibble(std::uint8_t nibble, std::uint8_t control,
+                             std::int32_t& previous, std::int32_t& older) {
+  std::int32_t prediction = 0;
+  switch (control >> 4u) {
+  case 1u: prediction = previous * 60; break;
+  case 2u: prediction = previous * 115 - older * 52; break;
+  case 3u: prediction = previous * 98 - older * 55; break;
+  default: break;
+  }
+  prediction = std::clamp((prediction + 32) >> 6, -0x200000, 0x1fffff);
+  const std::int32_t signed_nibble = nibble < 8u ? nibble : static_cast<std::int32_t>(nibble) - 16;
+  const std::int32_t current =
+      ((signed_nibble * 4096) >> (control & 15u)) * 64 + prediction;
+  older = previous;
+  previous = current;
+  return static_cast<std::int16_t>(std::clamp(current >> 6, -32768, 32767));
+}
+}
+
+void NativeDI::Reset(bool disc_present) {
+  ++command_sequence_; // Retire any completion scheduled before the reset.
+  status_ = 0;
+  disc_present_ = disc_present;
+  cover_ = disc_present ? 0u : kCoverOpen;
+  command_ = {};
+  dma_address_ = 0;
+  dma_length_ = 0;
+  dma_control_ = 0;
+  immediate_ = 0;
+  config_ = 1u; // GameCube: boot-ROM descrambler disabled after IPL/BS2 setup.
+  last_error_ = 0;
+  last_opcode_ = 0;
+  audio_enabled_ = false;
+  audio_streaming_ = false;
+  audio_stop_at_track_end_ = false;
+  audio_buffer_size_ = 0;
+  audio_current_start_ = 0;
+  audio_current_length_ = 0;
+  audio_position_ = 0;
+  audio_next_start_ = 0;
+  audio_next_length_ = 0;
+  ResetAudioDecoder();
+}
+
+void NativeDI::ResetAudioDecoder() {
+  audio_history_.fill(0);
+  audio_frame_index_ = 28u;
+  audio_sample_phase_ = 0;
+}
+
+bool NativeDI::DecodeAudioBlock() {
+  if (!audio_streaming_ || !audio_enabled_ || !disc_present_ || !hooks_.read_audio)
+    return false;
+  if (audio_position_ >= audio_current_start_ + audio_current_length_) {
+    audio_current_start_ = audio_next_start_;
+    audio_current_length_ = audio_next_length_;
+    audio_position_ = audio_current_start_;
+    if (audio_stop_at_track_end_ || audio_current_length_ == 0u) {
+      audio_stop_at_track_end_ = false;
+      audio_streaming_ = false;
+      return false;
+    }
+    audio_history_.fill(0);
+  }
+  std::array<std::uint8_t, 32> block{};
+  if (audio_current_start_ + audio_current_length_ - audio_position_ < block.size() ||
+      !hooks_.read_audio(hooks_.user, audio_position_, block.data(), block.size())) {
+    static unsigned read_errors = 0;
+    if (read_errors++ < 8u)
+      std::fprintf(stderr, "GEKKOAOT_NATIVE_DTK_READ_ERROR offset=%08llx\n",
+                   static_cast<unsigned long long>(audio_position_));
+    audio_streaming_ = false;
+    return false;
+  }
+  audio_position_ += block.size();
+  for (std::size_t i = 0; i < 28u; ++i) {
+    const auto bits = block[4u + i];
+    audio_decoded_[i * 2u] =
+        DecodeDtkNibble(bits & 15u, block[0], audio_history_[0], audio_history_[1]);
+    audio_decoded_[i * 2u + 1u] =
+        DecodeDtkNibble(bits >> 4u, block[1], audio_history_[2], audio_history_[3]);
+  }
+  audio_frame_index_ = 0u;
+  return true;
+}
+
+void NativeDI::MixAudio(std::int16_t* pcm, std::size_t frames,
+                        std::uint32_t output_hz, std::uint32_t stream_hz,
+                        std::uint32_t volume) {
+  if (!pcm || !frames || !output_hz || !stream_hz || !audio_streaming_) return;
+  const std::int32_t left_volume = volume & 0xffu;
+  const std::int32_t right_volume = (volume >> 8u) & 0xffu;
+  for (std::size_t frame = 0; frame < frames; ++frame) {
+    if (audio_frame_index_ == 28u && !DecodeAudioBlock()) return;
+    for (std::size_t channel = 0; channel < 2u; ++channel) {
+      const std::int32_t gain = channel == 0u ? left_volume : right_volume;
+      const std::int32_t disc_sample = audio_decoded_[audio_frame_index_ * 2u + channel];
+      const std::int32_t mixed = static_cast<std::int32_t>(pcm[frame * 2u + channel]) +
+                                 (disc_sample * gain) / 255;
+      pcm[frame * 2u + channel] =
+          static_cast<std::int16_t>(std::clamp(mixed, -32768, 32767));
+    }
+    audio_sample_phase_ += stream_hz;
+    while (audio_sample_phase_ >= output_hz) {
+      audio_sample_phase_ -= output_hz;
+      ++audio_frame_index_;
+      if (audio_frame_index_ == 28u && !DecodeAudioBlock()) return;
+    }
+  }
+}
+
+bool NativeDI::Handles(std::uint32_t address) const {
+  const std::uint32_t physical = ToPhysical(address);
+  return physical >= BasePhysical && physical < BasePhysical + WindowSize;
+}
+
+bool NativeDI::Read32(std::uint32_t offset, std::uint32_t* value) const {
+  if (!value) return false;
+  switch (offset) {
+  case kStatus: *value = status_; return true;
+  case kCover: *value = cover_; return true;
+  case kCommand0: *value = command_[0]; return true;
+  case kCommand1: *value = command_[1]; return true;
+  case kCommand2: *value = command_[2]; return true;
+  case kDmaAddress: *value = dma_address_; return true;
+  case kDmaLength: *value = dma_length_; return true;
+  case kDmaControl: *value = dma_control_; return true;
+  case kImmediate: *value = immediate_; return true;
+  case kConfig: *value = config_; return true;
+  default: return false;
+  }
+}
+
+bool NativeDI::Read(std::uint32_t address, std::uint8_t size, std::uint64_t* value) const {
+  if (!Handles(address) || !value || size != 4u) return false;
+  const std::uint32_t offset = ToPhysical(address) - BasePhysical;
+  if (offset & 3u) return false;
+  std::uint32_t word = 0;
+  if (!Read32(offset, &word)) return false;
+  *value = word;
+  return true;
+}
+
+bool NativeDI::InterruptPending() const {
+  return ((status_ & kDeviceErrorInt) && (status_ & kDeviceErrorMask)) ||
+         ((status_ & kTransferCompleteInt) && (status_ & kTransferCompleteMask)) ||
+         ((status_ & kBreakInt) && (status_ & kBreakMask)) ||
+         ((cover_ & kCoverInt) && (cover_ & kCoverIntMask));
+}
+
+void NativeDI::SetDiscPresent(bool present) {
+  if (disc_present_ == present) return;
+  disc_present_ = present;
+  if (present)
+    cover_ &= ~kCoverOpen;
+  else
+    cover_ |= kCoverOpen;
+  cover_ |= kCoverInt;
+}
+
+void NativeDI::ConfigureAudioBuffer(bool enabled, std::uint8_t size) {
+  audio_enabled_ = enabled;
+  audio_buffer_size_ = size & 0x0fu;
+  if (!enabled) {
+    audio_streaming_ = false;
+    audio_stop_at_track_end_ = false;
+  }
+}
+
+void NativeDI::FinishCommand(bool success, std::uint32_t immediate,
+                             std::uint32_t bytes_transferred,
+                             std::uint32_t error_code) {
+  static unsigned logs = 0;
+  if (TraceDvd() && logs++ < 256u)
+    std::fprintf(stderr, "GEKKOAOT_TRACE_DVD event=device-complete seq=%llu opcode=%02x success=%u bytes=%u immediate=%08x error=%08x\n",
+                 static_cast<unsigned long long>(command_sequence_), last_opcode_,
+                 unsigned(success), bytes_transferred, immediate, success ? 0u : error_code);
+  immediate_ = immediate;
+  dma_control_ &= ~kControlTStart;
+
+  if (success) {
+    if (dma_control_ & kControlDma) {
+      const std::uint32_t transferred = std::min(bytes_transferred, dma_length_);
+      dma_address_ = (dma_address_ + transferred) & kGcDmaAddressMask;
+      dma_length_ -= transferred;
+    }
+    status_ |= kTransferCompleteInt;
+  } else {
+    last_error_ = error_code;
+    status_ |= kDeviceErrorInt;
+  }
+}
+
+void NativeDI::CompletePending(bool success, std::uint32_t immediate,
+                               std::uint32_t bytes_transferred,
+                               std::uint32_t error_code) {
+  CompletePendingFor(command_sequence_, success, immediate, bytes_transferred, error_code);
+}
+
+bool NativeDI::CompletePendingFor(std::uint64_t sequence, bool success,
+                                  std::uint32_t immediate,
+                                  std::uint32_t bytes_transferred,
+                                  std::uint32_t error_code) {
+  if (sequence != command_sequence_ || !(dma_control_ & kControlTStart)) return false;
+  FinishCommand(success, immediate, bytes_transferred, error_code);
+  return true;
+}
+
+void NativeDI::ExecuteCommand() {
+  const std::uint8_t opcode = static_cast<std::uint8_t>(command_[0] >> 24);
+  last_opcode_ = opcode;
+  static unsigned logs = 0;
+  if (TraceDvd() && logs++ < 256u)
+    std::fprintf(stderr, "GEKKOAOT_TRACE_DVD event=device-command seq=%llu command=%08x,%08x,%08x dma=%08x length=%u control=%x\n",
+                 static_cast<unsigned long long>(command_sequence_), command_[0], command_[1],
+                 command_[2], dma_address_, dma_length_, dma_control_);
+
+  // The disc reader is a separate provider. It may still have an image
+  // mounted after the guest opens the drive cover, but that image is no longer
+  // accessible through disc read or seek commands.
+  if (!disc_present_ && (opcode == 0xa8u || opcode == kCmdSeek)) {
+    FinishCommand(false, immediate_, 0u, kNoMediumError);
+    return;
+  }
+
+  // Commands that are entirely register/state based stay owned by DI even when
+  // a media provider is attached. This also keeps DeviceHooks focused on the
+  // actual disc byte boundary instead of making every backend emulate drive
+  // bookkeeping such as RequestError.
+  if (opcode == kCmdRequestError) {
+    const std::uint32_t error = last_error_;
+    last_error_ = 0;
+    FinishCommand(true, error, 0, 0);
+    return;
+  }
+  if (opcode == kCmdSeek && disc_present_) {
+    FinishCommand(true, immediate_, 0, 0);
+    return;
+  }
+  if (opcode == kCmdAudioBufferConfig) {
+    // E4: bit 16 enables the drive's DTK audio path; low nibble selects the
+    // hardware audio-buffer size. Keep this register/drive state even though
+    // actual ADPCM decoding is not part of NativeDI.
+    ConfigureAudioBuffer(((command_[0] >> 16u) & 1u) != 0u,
+                         static_cast<std::uint8_t>(command_[0] & 0x0fu));
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_DI_DTK_V56=1 cmd=E4 enabled=%u buffer=%u\n",
+                 audio_enabled_ ? 1u : 0u, static_cast<unsigned>(audio_buffer_size_));
+    FinishCommand(true, 0u, 0u, 0u);
+    return;
+  }
+  if (opcode == kCmdAudioStream) {
+    // E1: subcommand 0 starts/queues a DTK stream, subcommand 1 stops it.
+    // Offsets are encoded in 32-bit words just like DVDLowRead.
+    if (!audio_enabled_ || !disc_present_) {
+      FinishCommand(false, immediate_, 0u, 0x00052000u);
+      return;
+    }
+    const std::uint8_t subcommand = static_cast<std::uint8_t>((command_[0] >> 16u) & 0xffu);
+    if (subcommand == 0u) {
+      const std::uint64_t offset = static_cast<std::uint64_t>(command_[1]) << 2u;
+      const std::uint32_t length = command_[2];
+      if (offset == 0u && length == 0u) {
+        audio_stop_at_track_end_ = true;
+      } else if (!audio_stop_at_track_end_) {
+        audio_next_start_ = offset;
+        audio_next_length_ = length;
+        if (!audio_streaming_) {
+          audio_current_start_ = audio_next_start_;
+          audio_current_length_ = audio_next_length_;
+          audio_position_ = audio_current_start_;
+          audio_streaming_ = true;
+          ResetAudioDecoder();
+        }
+      }
+    } else if (subcommand == 1u) {
+      audio_stop_at_track_end_ = false;
+      audio_streaming_ = false;
+      ResetAudioDecoder();
+    } else {
+      FinishCommand(false, immediate_, 0u, 0x00052000u);
+      return;
+    }
+    std::fprintf(stderr,
+                 "GEKKOAOT_NATIVE_DI_DTK_V56=1 cmd=E1 sub=%u streaming=%u start=%08llx length=%u\n",
+                 static_cast<unsigned>(subcommand), audio_streaming_ ? 1u : 0u,
+                 static_cast<unsigned long long>(audio_current_start_), audio_current_length_);
+    FinishCommand(true, 0u, 0u, 0u);
+    return;
+  }
+  if (opcode == kCmdRequestAudioStatus) {
+    // E2 returns status through DI_IMMBUF. The position is intentionally kept
+    // at the current track start until a DTK decoder owns stream timing; games
+    // still receive correct enabled/running/start/length state and command
+    // completion instead of DEINT/InvalidCommand.
+    if (!audio_enabled_ || !disc_present_) {
+      FinishCommand(false, immediate_, 0u, 0x00052000u);
+      return;
+    }
+    const std::uint8_t subcommand = static_cast<std::uint8_t>((command_[0] >> 16u) & 0xffu);
+    std::uint32_t result = 0u;
+    switch (subcommand) {
+    case 0u: result = audio_streaming_ ? 1u : 0u; break;
+    case 1u: result = static_cast<std::uint32_t>((audio_position_ & ~0x7fffull) >> 2u); break;
+    case 2u: result = static_cast<std::uint32_t>(audio_current_start_ >> 2u); break;
+    case 3u: result = audio_current_length_; break;
+    default:
+      FinishCommand(false, immediate_, 0u, 0x00052000u);
+      return;
+    }
+    static unsigned audio_status_logs = 0;
+    if (audio_status_logs < 16u) {
+      std::fprintf(stderr,
+                   "GEKKOAOT_NATIVE_DI_DTK_V56=1 cmd=E2 sub=%u result=%08x streaming=%u\n",
+                   static_cast<unsigned>(subcommand), result, audio_streaming_ ? 1u : 0u);
+      ++audio_status_logs;
+    }
+    FinishCommand(true, result, 0u, 0u);
+    return;
+  }
+  if (opcode == kCmdStopMotor) {
+    // DVDLowStopMotor is a drive-state command, not a media read. Retail GC
+    // software expects it to complete normally through TCINT. Bits 17 and 20
+    // request eject and kill respectively; only eject-without-kill opens the
+    // cover. The common E3000000 command simply stops the motor.
+    const bool eject = (command_[0] & (1u << 17)) != 0u;
+    const bool kill = (command_[0] & (1u << 20)) != 0u;
+    if (eject && !kill) SetDiscPresent(false);
+    FinishCommand(true, immediate_, 0, 0);
+    return;
+  }
+
+  // A backend owns commands that need real media bytes. Keeping this as a
+  // narrow request/response boundary lets the standalone host use a raw or
+  // cached logical disc without routing execution through Dolphin's DVD stack.
+  if (hooks_.execute) {
+    const CommandRequest request{command_, dma_address_, dma_length_, dma_control_,
+                                 immediate_, command_sequence_};
+    const CommandResponse response = hooks_.execute(hooks_.user, request);
+    if (response.result == 0) return;
+    FinishCommand(response.result > 0, response.immediate,
+                  response.bytes_transferred, response.error_code);
+    return;
+  }
+
+  FinishCommand(false, immediate_, 0,
+                disc_present_ ? kInvalidCommandError : kNoMediumError);
+}
+
+bool NativeDI::Write32(std::uint32_t offset, std::uint32_t value) {
+  switch (offset) {
+  case kStatus: {
+    constexpr std::uint32_t writable_state =
+        kBreak | kDeviceErrorMask | kTransferCompleteMask | kBreakMask;
+    status_ = (status_ & ~writable_state) | (value & writable_state);
+    if (value & kDeviceErrorInt) status_ &= ~kDeviceErrorInt;
+    if (value & kTransferCompleteInt) status_ &= ~kTransferCompleteInt;
+    if (value & kBreakInt) status_ &= ~kBreakInt;
+    if (value & kBreak) {
+      dma_control_ &= ~kControlTStart;
+      status_ |= kBreakInt;
+    }
+    return true;
+  }
+
+  case kCover:
+    cover_ = (cover_ & ~(kCoverIntMask)) | (value & kCoverIntMask) |
+             (disc_present_ ? 0u : kCoverOpen) | (cover_ & kCoverInt);
+    if (value & kCoverInt) cover_ &= ~kCoverInt;
+    return true;
+
+  case kCommand0: command_[0] = value; return true;
+  case kCommand1: command_[1] = value; return true;
+  case kCommand2: command_[2] = value; return true;
+  case kDmaAddress: dma_address_ = value & kGcDmaAddressMask; return true;
+  case kDmaLength: dma_length_ = value & kDmaLengthMask; return true;
+
+  case kDmaControl:
+    dma_control_ = value & (kControlTStart | kControlDma | kControlWrite);
+    if (dma_control_ & kControlTStart) {
+      ++command_sequence_;
+      ExecuteCommand();
+    }
+    return true;
+
+  case kImmediate: immediate_ = value; return true;
+  case kConfig:
+    // DI_CONFIG is read-only on retail GameCube hardware.
+    return false;
+  default:
+    return false;
+  }
+}
+
+bool NativeDI::Write(std::uint32_t address, std::uint64_t value, std::uint8_t size) {
+  if (!Handles(address) || size != 4u) return false;
+  const std::uint32_t offset = ToPhysical(address) - BasePhysical;
+  if (offset & 3u) return false;
+  return Write32(offset, static_cast<std::uint32_t>(value));
+}
+
+} // namespace GekkoAOT::HW::DI

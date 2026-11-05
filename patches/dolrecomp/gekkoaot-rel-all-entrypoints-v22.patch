@@ -1,0 +1,24 @@
+diff --git a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -162,7 +162,20 @@ void FunctionEmitter::scanRegionLeaders() {
+   if (has_computed_ctr_branch) {
+     for (u32 i = 0; i < source_.block_count; i++)
+       region_leaders_[i] = true;
+   }
++
++  // RELs may be entered through runtime-relocated function pointers and jump
++  // tables whose destination addresses are not visible to the static scanner.
++  // The standalone runtime intentionally has no PPC interpreter to recover an
++  // interior target.  When secondary REL AOT explicitly requests it, make
++  // every guest instruction in this function a legal native re-entry point.
++  // Keep this opt-in so the main DOL retains the normal coalesced region shape.
++  const char *rel_all_entries =
++      std::getenv("DOLRECOMP_REL_ALL_INSTRUCTION_ENTRYPOINTS");
++  if (rel_all_entries && rel_all_entries[0] == '1' && rel_all_entries[1] == '\0') {
++    for (u32 i = 0; i < source_.block_count; i++)
++      region_leaders_[i] = true;
++  }
+   for (u32 i = 0; i < source_.block_count; i++) {
+     if (modern_runtime_ && native_abi_ && needsInterpreter(source_.blocks[i])) {
+       region_leaders_[i] = true;

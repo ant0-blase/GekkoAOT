@@ -1,0 +1,18 @@
+diff --git a/src/cpu/cpu.c b/src/cpu/cpu.c
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -868,6 +868,14 @@ void ppc_rfi(CPUState* cpu, u32 cia) {
+     cpu->msr = (cpu->msr & ~PPC_MSR_RFI_MASK) | (cpu->srr1 & PPC_MSR_RFI_MASK);
+     cpu->msr &= ~PPC_MSR_POW;
+     cpu->pc = cpu->srr0 & ~3u;
++
++    // GEKKOAOT_DOLRECOMP_RFI_PENDING_QUERY_V284: returning from an IRQ or
++    // OSLoadContext can enable EE. Notify the host at this semantic boundary,
++    // before a module superchain can disable EE again. The reserved query
++    // only raises the host event epoch when a deliverable event needs service;
++    // the restored PC, registers and interrupt delivery remain architectural.
++    if ((cpu->msr & PPC_MSR_EE) && cpu->host_call)
++        (void)cpu->host_call(cpu, 0xfffffff4u);
+ }
+ 
+ void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia) {

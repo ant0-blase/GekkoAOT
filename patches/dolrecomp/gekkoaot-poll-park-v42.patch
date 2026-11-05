@@ -1,0 +1,46 @@
+diff --git a/src/backend/llvm/instructions.cpp b/src/backend/llvm/instructions.cpp
+--- a/src/backend/llvm/instructions.cpp
++++ b/src/backend/llvm/instructions.cpp
+@@ -12,4 +12,40 @@ bool FunctionEmitter::isPurePollingLoop(u32 header) const {
+   if (header >= source_.block_count || !loop_headers_[header])
+     return false;
+-
++
++  // v42: recognize the canonical retail-SDK/game flag wait directly from PPC
++  // shape before relying on DolIR state-def metadata. Some lifted compare/load
++  // combinations intentionally keep their architectural destination in SSA and
++  // therefore made the stricter v41 gprDefs check reject a real pure poll.
++  //
++  //   lbz/lhz/lha/lwz rD,disp(rA)
++  //   cmpwi/cmplwi/andi./andis. ...
++  //   bc <back to load>
++  //
++  // This is address-independent and deliberately narrow: exactly three PPC
++  // instructions, one non-update scalar RAM load, one compare/mask and one
++  // conditional backedge. No game symbol/address participates in the decision.
++  if (header + 2u < source_.block_count) {
++    const DolIRBlock& load = source_.blocks[header];
++    const DolIRBlock& test = source_.blocks[header + 1u];
++    const DolIRBlock& branch = source_.blocks[header + 2u];
++    const DolIRTerminator& term = branch.terminator;
++    const u32 loadPrimary = load.raw >> 26u;
++    const u32 testPrimary = test.raw >> 26u;
++    const u32 branchPrimary = branch.raw >> 26u;
++    const bool scalarLoad = loadPrimary == 32u || loadPrimary == 34u ||
++                            loadPrimary == 40u || loadPrimary == 42u;
++    const bool scalarTest = testPrimary == 10u || testPrimary == 11u ||
++                            testPrimary == 28u || testPrimary == 29u;
++    const bool linear = load.terminator.kind == DOLIR_TERM_FALLTHROUGH &&
++                        load.terminator.targets[0] == header + 1u &&
++                        test.terminator.kind == DOLIR_TERM_FALLTHROUGH &&
++                        test.terminator.targets[0] == header + 2u;
++    const bool conditionalBackedge =
++        term.kind == DOLIR_TERM_COND_BRANCH && !term.linked &&
++        ((term.targets[0] == header && term.targets[1] != header) ||
++         (term.targets[1] == header && term.targets[0] != header));
++    if (scalarLoad && scalarTest && branchPrimary == 16u && linear &&
++        conditionalBackedge)
++      return true;
++  }
++
+   // Conservative, address-independent classifier for the common GameCube

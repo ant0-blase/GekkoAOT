@@ -1,0 +1,170 @@
+--- a/src/backend/llvm/paired_single.cpp
++++ b/src/backend/llvm/paired_single.cpp
+@@ -5,8 +5,12 @@
+ #include <llvm/IR/Constants.h>
+ #include <llvm/IR/Function.h>
+ #include <llvm/IR/Intrinsics.h>
++#include <llvm/IR/MDBuilder.h>
+ #include <llvm/IR/Module.h>
+ 
++#include <cstdlib>
++#include <initializer_list>
++
+ namespace dolllvm {
+ 
+ using namespace llvm;
+@@ -25,18 +29,69 @@
+     writePairF32(d, rounded, true, valueClass);
+     updateFPRF(builder_.CreateExtractElement(rounded, uint64_t{0}));
+   };
++  // GEKKOAOT_PAIRED_NI_DENORMAL_V342: with exact-single operands the f32 path
++  // equals the architectural f64 one except when non-IEEE mode (MXCSR DAZ)
++  // zeroes an f32-denormal input. Operands not statically proven
++  // denormal-safe used to take the f64 path unconditionally (also in IEEE
++  // mode); select it at run time only for that case instead.
++  static const bool runtimeGate = [] {
++    const char *setting = std::getenv("DOLRECOMP_PAIRED_NI_DENORMAL");
++    return !setting || setting[0] != '0';
++  }();
++  auto gated = [&](std::initializer_list<u32> regs, auto &&path,
++                   FPValueClass valueClass) {
++    Type *integerPair = FixedVectorType::get(Type::getInt32Ty(context_), 2);
++    auto splat = [&](u32 value) {
++      return ConstantVector::getSplat(ElementCount::getFixed(2), builder_.getInt32(value));
++    };
++    Value *anyDenormal = builder_.getFalse();
++    for (u32 reg : regs) {
++      Value *bits = builder_.CreateBitCast(pairF32(reg), integerPair);
++      Value *denormal = builder_.CreateAnd(
++          builder_.CreateICmpEQ(builder_.CreateAnd(bits, splat(0x7F800000u)), splat(0u)),
++          builder_.CreateICmpNE(builder_.CreateAnd(bits, splat(0x007FFFFFu)), splat(0u)));
++      anyDenormal = builder_.CreateOr(anyDenormal,
++          builder_.CreateOr(builder_.CreateExtractElement(denormal, uint64_t{0}),
++                            builder_.CreateExtractElement(denormal, 1u)));
++    }
++    Value *strict = builder_.CreateAnd(niEnabled(), anyDenormal, "ps.ni.denormal");
++    BasicBlock *single = BasicBlock::Create(context_, "ps_single", function_);
++    BasicBlock *wide = BasicBlock::Create(context_, "ps_architectural", function_);
++    BasicBlock *join = BasicBlock::Create(context_, "ps_precision_join", function_);
++    builder_.CreateCondBr(strict, wide, single, MDBuilder(context_).createBranchWeights(1, 2000));
++    builder_.SetInsertPoint(single);
++    Value *singleResult = roundPairToSingle(path(true));
++    builder_.CreateBr(join);
++    BasicBlock *singleEnd = builder_.GetInsertBlock();
++    builder_.SetInsertPoint(wide);
++    Value *wideResult = roundPairToSingle(path(false));
++    builder_.CreateBr(join);
++    BasicBlock *wideEnd = builder_.GetInsertBlock();
++    builder_.SetInsertPoint(join);
++    PHINode *rounded = builder_.CreatePHI(FixedVectorType::get(Type::getFloatTy(context_), 2), 2, "ps.precision");
++    rounded->addIncoming(singleResult, singleEnd);
++    rounded->addIncoming(wideResult, wideEnd);
++    writePairF32(d, rounded, true, valueClass);
++    updateFPRF(builder_.CreateExtractElement(rounded, uint64_t{0}));
++  };
+ 
+   if (op == DOLIR_EXACT_PS_ADD || op == DOLIR_EXACT_PS_SUB) {
+-    bool useSingle = singleMathSafe(a) && singleMathSafe(b);
+-    Value *left = useSingle ? pairF32(a) : pairF64(a);
+-    Value *right = useSingle ? pairF32(b) : pairF64(b);
++    bool staticSingle = singleMathSafe(a) && singleMathSafe(b);
+     unsigned intrinsic = op == DOLIR_EXACT_PS_ADD
+                              ? Intrinsic::experimental_constrained_fadd
+                              : Intrinsic::experimental_constrained_fsub;
+     bool operandsFinite = finite(a) && finite(b);
+-    finish(preferPairedNaN(constrainedPairBinary(intrinsic, left, right), left,
+-                           right, operandsFinite),
+-           operandsFinite ? FPValueClass::NoNaN : FPValueClass::Unknown);
++    auto path = [&](bool useSingle) {
++      Value *left = useSingle ? pairF32(a) : pairF64(a);
++      Value *right = useSingle ? pairF32(b) : pairF64(b);
++      return preferPairedNaN(constrainedPairBinary(intrinsic, left, right), left,
++                             right, operandsFinite);
++    };
++    FPValueClass valueClass = operandsFinite ? FPValueClass::NoNaN : FPValueClass::Unknown;
++    if (runtimeGate && !staticSingle && isSingle(a) && isSingle(b))
++      gated({a, b}, path, valueClass);
++    else
++      finish(path(staticSingle), valueClass);
+     return true;
+   }
+ 
+@@ -52,39 +107,51 @@
+   }
+ 
+   if (op == DOLIR_EXACT_PS_MUL) {
+-    bool useSingle = singleMathSafe(a) && singleMathSafe(c);
+-    Value *left = useSingle ? pairF32(a) : pairF64(a);
+-    Value *architecturalRight = useSingle ? pairF32(c) : pairF64(c);
+-    Value *right = useSingle
+-                       ? architecturalRight
+-                       : forcePairedMultiplierPrecision(architecturalRight);
++    bool staticSingle = singleMathSafe(a) && singleMathSafe(c);
+     bool operandsFinite = finite(a) && finite(c);
+-    finish(preferPairedNaN(
+-               constrainedPairBinary(Intrinsic::experimental_constrained_fmul,
+-                                     left, right),
+-               left, architecturalRight, operandsFinite),
+-           operandsFinite ? FPValueClass::NoNaN : FPValueClass::Unknown);
++    auto path = [&](bool useSingle) {
++      Value *left = useSingle ? pairF32(a) : pairF64(a);
++      Value *architecturalRight = useSingle ? pairF32(c) : pairF64(c);
++      Value *right = useSingle
++                         ? architecturalRight
++                         : forcePairedMultiplierPrecision(architecturalRight);
++      return preferPairedNaN(
++          constrainedPairBinary(Intrinsic::experimental_constrained_fmul,
++                                left, right),
++          left, architecturalRight, operandsFinite);
++    };
++    FPValueClass valueClass = operandsFinite ? FPValueClass::NoNaN : FPValueClass::Unknown;
++    if (runtimeGate && !staticSingle && isSingle(a) && isSingle(c))
++      gated({a, c}, path, valueClass);
++    else
++      finish(path(staticSingle), valueClass);
+     return true;
+   }
+ 
+   if (op == DOLIR_EXACT_PS_MULS0 || op == DOLIR_EXACT_PS_MULS1) {
+-    bool useSingle = singleMathSafe(a) && singleMathSafe(c);
+-    Value *left = useSingle ? pairF32(a) : pairF64(a);
+-    Value *architecturalScalar = useSingle ? pairF32(c) : pairF64(c);
+-    Value *scalarPair =
+-        useSingle ? architecturalScalar
+-                  : forcePairedMultiplierPrecision(architecturalScalar);
+-    int lane = op == DOLIR_EXACT_PS_MULS1 ? 1 : 0;
+-    Value *splat =
+-        builder_.CreateShuffleVector(scalarPair, scalarPair, {lane, lane});
+-    Value *architecturalSplat = builder_.CreateShuffleVector(
+-        architecturalScalar, architecturalScalar, {lane, lane});
++    bool staticSingle = singleMathSafe(a) && singleMathSafe(c);
+     bool operandsFinite = finite(a) && finite(c);
+-    finish(preferPairedNaN(
+-               constrainedPairBinary(Intrinsic::experimental_constrained_fmul,
+-                                     left, splat),
+-               left, architecturalSplat, operandsFinite),
+-           operandsFinite ? FPValueClass::NoNaN : FPValueClass::Unknown);
++    auto path = [&](bool useSingle) {
++      Value *left = useSingle ? pairF32(a) : pairF64(a);
++      Value *architecturalScalar = useSingle ? pairF32(c) : pairF64(c);
++      Value *scalarPair =
++          useSingle ? architecturalScalar
++                    : forcePairedMultiplierPrecision(architecturalScalar);
++      int lane = op == DOLIR_EXACT_PS_MULS1 ? 1 : 0;
++      Value *splat =
++          builder_.CreateShuffleVector(scalarPair, scalarPair, {lane, lane});
++      Value *architecturalSplat = builder_.CreateShuffleVector(
++          architecturalScalar, architecturalScalar, {lane, lane});
++      return preferPairedNaN(
++          constrainedPairBinary(Intrinsic::experimental_constrained_fmul,
++                                left, splat),
++          left, architecturalSplat, operandsFinite);
++    };
++    FPValueClass valueClass = operandsFinite ? FPValueClass::NoNaN : FPValueClass::Unknown;
++    if (runtimeGate && !staticSingle && isSingle(a) && isSingle(c))
++      gated({a, c}, path, valueClass);
++    else
++      finish(path(staticSingle), valueClass);
+     return true;
+   }
+ 

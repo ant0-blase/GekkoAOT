@@ -1,0 +1,123 @@
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+index e12460b..ee5a366 100644
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -1859,19 +1859,63 @@ static int run_llvm_chunk_jobs(const LLVMChunkJob* jobs, u32 count,
+     const u32 rel_workers = rel_parallel
+         ? effective_chunk_jobs(paths.count, jobs) : 1u;
+     if (rel_workers > 1u) {
+-        typedef struct { pid_t pid; u32 index; } RELCompileWorker;
++        // v47: use --jobs as one global CPU-slot budget. Tiny RELs still run
++        // concurrently, while large RELs are allowed to spend several slots
++        // on their LLVM chunks instead of being stranded at inner_jobs=1.
++        typedef struct { pid_t pid; u32 index; u32 slots; } RELCompileWorker;
+         RELCompileWorker* active =
+             (RELCompileWorker*)calloc(rel_workers, sizeof(*active));
+-        if (!active)
++        u32* rel_slots = (u32*)calloc(paths.count, sizeof(*rel_slots));
++        u32* rel_instructions =
++            (u32*)calloc(paths.count, sizeof(*rel_instructions));
++        if (!active || !rel_slots || !rel_instructions) {
++            free(active);
++            free(rel_slots);
++            free(rel_instructions);
+             goto done;
+-        const u32 inner_jobs = jobs / rel_workers ? jobs / rel_workers : 1u;
+-        u32 next = 0, active_count = 0, completed = 0;
++        }
++
++        const u32 cpu_slots = jobs ? jobs : 1u;
++        for (u32 i = 0; i < paths.count; ++i) {
++            u64 executable_bytes = 0u;
++            for (u32 s = 0; s < items[i].rel.section_count; ++s) {
++                if (items[i].rel.sections[s].executable)
++                    executable_bytes += items[i].rel.sections[s].size;
++            }
++            u64 instruction_count = (executable_bytes + 3u) / 4u;
++            if (instruction_count > 0xffffffffu)
++                instruction_count = 0xffffffffu;
++            rel_instructions[i] = (u32)instruction_count;
++
++            u32 width = 1u;
++            if (instruction_count >= 131072u)
++                width = cpu_slots;
++            else if (instruction_count >= 32768u)
++                width = cpu_slots < 4u ? cpu_slots : 4u;
++            else if (instruction_count >= 8192u)
++                width = cpu_slots < 2u ? cpu_slots : 2u;
++            if (!width)
++                width = 1u;
++            rel_slots[i] = width;
++        }
++
++        u32 next = 0, active_count = 0, completed = 0, used_slots = 0;
+         int failed = 0;
+-        printf("DOLRECOMP_REL_PARALLEL=1 modules=%u workers=%u inner_jobs=%u\n",
+-               paths.count, rel_workers, inner_jobs);
++        printf("DOLRECOMP_REL_ADAPTIVE_V47=1 modules=%u cpu_slots=%u "
++               "policy=weighted-exec-instructions thresholds=8192,32768,131072\n",
++               paths.count, cpu_slots);
+         while ((next < paths.count && !failed) || active_count) {
+             while (!failed && next < paths.count && active_count < rel_workers) {
+-                const u32 index = next++;
++                const u32 index = next;
++                const u32 module_jobs = rel_slots[index];
++                if (active_count && used_slots + module_jobs > cpu_slots)
++                    break;
++                ++next;
++                used_slots += module_jobs;
++                printf("DOLRECOMP_REL_SCHEDULE_V47=1 rel=%u/%u module=%u "
++                       "instructions=%u inner_jobs=%u used_slots=%u/%u\n",
++                       index + 1u, paths.count, items[index].rel.module_id,
++                       rel_instructions[index], module_jobs, used_slots, cpu_slots);
+                 fflush(NULL);
+                 const pid_t pid = fork();
+                 if (pid == 0) {
+@@ -1887,17 +1931,19 @@ static int run_llvm_chunk_jobs(const LLVMChunkJob* jobs, u32 count,
+                         printf("\nwriting output to: %s\n", rel_output_path);
+                         child_ok = emit_rel_split(&items[index].rel,
+                                                   rel_output_path, cpu,
+-                                                  inner_jobs, 1, options);
++                                                  module_jobs, 1, options);
+                     }
+                     fflush(NULL);
+                     _exit(child_ok ? 0 : 1);
+                 }
+                 if (pid < 0) {
++                    used_slots -= module_jobs;
+                     fprintf(stderr, "error: cannot start REL compiler worker\n");
+                     failed = 1;
+                     break;
+                 }
+-                active[active_count++] = (RELCompileWorker){pid, index};
++                active[active_count++] =
++                    (RELCompileWorker){pid, index, module_jobs};
+             }
+             if (!active_count)
+                 break;
+@@ -1917,18 +1963,23 @@ static int run_llvm_chunk_jobs(const LLVMChunkJob* jobs, u32 count,
+                 continue;
+             }
+             const u32 index = active[slot].index;
++            const u32 released_slots = active[slot].slots;
+             active[slot] = active[--active_count];
++            used_slots = used_slots >= released_slots
++                ? used_slots - released_slots : 0u;
+             if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                 fprintf(stderr, "error: REL %u/%u compiler worker failed\n",
+                         index + 1u, paths.count);
+                 failed = 1;
+             } else {
+                 completed++;
+-                printf("DOLRECOMP_REL_PARALLEL_PROGRESS=%u/%u\n",
+-                       completed, paths.count);
++                printf("DOLRECOMP_REL_PARALLEL_PROGRESS=%u/%u free_slots=%u/%u\n",
++                       completed, paths.count, cpu_slots - used_slots, cpu_slots);
+             }
+         }
+         free(active);
++        free(rel_slots);
++        free(rel_instructions);
+         if (failed || completed != paths.count)
+             goto done;
+     } else

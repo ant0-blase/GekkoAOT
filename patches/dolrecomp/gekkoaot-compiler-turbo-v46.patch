@@ -1,0 +1,230 @@
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -146,4 +146,38 @@
+ }
+
++static int gekkoaot_llvm_env_enabled(const char* name, int fallback) {
++    const char* value = getenv(name);
++    if (!value || !value[0])
++        return fallback;
++    if (value[0] == '0' && value[1] == '\0')
++        return 0;
++    if (value[0] == '1' && value[1] == '\0')
++        return 1;
++    return fallback;
++}
++
++static u32 llvm_ir_optimization_level(void) {
++    const char* configured = getenv("DOLRECOMP_LLVM_IR_LEVEL");
++    if (!configured || !configured[0])
++        return 3u;
++    char* end = NULL;
++    errno = 0;
++    unsigned long value = strtoul(configured, &end, 10);
++    if (errno || !end || *end || value > 3u) {
++        fprintf(stderr,
++                "warning: DOLRECOMP_LLVM_IR_LEVEL must be 0..3; using 3\n");
++        return 3u;
++    }
++    return (u32)value;
++}
++
++static int llvm_emit_thinlto(void) {
++    return gekkoaot_llvm_env_enabled("DOLRECOMP_LLVM_EMIT_THINLTO", 1);
++}
++
+ // Validate the object format selected by the target triple.
+ static int valid_object_file(const LLVMChunkJob* job, const char* path) {
+@@ -291,4 +325,10 @@
+         codegen_level = "2";
+     hash = hash_bytes(hash, codegen_level, strlen(codegen_level));
++    const char* ir_level = getenv("DOLRECOMP_LLVM_IR_LEVEL");
++    if (!ir_level || !ir_level[0]) ir_level = "3";
++    hash = hash_bytes(hash, ir_level, strlen(ir_level));
++    const char* emit_thinlto = getenv("DOLRECOMP_LLVM_EMIT_THINLTO");
++    if (!emit_thinlto || !emit_thinlto[0]) emit_thinlto = "1";
++    hash = hash_bytes(hash, emit_thinlto, strlen(emit_thinlto));
+     const char* coalesce_size = getenv("DOLRECOMP_LLVM_COALESCE_SIZE");
+     const char* coalesce_limit = getenv("DOLRECOMP_LLVM_COALESCE_LIMIT");
+@@ -625,11 +665,13 @@
+
+ static int reuse_llvm_object(const LLVMChunkJob* job) {
++    const int need_bitcode = llvm_emit_thinlto();
+     if (getenv("DOLRECOMP_LLVM_RESUME") && valid_object_file(job, job->path) &&
+-        file_exists(job->thinlto_path) && valid_llvm_job_stamp(job))
++        (!need_bitcode || file_exists(job->thinlto_path)) &&
++        valid_llvm_job_stamp(job))
+         return 1;
+     if (!job->cache_path[0] || !valid_object_file(job, job->cache_path) ||
+-        !file_exists(job->cache_bitcode_path) ||
++        (need_bitcode && !file_exists(job->cache_bitcode_path)) ||
+         !copy_file(job->cache_path, job->path) ||
+-        !copy_file(job->cache_bitcode_path, job->thinlto_path))
++        (need_bitcode && !copy_file(job->cache_bitcode_path, job->thinlto_path)))
+         return 0;
+     write_llvm_job_stamp(job);
+@@ -638,6 +680,8 @@
+
+ static void cache_llvm_object(const LLVMChunkJob* job) {
+-    if (!job->cache_path[0] || (valid_object_file(job, job->cache_path) &&
+-         file_exists(job->cache_bitcode_path)))
++    const int need_bitcode = llvm_emit_thinlto();
++    if (!job->cache_path[0] ||
++        (valid_object_file(job, job->cache_path) &&
++         (!need_bitcode || file_exists(job->cache_bitcode_path))))
+         return;
+     char temp[1440];
+@@ -655,4 +699,6 @@
+     if (rename(temp, job->cache_path) != 0)
+         remove(temp);
++    if (!need_bitcode)
++        return;
+     if (snprintf(temp, sizeof(temp), "%s.tmp.%d", job->cache_bitcode_path,
+                  process_id) >= (int)sizeof(temp))
+@@ -700,10 +746,10 @@
+     options.partition_seed = job->partition_seed;
+     options.state_in_memory = job->state_in_memory;
+-    options.emit_thinlto = 1;
+-    options.thinlto_path = job->thinlto_path;
++    options.emit_thinlto = llvm_emit_thinlto();
++    options.thinlto_path = options.emit_thinlto ? job->thinlto_path : NULL;
+     options.fixed_memory_layout = 1;
+     options.ram_size = job->ram_size;
+     options.mem2_size = job->mem2_size;
+-    options.optimization_level = 3;
++    options.optimization_level = (int)llvm_ir_optimization_level();
+     options.verify = 1;
+     options.function_ranges = job->ranges;
+@@ -760,4 +806,21 @@
+                                u32 requested_jobs) {
+     u32 workers = effective_chunk_jobs(count, requested_jobs);
++#ifndef _WIN32
++    // REL-directory workers already provide outer parallelism. Avoid a fork
++    // for every LLVM batch when this worker owns one CPU slot; this also lets
++    // the process-local TargetMachine cache survive across all of the REL's
++    // chunks.
++    if (workers == 1u) {
++        for (u32 i = 0; i < count; i++) {
++            const int reused = reuse_llvm_object(&jobs[i]);
++            if (!reused && !emit_llvm_chunk_job(&jobs[i], NULL))
++                return 0;
++            printf("[%u/%u] %s LLVM object %s\n", i + 1u, count,
++                   reused ? "Reusing cached" : "Emitting", jobs[i].name);
++        }
++        fflush(stdout);
++        return 1;
++    }
++#endif
+ #ifdef _WIN32
+     for (u32 i = 0; i < count; i++) {
+@@ -1793,17 +1866,100 @@
+     }
+
+-    for (u32 i = 0; i < paths.count; i++) {
+-        char rel_output_path[1200];
+-        printf("\nREL %u/%u: %s\n", i + 1, paths.count, paths.paths[i]);
+-        rel_print_info(&items[i].rel, NULL);
+-        if (!build_rel_output_path(generated_root, paths.paths[i],
+-                                   items[i].rel.module_id, rel_output_path,
+-                                   sizeof(rel_output_path))) {
++#ifndef _WIN32
++    const char* rel_parallel_env = getenv("DOLRECOMP_REL_PARALLEL");
++    const int rel_parallel = options->backend == DOLRECOMP_BACKEND_LLVM &&
++        (!rel_parallel_env || strcmp(rel_parallel_env, "0") != 0);
++    const u32 rel_workers = rel_parallel
++        ? effective_chunk_jobs(paths.count, jobs) : 1u;
++    if (rel_workers > 1u) {
++        typedef struct { pid_t pid; u32 index; } RELCompileWorker;
++        RELCompileWorker* active =
++            (RELCompileWorker*)calloc(rel_workers, sizeof(*active));
++        if (!active)
+             goto done;
++        const u32 inner_jobs = jobs / rel_workers ? jobs / rel_workers : 1u;
++        u32 next = 0, active_count = 0, completed = 0;
++        int failed = 0;
++        printf("DOLRECOMP_REL_PARALLEL=1 modules=%u workers=%u inner_jobs=%u\n",
++               paths.count, rel_workers, inner_jobs);
++        while ((next < paths.count && !failed) || active_count) {
++            while (!failed && next < paths.count && active_count < rel_workers) {
++                const u32 index = next++;
++                fflush(NULL);
++                const pid_t pid = fork();
++                if (pid == 0) {
++                    char rel_output_path[1200];
++                    printf("\nREL %u/%u: %s\n", index + 1u, paths.count,
++                           paths.paths[index]);
++                    rel_print_info(&items[index].rel, NULL);
++                    int child_ok = build_rel_output_path(
++                        generated_root, paths.paths[index],
++                        items[index].rel.module_id, rel_output_path,
++                        sizeof(rel_output_path));
++                    if (child_ok) {
++                        printf("\nwriting output to: %s\n", rel_output_path);
++                        child_ok = emit_rel_split(&items[index].rel,
++                                                  rel_output_path, cpu,
++                                                  inner_jobs, 1, options);
++                    }
++                    fflush(NULL);
++                    _exit(child_ok ? 0 : 1);
++                }
++                if (pid < 0) {
++                    fprintf(stderr, "error: cannot start REL compiler worker\n");
++                    failed = 1;
++                    break;
++                }
++                active[active_count++] = (RELCompileWorker){pid, index};
++            }
++            if (!active_count)
++                break;
++            int status = 0;
++            pid_t finished;
++            do { finished = waitpid(-1, &status, 0); }
++            while (finished < 0 && errno == EINTR);
++            if (finished < 0) {
++                failed = 1;
++                break;
++            }
++            u32 slot = 0;
++            while (slot < active_count && active[slot].pid != finished)
++                slot++;
++            if (slot == active_count) {
++                failed = 1;
++                continue;
++            }
++            const u32 index = active[slot].index;
++            active[slot] = active[--active_count];
++            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
++                fprintf(stderr, "error: REL %u/%u compiler worker failed\n",
++                        index + 1u, paths.count);
++                failed = 1;
++            } else {
++                completed++;
++                printf("DOLRECOMP_REL_PARALLEL_PROGRESS=%u/%u\n",
++                       completed, paths.count);
++            }
+         }
+-        printf("\nwriting output to: %s\n", rel_output_path);
+-        if (!emit_rel_split(&items[i].rel, rel_output_path, cpu, jobs, 1,
+-                            options))
++        free(active);
++        if (failed || completed != paths.count)
+             goto done;
++    } else
++#endif
++    {
++        for (u32 i = 0; i < paths.count; i++) {
++            char rel_output_path[1200];
++            printf("\nREL %u/%u: %s\n", i + 1, paths.count, paths.paths[i]);
++            rel_print_info(&items[i].rel, NULL);
++            if (!build_rel_output_path(generated_root, paths.paths[i],
++                                       items[i].rel.module_id, rel_output_path,
++                                       sizeof(rel_output_path))) {
++                goto done;
++            }
++            printf("\nwriting output to: %s\n", rel_output_path);
++            if (!emit_rel_split(&items[i].rel, rel_output_path, cpu, jobs, 1,
++                                options))
++                goto done;
++        }
+     }

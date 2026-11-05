@@ -1,0 +1,417 @@
+diff --color -ruN a/src/app/pipeline.c b/src/app/pipeline.c
+--- a/src/app/pipeline.c	2026-10-30 15:16:23.492557268 +0100
++++ b/src/app/pipeline.c	2026-10-30 15:18:50.302262841 +0100
+@@ -317,6 +317,9 @@
+         hash = hash_bytes(hash, job->profile_generate_path,
+                           strlen(job->profile_generate_path));
+     hash = hash_file_contents(hash, getenv("DOLRECOMP_INTERIOR_HOOKS"));
++    const char* hot_chain = getenv("DOLRECOMP_HOT_CHAIN");
++    if (hot_chain)
++        hash = hash_bytes(hash, hot_chain, strlen(hot_chain));
+     const char* compat_native_calls = getenv("DOLRECOMP_COMPAT_NATIVE_CALLS");
+     if (compat_native_calls)
+         hash = hash_bytes(hash, compat_native_calls, strlen(compat_native_calls));
+diff --color -ruN a/src/backend/llvm/branch_targets.cpp b/src/backend/llvm/branch_targets.cpp
+--- a/src/backend/llvm/branch_targets.cpp	2026-10-30 15:16:23.546729782 +0100
++++ b/src/backend/llvm/branch_targets.cpp	2026-10-30 15:18:50.300676291 +0100
+@@ -57,7 +57,7 @@
+     if (source_.blocks[term.targets[slot]].terminator.kind ==
+         DOLIR_TERM_FALLBACK)
+       return fallbackEdge(term.target_addresses[slot]);
+-    return blocks_[term.targets[slot]];
++    return regionTarget(term.targets[slot]);
+   }
+   return externalDestination(term, slot);
+ }
+diff --color -ruN a/src/backend/llvm/control_flow.cpp b/src/backend/llvm/control_flow.cpp
+--- a/src/backend/llvm/control_flow.cpp	2026-10-30 15:16:23.525592248 +0100
++++ b/src/backend/llvm/control_flow.cpp	2026-10-30 15:18:50.300419756 +0100
+@@ -128,7 +128,7 @@
+         source_.blocks[i].terminator.kind == DOLIR_TERM_FALLBACK)
+       continue;
+     dispatch->addCase(builder_.getInt32(source_.blocks[i].guest_address),
+-                      blocks_[i]);
++                      entryBlock(i));
+   }
+ 
+   builder_.SetInsertPoint(repeatCheck);
+diff --color -ruN a/src/backend/llvm/emitter.cpp b/src/backend/llvm/emitter.cpp
+--- a/src/backend/llvm/emitter.cpp	2026-10-30 15:16:23.505757736 +0100
++++ b/src/backend/llvm/emitter.cpp	2026-10-30 15:18:50.299952339 +0100
+@@ -111,7 +111,15 @@
+   scanContinuations();
+   scanLoopHeaders();
+   scanRegionLeaders();
++  static const bool hotChains = [] {
++    const char *setting = std::getenv("DOLRECOMP_HOT_CHAIN");
++    return setting && setting[0] == '1';
++  }();
++  // cold_escapes_: settled cycles must not flow back through flushCallCounters
++  // on the way out of a body (see settleCycles).
++  hot_chain_ = hotChains && !modern_runtime_ && cold_escapes_;
+   blocks_.resize(source_.block_count);
++  restart_blocks_.assign(source_.block_count, nullptr);
+   BasicBlock *region = nullptr;
+   for (u32 i = 0; i < source_.block_count; i++) {
+     if (source_.blocks[i].terminator.kind == DOLIR_TERM_FALLBACK) {
+@@ -119,8 +127,11 @@
+       region = nullptr;
+       continue;
+     }
+-    if (region_leaders_[i])
++    if (hot_chain_ ? hard_leaders_[i] : region_leaders_[i])
+       region = BasicBlock::Create(context_, blockName(i), function_);
++    if (hot_chain_ && region_leaders_[i] && !hard_leaders_[i])
++      restart_blocks_[i] =
++          BasicBlock::Create(context_, blockName(i) + ".restart", function_);
+     if (!region) {
+       diagnostics << "dolllvm: instruction 0x"
+                   << format_hex_no_prefix(source_.blocks[i].guest_address, 8)
+@@ -131,12 +142,18 @@
+   }
+   emitEntry();
+   for (u32 i = 0; i < source_.block_count; i++) {
+-    if (!region_leaders_[i] ||
++    if (!(hot_chain_ ? hard_leaders_[i] : region_leaders_[i]) ||
+         source_.blocks[i].terminator.kind == DOLIR_TERM_FALLBACK)
+       continue;
+     if (!emitRegion(i, diagnostics))
+       return false;
+   }
++  emitting_restart_ = true;
++  for (u32 i = 0; i < source_.block_count; i++) {
++    if (restart_blocks_[i] && !emitRegion(i, diagnostics))
++      return false;
++  }
++  emitting_restart_ = false;
+   emitFallbackHandler();
+   finalizeStateSSA();
+   tagMemoryAliasClasses();
+diff --color -ruN a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+--- a/src/backend/llvm/emitter.h	2026-10-30 15:16:23.499703480 +0100
++++ b/src/backend/llvm/emitter.h	2026-10-30 15:18:50.299187658 +0100
+@@ -304,6 +304,32 @@
+   std::array<bool, DOLIR_STATE_COUNT> dirty_{};
+   std::vector<llvm::BasicBlock *> blocks_;
+   std::vector<bool> region_leaders_;
++  // GEKKOAOT_HOT_CHAIN_V392: a hard leader is reached by control flow; a soft
++  // leader only by re-entry through the dispatcher after an exit at that PC
++  // (memory fault, FP unavailable). Hot code runs straight through soft leaders;
++  // re-entry goes to a cold clone that rejoins at the next hard leader.
++  bool hot_chain_ = false;
++  bool emitting_restart_ = false;
++  u64 lazy_cycles_ = 0;
++  std::vector<bool> hard_leaders_;
++  std::vector<llvm::BasicBlock *> restart_blocks_;
++  bool regionEnds(u32 index) const;
++  llvm::BasicBlock *regionTarget(u32 index) const;
++  llvm::BasicBlock *entryBlock(u32 index) const;
++  void flushLazyCycles();
++  // What the emitter knows about guest registers. A memory access changes no
++  // register, so its slow path (which forgets everything) must not make the
++  // hot path forget.
++  struct EmitFacts {
++    std::array<FPRepresentation, 32> fp_rep;
++    std::array<bool, 32> fp_exact_single;
++    std::array<bool, 32> fp_denormal_safe;
++    std::array<FPValueClass, 32> fp_value_class;
++    std::array<llvm::ConstantInt *, DOLIR_STATE_COUNT> known_state;
++    bool fp_available_checked, psq_direct_proven, psq_indexed_proven;
++  };
++  EmitFacts captureFacts() const;
++  void restoreFacts(const EmitFacts &facts);
+   std::vector<bool> loop_headers_;
+   std::vector<bool> loop_members_;
+   std::vector<llvm::Value *> values_;
+diff --color -ruN a/src/backend/llvm/exits.cpp b/src/backend/llvm/exits.cpp
+--- a/src/backend/llvm/exits.cpp	2026-10-30 15:16:23.531267920 +0100
++++ b/src/backend/llvm/exits.cpp	2026-10-30 15:18:50.300522073 +0100
+@@ -469,7 +469,7 @@
+       continue;
+     dispatch->addCase(ConstantInt::get(Type::getInt32Ty(context_),
+                                        source_.blocks[i].guest_address),
+-                      blocks_[i]);
++                      entryBlock(i));
+   }
+   emitColdEntry(bad);
+ }
+diff --color -ruN a/src/backend/llvm/floating_point.cpp b/src/backend/llvm/floating_point.cpp
+--- a/src/backend/llvm/floating_point.cpp	2026-10-30 15:17:25.327680286 +0100
++++ b/src/backend/llvm/floating_point.cpp	2026-10-30 15:18:50.300945225 +0100
+@@ -47,10 +47,13 @@
+     // current in the architectural slot.
+     return builder_.CreateLoad(i32, state_[DOLIR_STATE_FPSCR], "fpscr.direct");
+   };
++  // In a hot chain f32 provenance outlives the operation that established it,
++  // so an enabled exception that suppressed that write must fail this test: it
++  // is still enabled now (an FPSCR write resets the facts).
+   auto defaultControls = [&](Value *fpscr) {
+     return builder_.CreateICmpEQ(
+-        builder_.CreateAnd(fpscr, builder_.getInt32(7)), builder_.getInt32(0),
+-        "fp.default-controls");
++        builder_.CreateAnd(fpscr, builder_.getInt32(hot_chain_ ? 0xffu : 7u)),
++        builder_.getInt32(0), "fp.default-controls");
+   };
+   auto finiteF32 = [&](Value *value) {
+     Value *bits = builder_.CreateBitCast(value, i32);
+@@ -532,15 +535,25 @@
+       // RN=nearest is required; NI is safe for normal f32 inputs when the
+       // final result is nonzero and not subnormal. Validate that below before
+       // publishing anything. Tiny results still use the exact helper.
++      BasicBlock *fast = BasicBlock::Create(context_, "fma_direct", function_);
++      BasicBlock *slow = BasicBlock::Create(context_, "fma_exact", function_);
++      BasicBlock *join = BasicBlock::Create(context_, "fma_join", function_);
++      // GEKKOAOT_HOT_CHAIN_V392: operands already proven f32 in this chain need
++      // no bit tests when FPSCR is at its defaults: IEEE mode, nearest, nothing
++      // enabled. NaN and infinity show in the result, checked before commit.
++      const bool provenOperands =
++          hot_chain_ && aExactSingle && bExactSingle && cExactSingle;
++      if (provenOperands) {
++        BasicBlock *check = BasicBlock::Create(context_, "fma_check", function_);
++        builder_.CreateCondBr(defaultControls(fpscr), fast, check,
++                              MDBuilder(context_).createBranchWeights(4096, 1));
++        builder_.SetInsertPoint(check);
++      }
+       Value *safe = builder_.CreateICmpEQ(
+           builder_.CreateAnd(fpscr, builder_.getInt32(3)), builder_.getInt32(0));
+       safe = builder_.CreateAnd(safe, exactF32(wideLeft));
+       safe = builder_.CreateAnd(safe, exactF32(wideMultiplier));
+       safe = builder_.CreateAnd(safe, exactF32(wideAddend));
+-
+-      BasicBlock *fast = BasicBlock::Create(context_, "fma_direct", function_);
+-      BasicBlock *slow = BasicBlock::Create(context_, "fma_exact", function_);
+-      BasicBlock *join = BasicBlock::Create(context_, "fma_join", function_);
+       builder_.CreateCondBr(safe, fast, slow,
+                             MDBuilder(context_).createBranchWeights(4096, 1));
+ 
+@@ -564,7 +577,10 @@
+                              builder_.getInt32(0x7F800000u)),
+           builder_.getInt32(0));
+       BasicBlock *commit = BasicBlock::Create(context_, "fma_commit", function_);
+-      builder_.CreateCondBr(builder_.CreateOr(ieee, nonTiny), commit, slow,
++      Value *publish = builder_.CreateOr(ieee, nonTiny);
++      if (provenOperands)
++        publish = builder_.CreateAnd(publish, finiteF32(rounded));
++      builder_.CreateCondBr(publish, commit, slow,
+                             MDBuilder(context_).createBranchWeights(4096, 1));
+       builder_.SetInsertPoint(commit);
+       Value *wide = builder_.CreateFPExt(rounded, f64);
+diff --color -ruN a/src/backend/llvm/instructions.cpp b/src/backend/llvm/instructions.cpp
+--- a/src/backend/llvm/instructions.cpp	2026-10-30 15:16:23.518599876 +0100
++++ b/src/backend/llvm/instructions.cpp	2026-10-30 15:18:50.300249646 +0100
+@@ -210,14 +210,19 @@
+   psq_indexed_proven_ = false;
+   fp_available_checked_ = false;
+   pending_fprf_ = nullptr;
+-  builder_.SetInsertPoint(blocks_[index]);
++  lazy_cycles_ = 0;
++  builder_.SetInsertPoint(emitting_restart_ ? restart_blocks_[index]
++                                            : blocks_[index]);
+   for (u32 current = index; current < source_.block_count; current++) {
+     const DolIRBlock &block = source_.blocks[current];
+-    if (current != index && region_leaders_[current]) {
++    if (current != index && regionEnds(current)) {
++      flushLazyCycles();
+       materializeFPRF();
+-      builder_.CreateBr(blocks_[current]);
++      builder_.CreateBr(regionTarget(current));
+       return true;
+     }
++    if (current != index && region_leaders_[current])
++      materializeFPRF();
+     const bool useService =
+         modern_runtime_ && native_abi_ && needsInterpreter(block);
+     if (loop_headers_[current]) {
+@@ -242,9 +247,10 @@
+     if (block.terminator.kind == DOLIR_TERM_FALLTHROUGH) {
+       u32 next = block.terminator.targets[0];
+       if (next != DOLIR_NO_BLOCK && next == current + 1u &&
+-          next < source_.block_count && !region_leaders_[next])
++          next < source_.block_count && !regionEnds(next))
+         continue;
+     }
++    flushLazyCycles();
+     materializeFPRF();
+     return emitTerminator(block.terminator, diagnostics);
+   }
+@@ -437,13 +443,21 @@
+         {static_cast<int>(inst.aux & 0xFFu),
+          static_cast<int>((inst.aux >> 8) & 0xFFu)});
+     break;
+-  case DOLIR_OP_GUEST_LOAD:
++  case DOLIR_OP_GUEST_LOAD: {
++    const EmitFacts facts = captureFacts();
+     result = emitGuestLoad(inst, operand(inst, 0), resultType, inst.aux & 0xffu,
+                            (inst.aux & 0x100u) != 0);
++    if (hot_chain_)
++      restoreFacts(facts);
+     break;
+-  case DOLIR_OP_GUEST_STORE:
++  }
++  case DOLIR_OP_GUEST_STORE: {
++    const EmitFacts facts = captureFacts();
+     emitGuestStore(inst, operand(inst, 0), operand(inst, 1), inst.aux & 0xffu);
++    if (hot_chain_)
++      restoreFacts(facts);
+     break;
++  }
+   case DOLIR_OP_HELPER_CALL:
+     if (inst.aux == DOLIR_HELPER_FP_AVAILABLE)
+       result = emitFPAvailable(inst.guest_pc);
+diff --color -ruN a/src/backend/llvm/register_state.cpp b/src/backend/llvm/register_state.cpp
+--- a/src/backend/llvm/register_state.cpp	2026-10-30 15:16:23.511871342 +0100
++++ b/src/backend/llvm/register_state.cpp	2026-10-30 15:19:20.374272814 +0100
+@@ -240,9 +240,11 @@
+ 
+ void FunctionEmitter::scanRegionLeaders() {
+   region_leaders_.assign(source_.block_count, false);
++  hard_leaders_.assign(source_.block_count, false);
+   if (!source_.block_count)
+     return;
+   region_leaders_[0] = true;
++  hard_leaders_[0] = true;
+ 
+ 
+   // Computed CTR branches are the normal PowerPC lowering for C/C++ switch
+@@ -303,10 +305,14 @@
+       }
+     }
+     const DolIRTerminator &term = source_.blocks[i].terminator;
+-    if (term.kind == DOLIR_TERM_FALLBACK)
++    if (term.kind == DOLIR_TERM_FALLBACK) {
+       region_leaders_[i] = true;
+-    if (i + 1u < source_.block_count && term.kind != DOLIR_TERM_FALLTHROUGH)
++      hard_leaders_[i] = true;
++    }
++    if (i + 1u < source_.block_count && term.kind != DOLIR_TERM_FALLTHROUGH) {
+       region_leaders_[i + 1u] = true;
++      hard_leaders_[i + 1u] = true;
++    }
+     // A block that writes MSR can return to the dispatcher and resume at the
+     // NEXT instruction, so that instruction has to be enterable. Terminators
+     // are already covered above; this catches the fallthrough case, which is
+@@ -340,6 +346,7 @@
+         if (dolir_state_mask_test(body.instructions[n].state_defs,
+                                   DOLIR_STATE_MSR)) {
+           region_leaders_[i + 1u] = true;
++          hard_leaders_[i + 1u] = true;
+           break;
+         }
+       }
+@@ -360,6 +367,7 @@
+         if (inst.op == DOLIR_OP_HELPER_CALL &&
+             inst.aux == DOLIR_HELPER_SPR_WRITE) {
+           region_leaders_[i + 1u] = true;
++          hard_leaders_[i + 1u] = true;
+           break;
+         }
+       }
+@@ -369,14 +377,18 @@
+                 : term.kind == DOLIR_TERM_INDIRECT  ? 2u
+                                                     : 0u;
+     for (u32 edge = 0; edge < count; edge++) {
+-      if (term.targets[edge] != DOLIR_NO_BLOCK)
++      if (term.targets[edge] != DOLIR_NO_BLOCK) {
+         region_leaders_[term.targets[edge]] = true;
++        hard_leaders_[term.targets[edge]] = true;
++      }
+     }
+   }
+   for (const auto &hook : interiorHooks()) {
+     if (hook.first >= source_.guest_start && hook.first < source_.guest_end &&
+-        ((hook.first - source_.guest_start) & 3u) == 0)
++        ((hook.first - source_.guest_start) & 3u) == 0) {
+       region_leaders_[(hook.first - source_.guest_start) / 4u] = true;
++      hard_leaders_[(hook.first - source_.guest_start) / 4u] = true;
++    }
+   }
+   for (u32 i = 0; i < entry_point_count_; i++) {
+     u32 address = entry_points_[i];
+@@ -384,6 +396,7 @@
+         ((address - source_.guest_start) & 3u) != 0)
+       continue;
+     region_leaders_[(address - source_.guest_start) / 4u] = true;
++    hard_leaders_[(address - source_.guest_start) / 4u] = true;
+   }
+ 
+   // GEKKOAOT_FP_REGION_COALESCE_V292: lazy-FPU exceptions can occur only at
+@@ -439,6 +452,37 @@
+   }
+ }
+ 
++bool FunctionEmitter::regionEnds(u32 index) const {
++  return hot_chain_ && !emitting_restart_ ? hard_leaders_[index]
++                                          : region_leaders_[index];
++}
++
++BasicBlock *FunctionEmitter::regionTarget(u32 index) const {
++  return emitting_restart_ && restart_blocks_[index] ? restart_blocks_[index]
++                                                     : blocks_[index];
++}
++
++BasicBlock *FunctionEmitter::entryBlock(u32 index) const {
++  return restart_blocks_[index] ? restart_blocks_[index] : blocks_[index];
++}
++
++FunctionEmitter::EmitFacts FunctionEmitter::captureFacts() const {
++  return {fp_rep_,          fp_exact_single_,      fp_denormal_safe_,
++          fp_value_class_,  known_state_,          fp_available_checked_,
++          psq_direct_proven_, psq_indexed_proven_};
++}
++
++void FunctionEmitter::restoreFacts(const EmitFacts &facts) {
++  fp_rep_ = facts.fp_rep;
++  fp_exact_single_ = facts.fp_exact_single;
++  fp_denormal_safe_ = facts.fp_denormal_safe;
++  fp_value_class_ = facts.fp_value_class;
++  known_state_ = facts.known_state;
++  fp_available_checked_ = facts.fp_available_checked;
++  psq_direct_proven_ = facts.psq_direct_proven;
++  psq_indexed_proven_ = facts.psq_indexed_proven;
++}
++
+ Value *FunctionEmitter::bytePtr(size_t offset) {
+   return builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ctx_,
+                                     builder_.getInt64(offset));
+diff --color -ruN a/src/backend/llvm/timing.cpp b/src/backend/llvm/timing.cpp
+--- a/src/backend/llvm/timing.cpp	2026-10-30 15:16:23.539752011 +0100
++++ b/src/backend/llvm/timing.cpp	2026-10-30 15:18:50.300616123 +0100
+@@ -43,6 +43,20 @@
+ } // namespace
+ 
+ void FunctionEmitter::chargeCycles(u32 cycles) {
++  // A chain charges its instructions in one add at its end: per-instruction
++  // adds are a long dependency chain through the stack in large functions.
++  if (hot_chain_) {
++    lazy_cycles_ += cycles;
++    return;
++  }
++  chargeCycles(ConstantInt::get(Type::getInt64Ty(context_), cycles));
++}
++
++void FunctionEmitter::flushLazyCycles() {
++  if (!lazy_cycles_)
++    return;
++  const u64 cycles = lazy_cycles_;
++  lazy_cycles_ = 0;
+   chargeCycles(ConstantInt::get(Type::getInt64Ty(context_), cycles));
+ }
+ 
+@@ -99,12 +113,16 @@
+   Value *downcount =
+       loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
+   Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
++  // Cycles the chain has not added yet are settled too. A path that rejoins the
++  // chain still gets them added at its end, hence the negative remainder.
++  if (lazy_cycles_)
++    cycles = builder_.CreateAdd(cycles, builder_.getInt64(lazy_cycles_));
+   builder_.CreateStore(builder_.CreateSub(downcount, cycles),
+                        bytePtr(offsetof(CPUState, downcount)));
+   Value *guard =
+       builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_local_);
+   builder_.CreateStore(builder_.CreateAdd(guard, cycles), guard_cycles_local_);
+-  builder_.CreateStore(builder_.getInt64(0), cycles_);
++  builder_.CreateStore(builder_.getInt64(-static_cast<int64_t>(lazy_cycles_)), cycles_);
+   builder_.CreateStore(builder_.getInt64(0), pending_cycles_);
+ }
+ 

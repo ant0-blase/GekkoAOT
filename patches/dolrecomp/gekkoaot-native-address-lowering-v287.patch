@@ -1,0 +1,120 @@
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -249,6 +249,9 @@
+   llvm::Value *return_pc_ = nullptr;
+   llvm::Value *initial_cycles_ = nullptr;
+   std::array<llvm::Argument *, DOLIR_STATE_COUNT> native_inputs_{};
++  llvm::Value *native_mem1_bias_ = nullptr;
++  llvm::Value *native_mem2_bias_ = nullptr;
++  llvm::Value *nativeMemoryPointer(llvm::Value*, llvm::Value*, llvm::Value*);
+   llvm::Value *ram_ = nullptr;
+   llvm::Value *ram_size_ = nullptr;
+   llvm::Value *mem2_ = nullptr;
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -303,6 +303,29 @@
+     mem2_ = loadOffset(pointer, offsetof(CPUState, exram));
+     mem2_size_ =
+         loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exram_size));
++    // GEKKOAOT_NATIVE_ADDRESS_LOWERING_V287: resolve once per native body,
++    // never once per access. This effect-free service needs no register spill.
++    const char* window = std::getenv("DOLRECOMP_NATIVE_ADDRESS_LOWERING");
++    if (window && std::string(window) == "1") {
++      Type* wide = builder_.getInt64Ty();
++      auto getter = module_.getOrInsertFunction("gekkoaot_native_address_base",
++          FunctionType::get(pointer, {ctx_->getType()}, false));
++      auto* service = llvm::cast<Function>(getter.getCallee());
++      service->setOnlyReadsMemory();
++      service->setDoesNotThrow();
++      service->addFnAttr(Attribute::WillReturn);
++      Value* base = builder_.CreateCall(getter, {ctx_}, "host.address.base");
++      Value* ready = builder_.CreateIsNotNull(base);
++      Value* mapped = builder_.CreatePtrToInt(base, wide);
++      native_mem1_bias_ = builder_.CreateSelect(ready, mapped,
++          builder_.CreateSub(builder_.CreatePtrToInt(ram_, wide), builder_.getInt64(GC_RAM_BASE)),
++          "host.mem1.bias");
++      native_mem2_bias_ = builder_.CreateSelect(ready, mapped,
++          builder_.CreateSub(builder_.CreatePtrToInt(mem2_, wide), builder_.getInt64(WII_MEM2_BASE)),
++          "host.mem2.bias");
++      function_->addFnAttr("dolrecomp-native-address-lowering", "287");
++    }
++
+   }
+   Function *assume = Intrinsic::getDeclaration(&module_, Intrinsic::assume);
+   Value *ramSizeValid =
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -14,6 +14,18 @@
+ namespace dolllvm {
+ 
+ using namespace llvm;
++
++// The range/width guards remain at each admission point. Once admitted, use
++// one 64-bit host addition with a zero-extended canonical EA. A null service
++// uses the old RAM allocation through a body-local bias, without per-access
++// branches or callbacks. Endian, polling, reservation and journals are intact.
++Value *FunctionEmitter::nativeMemoryPointer(Value *address, Value *memory, Value *offset) {
++  Value* bias = memory == ram_ ? native_mem1_bias_ : native_mem2_bias_;
++  if (!bias) return builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), memory, offset);
++  Value* ea = builder_.CreateZExt(address, builder_.getInt64Ty());
++  return builder_.CreateIntToPtr(builder_.CreateAdd(bias, ea, "host.base.plus.ea"),
++                                PointerType::getUnqual(context_));
++}
+ 
+ Value *FunctionEmitter::normalizeAddress(Value *address) {
+   return builder_.CreateAnd(address, builder_.getInt32(~0x40000000u));
+@@ -54,8 +66,7 @@
+           builder_.getInt32(static_cast<u32>(static_cast<s32>(displacement))),
+           "stack.mem1.offset");
+       function_->addFnAttr("dolrecomp-adaptive-stack-range", "mem1-4k");
+-      return builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, *offset,
+-                                        "stack.mem1.ptr");
++      return nativeMemoryPointer(normalizeAddress(address), ram_, *offset);
+     }
+ 
+     auto *binary = dyn_cast<BinaryOperator>(cursor);
+@@ -93,7 +104,7 @@
+     return nullptr;
+   *offset = builder_.getInt32(normalized - GC_RAM_BASE);
+   function_->addFnAttr("dolrecomp-native-memory", "mem1");
+-  return builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, *offset);
++  return nativeMemoryPointer(builder_.getInt32(normalized), ram_, *offset);
+ }
+ 
+ const char *FunctionEmitter::provenHardwareSymbol(
+@@ -259,7 +270,7 @@
+   Value *mem1Offset =
+       builder_.CreateSub(normalized, builder_.getInt32(GC_RAM_BASE));
+   Value *mem1Ptr =
+-      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, mem1Offset);
++      nativeMemoryPointer(normalized, ram_, mem1Offset);
+   Value *mem1Value = endianLoad(mem1Ptr, resultType, width, loopPollingLoad);
+   builder_.CreateBr(join);
+ 
+@@ -278,7 +289,7 @@
+   Value *mem2Offset =
+       builder_.CreateSub(normalized, builder_.getInt32(WII_MEM2_BASE));
+   Value *mem2Ptr =
+-      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), mem2_, mem2Offset);
++      nativeMemoryPointer(normalized, mem2_, mem2Offset);
+   Value *mem2Value = endianLoad(mem2Ptr, resultType, width, loopPollingLoad);
+   builder_.CreateBr(join);
+ 
+@@ -488,7 +499,7 @@
+       builder_.CreateSub(normalized, builder_.getInt32(GC_RAM_BASE));
+   journal(mem1Offset, width);
+   Value *mem1Ptr =
+-      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, mem1Offset);
++      nativeMemoryPointer(normalized, ram_, mem1Offset);
+   endianStore(mem1Ptr, value, width);
+   builder_.CreateBr(join);
+ 
+@@ -507,7 +518,7 @@
+   Value *mem2Offset =
+       builder_.CreateSub(normalized, builder_.getInt32(WII_MEM2_BASE));
+   Value *mem2Ptr =
+-      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), mem2_, mem2Offset);
++      nativeMemoryPointer(normalized, mem2_, mem2Offset);
+   endianStore(mem2Ptr, value, width);
+   builder_.CreateBr(join);
+ 

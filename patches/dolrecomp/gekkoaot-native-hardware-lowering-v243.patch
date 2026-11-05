@@ -1,0 +1,197 @@
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -197,7 +197,10 @@
+                           u32 width);
+   llvm::Value *endianLoad(llvm::Value *pointer, llvm::Type *result_type,
+                           u32 width, bool volatile_load = false);
+-  llvm::Value *externalRead(llvm::Value *address, u32 width);
++  const char *provenHardwareSymbol(const DolIRInstruction &instruction,
++                                   llvm::Value *address, u32 width, bool read);
++  llvm::Value *externalRead(llvm::Value *address, u32 width,
++                            const char *nativeSymbol = nullptr);
+   llvm::Value *emitGuestLoad(const DolIRInstruction &instruction,
+                              llvm::Value *address, llvm::Type *result_type,
+                              u32 width, bool sign);
+@@ -206,7 +209,8 @@
+   void clearReservation(llvm::Value *address);
+   void journal(llvm::Value *offset, u32 width);
+   void endianStore(llvm::Value *pointer, llvm::Value *value, u32 width);
+-  void externalWrite(llvm::Value *address, llvm::Value *value, u32 width);
++  void externalWrite(llvm::Value *address, llvm::Value *value, u32 width,
++                     const char *nativeSymbol = nullptr);
+   void emitGuestStore(const DolIRInstruction &instruction, llvm::Value *address,
+                       llvm::Value *value, u32 width);
+   void emitGuestStore(llvm::Value *address, llvm::Value *value, u32 width);
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -94,6 +94,33 @@
+   *offset = builder_.getInt32(normalized - GC_RAM_BASE);
+   function_->addFnAttr("dolrecomp-native-memory", "mem1");
+   return builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, *offset);
++}
++
++const char *FunctionEmitter::provenHardwareSymbol(
++    const DolIRInstruction &instruction, Value *address, u32 width, bool read) {
++  const char *enabled = std::getenv("DOLRECOMP_NATIVE_HARDWARE_LOWERING");
++  if (!enabled || std::string(enabled) != "1" || modern_runtime_ ||
++      (instruction.address_domain != DOLIR_ADDRESS_MMIO &&
++       instruction.address_domain != DOLIR_ADDRESS_FIFO) ||
++      instruction.address_lower != instruction.address_upper)
++    return nullptr;
++  const u32 physical = instruction.address_lower & 0x3fffffffu;
++  const char *symbol = nullptr;
++  if (read && width == 2u && !(physical & 1u)) {
++    if (physical >= 0x0c000000u && physical < 0x0c001000u)
++      symbol = "gekkoaot_cp_read16";
++    else if (physical >= 0x0c002000u && physical <= 0x0c002074u)
++      symbol = "gekkoaot_vi_read16";
++  } else if (!read) {
++    if (width == 4u && !(physical & 3u) &&
++        physical >= 0x0c003000u && physical < 0x0c004000u)
++      symbol = "gekkoaot_pi_write32";
++    else if (physical >= 0x0c008000u && physical < 0x0c008020u &&
++             (width == 1u || width == 2u || width == 4u || width == 8u))
++      symbol = "gekkoaot_wgpipe_write";
++  }
++  if (symbol) function_->addFnAttr("dolrecomp-native-hardware-lowering", "243");
++  return symbol;
+ }
+ 
+ Value *FunctionEmitter::rangeCheck(Value *normalized, u32 base, Value *size,
+@@ -136,6 +163,37 @@
+     auto translate = module_.getOrInsertFunction(
+         "gekkoaot_rel_translate_address", translateType);
+     address = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
++  }
++
++  if (const char *symbol = provenHardwareSymbol(instruction, address, width, true)) {
++    // Entry at an interior PC can bypass the address-producing instructions.
++    // Preserve the actual EA on such resumptions; LLVM folds this guard away
++    // whenever it proves the normal path's constant during optimization.
++    BasicBlock *direct = BasicBlock::Create(context_, "hardware_read", function_);
++    BasicBlock *fallback = BasicBlock::Create(context_, "hardware_read_fallback", function_);
++    BasicBlock *join = BasicBlock::Create(context_, "hardware_read_join", function_);
++    builder_.CreateCondBr(builder_.CreateICmpEQ(address, builder_.getInt32(instruction.address_lower)),
++                          direct, fallback);
++    builder_.SetInsertPoint(direct);
++    materializeFPRF();
++    Value *loaded = builder_.CreateZExtOrTrunc(externalRead(address, width, symbol), resultType);
++    if (sign && width * 8u < resultType->getIntegerBitWidth()) {
++      Value *narrow = builder_.CreateTrunc(loaded, IntegerType::get(context_, width * 8u));
++      loaded = builder_.CreateSExt(narrow, resultType);
++    }
++    BasicBlock *directEnd = builder_.GetInsertBlock();
++    builder_.CreateBr(join);
++    builder_.SetInsertPoint(fallback);
++    DolIRInstruction unknown = instruction;
++    unknown.address_domain = DOLIR_ADDRESS_UNKNOWN;
++    Value *generic = emitGuestLoad(unknown, address, resultType, width, sign);
++    BasicBlock *fallbackEnd = builder_.GetInsertBlock();
++    builder_.CreateBr(join);
++    builder_.SetInsertPoint(join);
++    PHINode *result = builder_.CreatePHI(resultType, 2);
++    result->addIncoming(loaded, directEnd);
++    result->addIncoming(generic, fallbackEnd);
++    return result;
+   }
+ 
+   bool loopPollingLoad = false;
+@@ -376,7 +434,20 @@
+     clearReservation(address);
+     materializeFPRF();
+     function_->addFnAttr("dolrecomp-direct-hardware-store", "1");
+-    externalWrite(address, value, width);
++    if (const char *symbol = provenHardwareSymbol(instruction, address, width, false)) {
++      BasicBlock *direct = BasicBlock::Create(context_, "hardware_write", function_);
++      BasicBlock *fallback = BasicBlock::Create(context_, "hardware_write_fallback", function_);
++      BasicBlock *join = BasicBlock::Create(context_, "hardware_write_join", function_);
++      builder_.CreateCondBr(builder_.CreateICmpEQ(address, builder_.getInt32(instruction.address_lower)),
++                            direct, fallback);
++      builder_.SetInsertPoint(direct);
++      externalWrite(address, value, width, symbol);
++      builder_.CreateBr(join);
++      builder_.SetInsertPoint(fallback);
++      externalWrite(address, value, width);
++      builder_.CreateBr(join);
++      builder_.SetInsertPoint(join);
++    } else externalWrite(address, value, width);
+     return;
+   }
+ 
+--- a/src/backend/llvm/memory_service.cpp
++++ b/src/backend/llvm/memory_service.cpp
+@@ -21,7 +21,8 @@
+ 
+ } // namespace
+ 
+-Value *FunctionEmitter::externalRead(Value *address, u32 width) {
++Value *FunctionEmitter::externalRead(Value *address, u32 width,
++                                      const char *nativeSymbol) {
+   if (modern_runtime_) {
+     Type *i32 = Type::getInt32Ty(context_);
+     Type *i64 = Type::getInt64Ty(context_);
+@@ -78,8 +79,11 @@
+   auto *functionType = FunctionType::get(
+       Type::getInt64Ty(context_),
+       {pointer, Type::getInt32Ty(context_), Type::getInt8Ty(context_)}, false);
+-  Value *called = builder_.CreateCall(
+-      functionType, function, {ctx_, address, builder_.getInt8(width)});
++  Value *called = nativeSymbol
++      ? builder_.CreateCall(module_.getOrInsertFunction(nativeSymbol, functionType),
++                            {ctx_, address, builder_.getInt8(width)})
++      : builder_.CreateCall(functionType, function,
++                            {ctx_, address, builder_.getInt8(width)});
+   Value *exception =
+       loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exception));
+   BasicBlock *resume =
+@@ -104,7 +108,8 @@
+   return phi;
+ }
+ 
+-void FunctionEmitter::externalWrite(Value *address, Value *value, u32 width) {
++void FunctionEmitter::externalWrite(Value *address, Value *value, u32 width,
++                                    const char *nativeSymbol) {
+   if (modern_runtime_) {
+     Type *i32 = Type::getInt32Ty(context_);
+     Type *i64 = Type::getInt64Ty(context_);
+@@ -159,11 +164,13 @@
+       {pointer, Type::getInt32Ty(context_), Type::getInt64Ty(context_),
+        Type::getInt8Ty(context_)},
+       false);
+-  builder_.CreateCall(
+-      functionType, function,
+-      {ctx_, address,
+-       builder_.CreateZExtOrTrunc(value, Type::getInt64Ty(context_)),
+-       builder_.getInt8(width)});
++  Value *stored = builder_.CreateZExtOrTrunc(value, Type::getInt64Ty(context_));
++  if (nativeSymbol)
++    builder_.CreateCall(module_.getOrInsertFunction(nativeSymbol, functionType),
++                        {ctx_, address, stored, builder_.getInt8(width)});
++  else
++    builder_.CreateCall(functionType, function,
++                        {ctx_, address, stored, builder_.getInt8(width)});
+   Value *exception =
+       loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exception));
+   BasicBlock *resume =
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -240,7 +240,7 @@
+       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+       "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
+       "x86-return-registers=3|"
+-      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s",
++      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module%s%s",
+       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+       static_cast<unsigned>(options ? options->native_abi_policy
+@@ -250,6 +250,9 @@
+       DOLIR_STATE_MASK_WORDS, DOLIR_STATE_COUNT,
+       std::getenv("DOLRECOMP_NATIVE_SDK_CLOCK_LOWERING") &&
+           std::string(std::getenv("DOLRECOMP_NATIVE_SDK_CLOCK_LOWERING")) == "1"
+-          ? "|sdk-clock-lowering=238" : "");
++          ? "|sdk-clock-lowering=238" : "",
++      std::getenv("DOLRECOMP_NATIVE_HARDWARE_LOWERING") &&
++          std::string(std::getenv("DOLRECOMP_NATIVE_HARDWARE_LOWERING")) == "1"
++          ? "|native-hardware-lowering=243" : "");
+   return written >= 0 && static_cast<size_t>(written) < size;
+ }

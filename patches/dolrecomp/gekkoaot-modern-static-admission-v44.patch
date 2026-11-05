@@ -1,0 +1,13 @@
+diff --git a/src/backend/llvm/exits.cpp b/src/backend/llvm/exits.cpp
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -161,10 +161,7 @@ void FunctionEmitter::emitEntry() {
+-  if (modern_runtime_) {
+-    builder_.CreateBr(query);
+-  } else {
++  {
+     const auto staticEntries =
+         regionInterceptions(source_.guest_start, source_.guest_end);
+     const bool allDirect =
+         !staticEntries.empty() &&
+         std::all_of(staticEntries.begin(), staticEntries.end(),

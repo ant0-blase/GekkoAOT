@@ -1,0 +1,66 @@
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -21,6 +21,7 @@
+ struct StaticIntercept {
+   u32 address = 0;
+   u32 direct_token = 0;
++  u32 gx_pixel_family = UINT32_MAX;
+ };
+ 
+ struct StaticInterceptTable {
+@@ -62,7 +63,13 @@
+           return StaticInterceptTable{};
+         token = static_cast<u32>(parsed);
+       }
+-      result.entries.push_back({static_cast<u32>(address), token});
++      u32 gxPixelFamily=UINT32_MAX;
++      std::string abiClass, lowering;
++      if(row >> abiClass >> lowering){
++        if(lowering.size()==10 && lowering.compare(0,9,"gx-pixel:")==0 &&
++           lowering[9]>='0' && lowering[9]<='3')gxPixelFamily=lowering[9]-'0';
++      }
++      result.entries.push_back({static_cast<u32>(address), token,gxPixelFamily});
+     }
+     std::sort(result.entries.begin(), result.entries.end(),
+               [](const StaticIntercept& a, const StaticIntercept& b) {
+@@ -238,9 +245,18 @@
+           continue;
+         }
+ 
+-        Value* handled = builder_.CreateCall(
+-            hostCallType, hostCall,
+-            {ctx_, builder_.getInt32(entry.direct_token)});
++        // GEKKOAOT_NATIVE_SDK_BINDINGS_V370: an explicit resolver annotation
++        // selects a named, ABI-checked native service. The module negotiates
++        // that service at load; no generic token dispatcher on this path.
++        Value* handled=nullptr;
++        if(entry.gx_pixel_family<4u){
++          auto service=module_.getOrInsertFunction("gekkoaot_sdk_gx_pixel",
++            FunctionType::get(builder_.getInt32Ty(),{pointer,builder_.getInt32Ty()},false));
++          auto* accepted=builder_.CreateCall(service,{ctx_,builder_.getInt32(entry.gx_pixel_family)});
++          handled=builder_.CreateICmpNE(accepted,builder_.getInt32(0));
++        }else{
++          handled=builder_.CreateCall(hostCallType,hostCall,{ctx_,builder_.getInt32(entry.direct_token)});
++        }
+         BasicBlock* accepted =
+             BasicBlock::Create(context_, "static_hle_accepted", function_);
+         builder_.CreateCondBr(handled, accepted, query);
+--- a/src/backend/llvm/side_exit_analysis.cpp
++++ b/src/backend/llvm/side_exit_analysis.cpp
+@@ -70,7 +70,15 @@
+     u32 parsed = 0, parsed_token = 0;
+     if (!(row >> name) || !number(address, parsed) || (parsed & 3)) return false;
+     if ((row >> token) && !number(token, parsed_token)) return false;
+-    if (row >> extra) return false;
++    if(row >> extra){
++      if(extra!="leaf" && extra!="context-capture" && extra!="full-fp-context")return false;
++      std::string lowering;
++      if(row >> lowering){
++        if(lowering.size()!=10 || lowering.compare(0,9,"gx-pixel:")!=0 ||
++           lowering[9]<'0' || lowering[9]>'3' || extra!="leaf")return false;
++        if(row >> extra)return false;
++      }
++    }
+     if (!report.sdk.emplace(parsed, name).second) return false;
+   }
+   return input.eof();

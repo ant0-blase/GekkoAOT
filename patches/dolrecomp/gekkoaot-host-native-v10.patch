@@ -1,0 +1,18 @@
+diff --git a/src/backend/llvm/target.cpp b/src/backend/llvm/target.cpp
+index a43a165..8ae51a1 100644
+--- a/src/backend/llvm/target.cpp
++++ b/src/backend/llvm/target.cpp
+@@ -79,6 +79,13 @@ bool resolveTargetProfile(const DolLLVMOptions *options, TargetProfile &result,
+   Triple triple(result.triple);
+   if (id == DOLLLVM_TARGET_HOST) {
+     result.aarch64 = triple.isAArch64();
++    // The host profile historically used the correct host triple but still
++    // forced LLVM's generic CPU. Resolve the CPU model reported by LLVM so
++    // codegen can use that CPU's default instruction/features set (for
++    // example MOVBE/BMI/AVX/FMA on modern x86-64 hosts).
++    const auto hostCPU = sys::getHostCPUName();
++    if (!hostCPU.empty() && hostCPU != "generic")
++      result.cpu = hostCPU.str();
+     if (!triple.isX86() && !triple.isAArch64()) {
+       error = "host profile requires x86-64 or AArch64";
+       return false;

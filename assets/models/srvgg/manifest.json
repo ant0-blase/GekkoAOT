@@ -1,0 +1,13 @@
+{
+  "name": "realesr-general-x4v3",
+  "upstream": "https://github.com/xinntao/Real-ESRGAN",
+  "release": "v0.2.5.0",
+  "architecture_source": "v0.3.0/realesrgan/archs/srvgg_arch.py",
+  "license": "BSD-3-Clause",
+  "parameters": 1213296,
+  "layers": 34,
+  "upstream_sha256": "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292",
+  "native_sha256": "90b6ff0db2a2867318379ef8f732d6c3f2541a465fc68bf8991ac3a9c2da6689",
+  "native_file": "general-x4v3.gsr",
+  "native_bytes": 4853660
+}

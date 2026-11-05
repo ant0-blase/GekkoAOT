@@ -1,0 +1,40 @@
+--- a/src/backend/llvm/exits.cpp	2026-10-23 23:06:01.906306143 +0200
++++ b/src/backend/llvm/exits.cpp	2026-10-23 23:06:01.917257793 +0200
+@@ -415,10 +415,33 @@
+   initializeEntryControls();
+   BasicBlock *bad = BasicBlock::Create(context_, "entry_miss", function_);
+   u32 nativeEntries = 0;
+-  for (u32 i = 0; i < source_.block_count; i++)
+-    nativeEntries += region_leaders_[i] &&
+-                     source_.blocks[i].terminator.kind != DOLIR_TERM_FALLBACK;
+-  auto *dispatch = builder_.CreateSwitch(entry_pc_, bad, nativeEntries);
++  BasicBlock *startBlock = nullptr;
++  for (u32 i = 0; i < source_.block_count; i++) {
++    const bool native = region_leaders_[i] &&
++                        source_.blocks[i].terminator.kind != DOLIR_TERM_FALLBACK;
++    nativeEntries += native;
++    if (native && !startBlock && source_.blocks[i].guest_address == source_.guest_start)
++      startBlock = blocks_[i];
++  }
++  // GEKKOAOT_START_ENTRY_FASTPATH_V369: a body can resume at any region leader
++  // (every instruction of a resumable chunk: 1024 cases), and PHI elimination
++  // put the entry values of every case target's PHIs in this block, so every
++  // ordinary call ran thousands of moves (Star Fox Adventures: 9.7 KiB of
++  // stores before the first guest instruction). Calls enter at the start; only
++  // resumes take the switch, whose copies now live in its own block. The
++  // switch reads a frozen copy of the PC so SimplifyCFG cannot fold the start
++  // test back into it.
++  Value *dispatchPC = entry_pc_;
++  if (startBlock) {
++    BasicBlock *resumeEntry = BasicBlock::Create(context_, "resume_entry", function_);
++    Value *atStart = builder_.CreateICmpEQ(entry_pc_, builder_.getInt32(source_.guest_start));
++    builder_.CreateCondBr(builder_.CreateCall(expect, {atStart, builder_.getTrue()}),
++                          startBlock, resumeEntry);
++    builder_.SetInsertPoint(resumeEntry);
++    dispatchPC = builder_.CreateFreeze(entry_pc_, "resume_pc");
++    function_->addFnAttr("dolrecomp-start-entry-fastpath", "369");
++  }
++  auto *dispatch = builder_.CreateSwitch(dispatchPC, bad, nativeEntries);
+   for (u32 i = 0; i < source_.block_count; i++) {
+     if (!region_leaders_[i] ||
+         source_.blocks[i].terminator.kind == DOLIR_TERM_FALLBACK)

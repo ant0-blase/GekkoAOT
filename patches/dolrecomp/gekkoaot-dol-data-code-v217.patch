@@ -1,0 +1,84 @@
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+index efcd037..b58bdd3 100644
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -2,8 +2,42 @@ int emit_dol_split(const DOLFile* dol, const char* output_path,
+                           DolRecompCPU cpu, u32 jobs, int local_chunks_dir,
+                           const DolRecompSymbolMap* symbols,
+                           const CliOptions* options) {
+-    LoadedCodeSection sections[DOL_NUM_TEXT];
++    LoadedCodeSection sections[DOL_NUM_TEXT + DOL_NUM_DATA];
+     u32 section_count = 0;
++    u32 data_code_begin[DOL_NUM_DATA] = {0};
++
++    /* Retail DOLs occasionally store hand-written/optimized PPC routines in a
++     * nominal data section.  A direct B/BC from an executable text section is
++     * architectural proof that the destination is executable; refusing to
++     * admit it leaves a valid target out of the static module and the runtime
++     * later dies with an "uncompiled address".  Record the earliest proven
++     * target in each data section and expose the tail as a mixed code/data
++     * section.  EMBEDDED_DATA_DOL keeps the normal conservative data-word
++     * classification for literals interspersed with the routines. */
++    for (u32 text_index = 0; text_index < DOL_NUM_TEXT; text_index++) {
++        const u8* text_data = dol_get_text_section(dol, (int)text_index);
++        u32 text_size = dol->header.text_sizes[text_index];
++        u32 text_address = dol->header.text_addresses[text_index];
++        if (!text_data || !text_size)
++            continue;
++        for (u32 offset = 0; offset + 4u <= text_size; offset += 4u) {
++            u32 pc = text_address + offset;
++            PPCInst inst = ppc_decode(read_be32(text_data + offset), pc);
++            if (inst.op != PPC_OP_B && inst.op != PPC_OP_BC)
++                continue;
++            for (u32 data_index = 0; data_index < DOL_NUM_DATA; data_index++) {
++                u32 begin = dol->header.data_addresses[data_index];
++                u32 size = dol->header.data_sizes[data_index];
++                u64 end = (u64)begin + size;
++                if (!size || (inst.branch_target & 3u) != 0u ||
++                    inst.branch_target < begin || (u64)inst.branch_target >= end)
++                    continue;
++                if (!data_code_begin[data_index] ||
++                    inst.branch_target < data_code_begin[data_index])
++                    data_code_begin[data_index] = inst.branch_target;
++            }
++        }
++    }
+-
++
+     for (u32 i = 0; i < DOL_NUM_TEXT; i++) {
+         if (dol->header.text_sizes[i] == 0)
+@@ -24,6 +58,33 @@ int emit_dol_split(const DOLFile* dol, const char* output_path,
+         section->embedded_data_mode = EMBEDDED_DATA_DOL;
+     }
+-
++
++    for (u32 i = 0; i < DOL_NUM_DATA; i++) {
++        u32 begin = data_code_begin[i];
++        if (!begin)
++            continue;
++        const u8* data = dol_get_data_section(dol, (int)i);
++        u32 base = dol->header.data_addresses[i];
++        u32 size = dol->header.data_sizes[i];
++        if (!data || begin < base || (u64)begin >= (u64)base + size)
++            continue;
++        u32 delta = begin - base;
++
++        LoadedCodeSection* section = &sections[section_count++];
++        section->label = "data-code";
++        section->name = NULL;
++        section->data = data + delta;
++        section->index = i;
++        section->file_offset = dol->header.data_offsets[i] + delta;
++        section->address = begin;
++        section->size = size - delta;
++        section->embedded_data_mode = EMBEDDED_DATA_DOL;
++
++        printf("DOL direct-branch executable data[%u]: 0x%08X-0x%08X "
++               "(%u bytes)\n",
++               i, section->address, section->address + section->size,
++               section->size);
++    }
++
+     return emit_code_sections_split(sections, section_count, output_path, cpu,
+                                     dol->header.entry_point, jobs,
+                                     local_chunks_dir, symbols, options);

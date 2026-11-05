@@ -1,0 +1,31 @@
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -199,10 +199,26 @@
+   dolllvm::simplifyRelLiveAddresses(module);
+   if (verifyModule(module, &stream)) return false;
+   report("optimize");
++  // GEKKOAOT_THINLTO_ONLY_V382: when the module is linked with ThinLTO the
++  // linker re-runs code generation from the bitcode, so the per-chunk machine
++  // object is never used. Emit an empty object of the same target instead
++  // (object validation and caching stay intact) and skip the codegen work.
++  static const bool thinltoOnly = [] {
++    const char *setting = std::getenv("DOLRECOMP_LLVM_THINLTO_ONLY");
++    return setting && setting[0] == '1';
++  }();
+   if (!writeIR(module, options, diagnostics) ||
+-      !writeThinLTO(module, options, diagnostics) ||
+-      !writeObject(module, *machine, object_path, diagnostics))
++      !writeThinLTO(module, options, diagnostics))
+     return false;
++  if (thinltoOnly && options.emit_thinlto && options.thinlto_path) {
++    Module stub("dolrecomp_thinlto_stub", context);
++    stub.setTargetTriple(module.getTargetTriple());
++    stub.setDataLayout(module.getDataLayout());
++    if (!writeObject(stub, *machine, object_path, diagnostics))
++      return false;
++  } else if (!writeObject(module, *machine, object_path, diagnostics)) {
++    return false;
++  }
+   report("codegen");
+   return true;
+ }

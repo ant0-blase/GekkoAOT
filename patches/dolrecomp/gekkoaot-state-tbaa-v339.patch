@@ -1,0 +1,73 @@
+--- a/src/backend/llvm/emitter.cpp
++++ b/src/backend/llvm/emitter.cpp
+@@ -8,6 +8,9 @@
+ #include <llvm/IR/Function.h>
+ #include <llvm/IR/GlobalVariable.h>
+ #include <llvm/IR/Intrinsics.h>
++#include <llvm/IR/InstIterator.h>
++#include <llvm/IR/MDBuilder.h>
++#include <llvm/Analysis/ValueTracking.h>
+ #include <llvm/IR/Module.h>
+ #include <llvm/IR/Verifier.h>
+ #include <llvm/Support/Format.h>
+@@ -136,11 +139,50 @@
+   }
+   emitFallbackHandler();
+   finalizeStateSSA();
++  tagMemoryAliasClasses();
+   if (verifyFunction(*function_, &diagnostics))
+     return false;
+   return emitWrapper(diagnostics);
+ }
+ 
++// GEKKOAOT_STATE_TBAA_V339: CPUState is only ever reached through the ctx
++// argument (no integer round trip of ctx exists), while guest memory and other
++// host objects are reached through loaded/returned base pointers or the
++// native host-address inttoptr. ctx escapes into helper calls, so BasicAA
++// alone must assume any guest store may rewrite guest registers held in
++// CPUState; distinct TBAA classes let GVN/DSE/LICM keep state values across
++// guest memory traffic. Untagged accesses (allocas, other arguments, memory
++// intrinsics) keep the conservative may-alias answer; calls still clobber.
++void FunctionEmitter::tagMemoryAliasClasses() {
++  static const bool enabled = [] {
++    const char *setting = std::getenv("DOLRECOMP_STATE_TBAA");
++    return !setting || setting[0] != '0';
++  }();
++  if (!enabled || !ctx_)
++    return;
++  MDBuilder mdb(context_);
++  MDNode *root = mdb.createTBAARoot("dolrecomp-aot-v339");
++  MDNode *stateType = mdb.createTBAAScalarTypeNode("cpu-state", root);
++  MDNode *otherType = mdb.createTBAAScalarTypeNode("guest-or-host-memory", root);
++  MDNode *stateTag = mdb.createTBAAStructTagNode(stateType, stateType, 0);
++  MDNode *otherTag = mdb.createTBAAStructTagNode(otherType, otherType, 0);
++  for (Instruction &instruction : instructions(*function_)) {
++    Value *pointer = nullptr;
++    if (auto *load = dyn_cast<LoadInst>(&instruction))
++      pointer = load->getPointerOperand();
++    else if (auto *store = dyn_cast<StoreInst>(&instruction))
++      pointer = store->getPointerOperand();
++    if (!pointer || instruction.getMetadata(LLVMContext::MD_tbaa))
++      continue;
++    const Value *base = getUnderlyingObject(pointer, 0);
++    if (base == ctx_)
++      instruction.setMetadata(LLVMContext::MD_tbaa, stateTag);
++    else if (isa<LoadInst>(base) || isa<CallBase>(base) || isa<IntToPtrInst>(base))
++      instruction.setMetadata(LLVMContext::MD_tbaa, otherTag);
++  }
++  function_->addFnAttr("dolrecomp-state-tbaa", "339");
++}
++
+ std::string FunctionEmitter::blockName(u32 index) const {
+   char text[40];
+   snprintf(text, sizeof(text), "guest_%08X_b%u",
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -86,6 +86,7 @@
+   void scanLoopHeaders();
+   void scanRegionLeaders();
+   void finalizeStateSSA();
++  void tagMemoryAliasClasses();
+   bool slotInMemory(DolIRStateSlot slot) const;
+ 
+   void emitEntry();

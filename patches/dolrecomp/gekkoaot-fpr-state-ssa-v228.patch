@@ -1,0 +1,19 @@
+--- a/src/backend/llvm/register_state.cpp
++++ b/src/backend/llvm/register_state.cpp
+@@ -47,6 +47,16 @@
+ 
+ bool FunctionEmitter::slotInMemory(DolIRStateSlot slot) const {
+   if (!state_in_memory_ || native_abi_)
++    return false;
++  // Keep paired-single/FPR intermediates in SSA when explicitly requested.
++  // Side exits and host calls already publish dirty SSA state; only integer
++  // state keeps the bounded-compilation memory policy on this hybrid path.
++  static const bool fpStateSSA = [] {
++    const char* setting = std::getenv("DOLRECOMP_FP_STATE_SSA");
++    return setting && std::string(setting) == "1";
++  }();
++  if (fpStateSSA && ((slot >= DOLIR_STATE_FPR0 && slot <= DOLIR_STATE_FPR31) ||
++                     (slot >= DOLIR_STATE_PS1_0 && slot <= DOLIR_STATE_PS1_31)))
+     return false;
+   // PGO-selected hot functions use full state residency. Every used guest
+   // register/state slot gets an entry alloca that finalizeStateSSA() promotes

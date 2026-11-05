@@ -1,0 +1,19 @@
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -623,6 +623,16 @@
+ }
+ 
+ void FunctionEmitter::clearReservation(Value *address) {
++  // GEKKOAOT_NO_RESERVATIONS_V381: the host proved that no guest code executes
++  // lwarx, so RESERVE_VALID can never be set and no store has a reservation to
++  // break. Every store previously paid this check (and, in hot functions, a
++  // branchless read-modify-write of the reservation state).
++  static const bool noReservations = [] {
++    const char *setting = std::getenv("DOLRECOMP_NO_RESERVATIONS");
++    return setting && setting[0] == '1';
++  }();
++  if (noReservations)
++    return;
+   Value *valid = builder_.CreateLoad(Type::getInt1Ty(context_),
+                                      state_[DOLIR_STATE_RESERVE_VALID]);
+   // Hot functions keep reservation state in SSA. Branchless invalidation lets

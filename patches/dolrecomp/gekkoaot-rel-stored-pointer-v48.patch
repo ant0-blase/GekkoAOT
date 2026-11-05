@@ -1,0 +1,78 @@
+diff --git a/src/ir/dolir_address.c b/src/ir/dolir_address.c
+--- a/src/ir/dolir_address.c
++++ b/src/ir/dolir_address.c
+@@ -232,6 +232,8 @@ void dolir_analyze_addresses(DolIRFunction* function) {
+             instruction->address_domain = DOLIR_ADDRESS_UNKNOWN;
+             instruction->address_lower = 0;
+             instruction->address_upper = 0;
++            if (instruction->op == DOLIR_OP_GUEST_STORE)
++                instruction->aux &= 0x7fffffffu;
+             if (instruction->op == DOLIR_OP_GUEST_LOAD ||
+                 instruction->op == DOLIR_OP_GUEST_STORE) {
+                 ConstantValue address_value = values[instruction->operands[0]];
+@@ -246,6 +248,17 @@ void dolir_analyze_addresses(DolIRFunction* function) {
+                     instruction->address_upper = 0xffffffffu;
+                 }
+             }
++            // A REL can materialize a canonical pointer and store it into guest
++            // memory (for example an interface/data pointer published by its
++            // prolog).  Mark only 32-bit store values with static MEM1 proof;
++            // the LLVM backend will run them through the same canonical->live
++            // OSLink translator used for proven REL effective addresses.
++            if (instruction->op == DOLIR_OP_GUEST_STORE &&
++                instruction->operand_count >= 2u) {
++                ConstantValue stored_value = values[instruction->operands[1]];
++                // v199: this is only a cheap compile-time *candidate* bit.
++                // A classic REL prolog (lis/addi/stw) folds its relocated
++                // address to a known constant, losing v171's dynamic-index
++                // provenance. The generated per-REL helper performs the
++                // authoritative own-data + cross-module check at runtime, so
++                // known MEM1 values are safe to admit here without repeating
++                // v195's broad rewrite.
++                if (stored_value.relocatable_mem1 ||
++                    (stored_value.known && is_mem1_constant(stored_value.bits)))
++                    instruction->aux |= 0x80000000u;
++            }
+             ConstantValue result =
+                 instruction_value(instruction, values, state);
+             if (instruction->result)
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -183,6 +183,27 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+     address = builder_.CreateCall(translate, {ctx_, address}, "rel.address");
+   }
+
++  // v199: a REL prolog can publish a self-data pointer using lis/addi/stw.
++  // Constant folding makes that value merely "known", so v197's provenance-
++  // only rule misses it. Do not blindly translate known MEM1 constants (v195
++  // did and broke SMB2). Instead forward only compile-time candidates to the
++  // generated per-REL guard, which verifies:
++  //   1) value belongs to this exact REL's non-executable canonical sections;
++  //   2) destination is outside this REL (a real module-boundary publication).
++  // Only then does it invoke the canonical->OSLink host translator.
++  if (relTranslate && relTranslate[0] && relTranslate[0] != '0' &&
++      width == 4u && (instruction.aux & 0x80000000u) != 0u) {
++    Type *i32 = Type::getInt32Ty(context_);
++    auto *publishType =
++        FunctionType::get(i32, {ctx_->getType(), i32, i32}, false);
++    auto publish = module_.getOrInsertFunction(
++        "gekkoaot_rel_translate_published_pointer", publishType);
++    // Only a statically proven store destination may cross the REL ABI here.
++    // Unknown/indexed destinations stay untouched; this keeps the rule narrow
++    // and is sufficient for standard REL prologs that publish interface/data
++    // pointers into main-DOL globals.
++    const bool knownDestination =
++        instruction.address_domain != DOLIR_ADDRESS_UNKNOWN &&
++        instruction.address_lower == instruction.address_upper;
++    Value *destination = builder_.getInt32(
++        knownDestination ? instruction.address_lower : 0xffffffffu);
++    Value *stored = value->getType() == i32
++        ? value : builder_.CreateZExtOrTrunc(value, i32);
++    value = builder_.CreateCall(publish, {ctx_, destination, stored},
++                                "rel.published_address");
++  }
++
+   Value *directOffset = nullptr;
+   if (Value *pointer =
+           provenMemoryPointer(instruction, address, width, &directOffset)) {

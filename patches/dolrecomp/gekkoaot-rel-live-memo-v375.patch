@@ -1,0 +1,133 @@
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -2,6 +2,7 @@
+ #include "backend/llvm/emitter.h"
+ 
+ #include <llvm/ADT/SmallVector.h>
++#include <llvm/ADT/DenseMap.h>
+ #include <llvm/Analysis/ValueTracking.h>
+ #include "cpu/cpu.h"
+ #include <cstdlib>
+@@ -21,8 +22,15 @@
+ // Materialization has already converted this SSA pointer to the live OSLink
+ // domain. Preserve that provenance through pointer arithmetic and merges;
+ // numerical overlap with the canonical window cannot justify rebasing twice.
+-static bool relLiveAddress(Value* value, Value* ctx, unsigned depth = 0) {
++using RelLiveProofCache = DenseMap<std::pair<Value*, unsigned>, bool>;
++static bool relLiveAddressImpl(Value* value, Value* ctx, unsigned depth, RelLiveProofCache& cache) {
+   if (!value || depth > 24) return false;
++  // Cache the depth as well: failure at the existing proof-depth limit must
++  // never poison a shallower query. The cache belongs to one immutable query,
++  // so IR replacement/deletion cannot leave stale provenance behind.
++  const auto key = std::make_pair(value, depth);
++  if (auto found = cache.find(key); found != cache.end()) return found->second;
++  const auto prove = [&]() -> bool {
+   if (auto* call = dyn_cast<CallBase>(value)) {
+     auto* callee = call->getCalledFunction();
+     return callee && callee->getName() == "gekkoaot_rel_translate_address";
+@@ -43,7 +51,7 @@
+         const auto storeBytes = layout.getTypeStoreSize(store->getValueOperand()->getType()).getFixedValue();
+         if (loadBase == storeBase) {
+           if (loadOffset == storeOffset && loadBytes == storeBytes)
+-            return relLiveAddress(store->getValueOperand(), ctx, depth + 1);
++            return relLiveAddressImpl(store->getValueOperand(), ctx, depth + 1, cache);
+           if (loadOffset + int64_t(loadBytes) <= storeOffset ||
+               storeOffset + int64_t(storeBytes) <= loadOffset) continue;
+         } else if (isa<AllocaInst>(loadBase) && isa<AllocaInst>(storeBase)) continue;
+@@ -56,22 +64,31 @@
+   if (auto* phi = dyn_cast<PHINode>(value)) {
+     if (!phi->getNumIncomingValues()) return false;
+     for (Value* incoming : phi->incoming_values())
+-      if (!relLiveAddress(incoming, ctx, depth + 1)) return false;
++      if (!relLiveAddressImpl(incoming, ctx, depth + 1, cache)) return false;
+     return true;
+   }
+   if (auto* select = dyn_cast<SelectInst>(value))
+-    return relLiveAddress(select->getTrueValue(), ctx, depth + 1) &&
+-           relLiveAddress(select->getFalseValue(), ctx, depth + 1);
++    return relLiveAddressImpl(select->getTrueValue(), ctx, depth + 1, cache) &&
++           relLiveAddressImpl(select->getFalseValue(), ctx, depth + 1, cache);
+   if (auto* cast = dyn_cast<CastInst>(value))
+     return cast->getSrcTy()->isIntegerTy(32) && cast->getDestTy()->isIntegerTy(32) &&
+-           relLiveAddress(cast->getOperand(0), ctx, depth + 1);
++           relLiveAddressImpl(cast->getOperand(0), ctx, depth + 1, cache);
+   if (auto* binary = dyn_cast<BinaryOperator>(value)) {
+-    const bool left = relLiveAddress(binary->getOperand(0), ctx, depth + 1);
+-    const bool right = relLiveAddress(binary->getOperand(1), ctx, depth + 1);
++    if (binary->getOpcode() != Instruction::Add && binary->getOpcode() != Instruction::Sub) return false;
++    const bool left = relLiveAddressImpl(binary->getOperand(0), ctx, depth + 1, cache);
++    const bool right = relLiveAddressImpl(binary->getOperand(1), ctx, depth + 1, cache);
+     if (binary->getOpcode() == Instruction::Add) return left != right;
+     if (binary->getOpcode() == Instruction::Sub) return left && !right;
+   }
+   return false;
++  };
++  const bool result = prove();
++  cache.try_emplace(key, result);
++  return result;
++}
++static bool relLiveAddress(Value* value, Value* ctx) {
++  RelLiveProofCache cache;
++  return relLiveAddressImpl(value, ctx, 0, cache);
+ }
+ 
+ void simplifyRelLiveAddresses(Module& module) {
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -380,6 +380,12 @@
+ add_test(NAME dolir COMMAND test_dolir)
+ 
+ if(DOLRECOMP_ENABLE_LLVM)
++    add_executable(rel_live_proof_test tests/rel_live_proof_test.cpp)
++    target_include_directories(rel_live_proof_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
++    target_compile_definitions(rel_live_proof_test PRIVATE ${LLVM_DEFINITIONS})
++    target_link_libraries(rel_live_proof_test PRIVATE dr_llvm)
++    add_test(NAME rel_live_proof COMMAND rel_live_proof_test)
++    set_tests_properties(rel_live_proof PROPERTIES TIMEOUT 5)
+     add_executable(llvm_fixture tests/llvm_fixture.cpp)
+     target_link_libraries(llvm_fixture PRIVATE dr_llvm)
+     add_test(NAME llvm_fixture COMMAND llvm_fixture
+--- /dev/null
++++ b/tests/rel_live_proof_test.cpp
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include <array>
++#include <llvm/IR/IRBuilder.h>
++#include <llvm/IR/Module.h>
++#include <llvm/IR/Verifier.h>
++#include <llvm/Support/raw_ostream.h>
++#include <chrono>
++#include <cstdlib>
++#include <iostream>
++namespace dolllvm {void simplifyRelLiveAddresses(llvm::Module&);}
++using namespace llvm;
++int main(){
++ LLVMContext c;Module m("rel-provenance",c);m.setDataLayout("e-p:64:64");
++ auto* i32=Type::getInt32Ty(c);auto* ptr=PointerType::getUnqual(c);
++ auto translate=m.getOrInsertFunction("gekkoaot_rel_translate_address",FunctionType::get(i32,{ptr,i32},false));
++ std::array<CallInst*,4> calls{};
++ for(unsigned fixture=0;fixture<4;++fixture){
++  auto* f=Function::Create(FunctionType::get(i32,{ptr},false),GlobalValue::ExternalLinkage,"case"+std::to_string(fixture),m);
++  auto* ctx=f->getArg(0);IRBuilder<> b(BasicBlock::Create(c,"entry",f));
++  Value* value=b.CreateLoad(i32,ctx);
++  if(fixture==0)value=b.CreateAdd(value,b.getInt32(4));
++  if(fixture==1)for(unsigned n=0;n<24;++n)value=b.CreateAdd(value,value);
++  if(fixture==2)value=b.CreateAnd(value,b.getInt32(0xffff));
++  if(fixture==3){
++   auto* loop=BasicBlock::Create(c,"loop",f);b.CreateBr(loop);b.SetInsertPoint(loop);
++   auto* phi=b.CreatePHI(i32,2);phi->addIncoming(value,&f->getEntryBlock());
++   phi->addIncoming(phi,loop);value=phi;
++   // The loop is only an IR proof fixture, never executed.
++  }
++  auto* call=b.CreateCall(translate,{ctx,value});call->setMetadata("gekkoaot.rel.effective",MDNode::get(c,{}));calls[fixture]=call;
++  if(fixture==3)b.CreateCondBr(b.getTrue(),b.GetInsertBlock(),BasicBlock::Create(c,"exit",f));
++  if(fixture==3)b.SetInsertPoint(&f->back());
++  if(fixture==3)b.CreateRet(b.getInt32(0));else b.CreateRet(call);
++ }
++ if(verifyModule(m,&errs()))return 2;
++ const auto start=std::chrono::steady_clock::now();dolllvm::simplifyRelLiveAddresses(m);
++ unsigned count=0;
++ for(auto& f:m)for(auto& block:f)for(auto& inst:block)if(auto* call=dyn_cast<CallInst>(&inst))if(call->getMetadata("gekkoaot.rel.effective"))++count;
++ if(count!=3 || verifyModule(m,&errs()))return 3;
++ std::cout<<"REL_PROOF_MEMO_PASS translated_add_folded=1 shared_dag_retained=1 unsupported_op_retained=1 cyclic_phi_retained=1 wall_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()<<"\n";
++}

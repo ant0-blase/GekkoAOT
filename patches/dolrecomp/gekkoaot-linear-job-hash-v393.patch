@@ -1,0 +1,82 @@
+--- a/src/app/pipeline.c	2026-10-30 23:20:57.375840367 +0100
++++ b/src/app/pipeline.c	2026-10-30 23:20:57.375738499 +0100
+@@ -67,6 +67,7 @@
+     u32 total;
+     const DolLLVMFunctionRange* ranges;
+     u32 range_count;
++    u64 ranges_digest;
+     const u32* entry_points;
+     u32 entry_point_count;
+     DolLLVMTargetProfile target_profile;
+@@ -365,8 +366,9 @@
+         hash = hash_bytes(hash, &job->insts[i].embedded_data,
+                           sizeof(job->insts[i].embedded_data));
+     }
+-    for (u32 i = 0; i < job->range_count; i++)
+-        hash = hash_bytes(hash, &job->ranges[i], sizeof(job->ranges[i]));
++    // Every chunk depends on the whole table. Hashing it per chunk was quadratic:
++    // about 52 GB for Super Mario Sunshine, most of the time before any codegen.
++    hash = hash_bytes(hash, &job->ranges_digest, sizeof(job->ranges_digest));
+     for (u32 i = 0; i < job->entry_point_count; i++) {
+         u32 address = job->entry_points[i];
+         if (address >= job->function_address &&
+@@ -709,18 +711,30 @@
+             const DolIRTerminator* term = &function->blocks[block].terminator;
+             u64 live_after[DOLIR_STATE_MASK_WORDS] = {0};
+             u64 defined_before[DOLIR_STATE_MASK_WORDS] = {0};
+-            if (!dolllvm_analyze_callsite_state(
+-                    function, block, ranges[range_index].may_def_state,
+-                    live_after, defined_before)) {
+-                dolir_module_free(&module);
+-                goto fail;
+-            }
+             u32 targets = term->kind == DOLIR_TERM_COND_BRANCH ? 2u
+                           : term->kind == DOLIR_TERM_FALLTHROUGH ||
+                                   term->kind == DOLIR_TERM_BRANCH
+                               ? 1u
+                           : term->kind == DOLIR_TERM_INDIRECT ? 2u
+                                                               : 0u;
++            // This analysis walks the whole function, so it runs only for the
++            // blocks whose result is used: those that leave the range.
++            int leaves_range = 0;
++            for (u32 slot = 0; slot < targets && !leaves_range; slot++) {
++                const DolLLVMFunctionRange* target = llvm_range_for(
++                    ranges, range_count, term->target_addresses[slot]);
++                leaves_range = target
++                                   ? target->start != ranges[range_index].start
++                                   : rel_crossmodule_live &&
++                                         term->target_addresses[slot] != 0u;
++            }
++            if (leaves_range && !dolllvm_analyze_callsite_state(
++                                    function, block,
++                                    ranges[range_index].may_def_state,
++                                    live_after, defined_before)) {
++                dolir_module_free(&module);
++                goto fail;
++            }
+                 for (u32 slot = 0; slot < targets; slot++) {
+                     const DolLLVMFunctionRange* target = llvm_range_for(
+                         ranges, range_count, term->target_addresses[slot]);
+@@ -1261,6 +1275,8 @@
+         goto fail;
+     u32 file_count = 0;
+     u32 range_count = 0;
++    u64 ranges_digest = 0;
++    int ranges_digest_ready = 0;
+     const u32 chunk_instructions = options->partition_instructions
+                                        ? options->partition_instructions
+                                        : llvm_chunk_instructions();
+@@ -1401,6 +1417,13 @@
+                 target_job->total = range_count * profile_count;
+                 target_job->ranges = ranges;
+                 target_job->range_count = range_count;
++                if (!ranges_digest_ready) {
++                    ranges_digest =
++                        hash_bytes(UINT64_C(0xCBF29CE484222325), ranges,
++                                   (size_t)range_count * sizeof(*ranges));
++                    ranges_digest_ready = 1;
++                }
++                target_job->ranges_digest = ranges_digest;
+                 target_job->entry_points = entry_points;
+                 target_job->entry_point_count = entry_point_count;
+                 target_job->target_profile = profiles[variant];
